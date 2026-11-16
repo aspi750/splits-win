@@ -30,6 +30,7 @@ pub enum GoalType {
     #[default]
     GeneralFitness,
     ReturnFromInjury,
+    HybridHyrox,
 }
 
 impl GoalType {
@@ -39,6 +40,7 @@ impl GoalType {
             GoalType::BaseBuilding => "Base Building",
             GoalType::GeneralFitness => "General Fitness",
             GoalType::ReturnFromInjury => "Return from Injury",
+            GoalType::HybridHyrox => "Hyrox / Hybrid Athlete",
         }
     }
 }
@@ -85,12 +87,23 @@ pub struct AthleteMedical {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
+pub struct HybridProfile {
+    pub division: Option<String>,
+    #[serde(default)]
+    pub focus_stations: Vec<String>,
+    pub weekly_hybrid_sessions_target: Option<i32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
 pub struct AthleteObjective {
     pub goal_type: GoalType,
     pub race_name: Option<String>,
     pub race_distance_km: Option<f64>,
     pub race_date: Option<String>,
     pub target_time_description: Option<String>,
+    #[serde(default)]
+    pub hybrid_profile: Option<HybridProfile>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -238,6 +251,24 @@ impl AthleteConfig {
             goal_parts.push(format!("target: {t}"));
         }
         lines.push(format!("- Objective: {}", goal_parts.join(" · ")));
+
+        if self.objective.goal_type == GoalType::HybridHyrox {
+            if let Some(ref hybrid) = self.objective.hybrid_profile {
+                let mut hybrid_parts = Vec::new();
+                if let Some(div) = hybrid.division.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                    hybrid_parts.push(format!("Division: {div}"));
+                }
+                if !hybrid.focus_stations.is_empty() {
+                    hybrid_parts.push(format!("Focus stations: {}", hybrid.focus_stations.join(", ")));
+                }
+                if let Some(target) = hybrid.weekly_hybrid_sessions_target.filter(|&v| v > 0) {
+                    hybrid_parts.push(format!("Hybrid sessions/wk: {target}"));
+                }
+                if !hybrid_parts.is_empty() {
+                    lines.push(format!("- Hybrid profile: {}", hybrid_parts.join(" · ")));
+                }
+            }
+        }
 
         if !self.availability.available_days.is_empty() {
             let mut days = self.availability.available_days.clone();
@@ -686,11 +717,116 @@ pub struct FitGuardrailAudit {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FitLap {
+    pub elapsed_sec: f64,
+    pub moving_sec: f64,
+    pub distance_m: f64,
+    pub avg_hr_bpm: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CompromisedRunAudit {
+    pub run_segment_count: usize,
+    pub first_half_avg_pace_sec_per_km: f64,
+    pub second_half_avg_pace_sec_per_km: f64,
+    pub pace_fade_sec_per_km: f64,
+    pub first_half_avg_hr: Option<f64>,
+    pub second_half_avg_hr: Option<f64>,
+    pub hr_drift_bpm: Option<f64>,
+}
+
+impl CompromisedRunAudit {
+    pub fn compute(laps: &[FitLap]) -> Option<Self> {
+        struct Seg {
+            is_run: bool,
+            distance: f64,
+            seconds: f64,
+            avg_hr: Option<f64>,
+        }
+        let segments: Vec<Seg> = laps
+            .iter()
+            .filter_map(|lap| {
+                let sec = if lap.moving_sec > 0.0 { lap.moving_sec } else { lap.elapsed_sec };
+                if sec <= 0.0 {
+                    return None;
+                }
+                let pace = if lap.distance_m > 0.0 {
+                    sec / (lap.distance_m / 1000.0)
+                } else {
+                    f64::INFINITY
+                };
+                let is_run = lap.distance_m >= 600.0 && pace <= 600.0;
+                Some(Seg {
+                    is_run,
+                    distance: lap.distance_m,
+                    seconds: sec,
+                    avg_hr: lap.avg_hr_bpm,
+                })
+            })
+            .collect();
+        if segments.len() < 4 {
+            return None;
+        }
+        let runs: Vec<&Seg> = segments.iter().filter(|s| s.is_run).collect();
+        let stations = segments.len() - runs.len();
+        if runs.len() < 2 || stations < 2 {
+            return None;
+        }
+        let mut transitions = 0usize;
+        for i in 1..segments.len() {
+            if segments[i].is_run != segments[i - 1].is_run {
+                transitions += 1;
+            }
+        }
+        if transitions < 3 {
+            return None;
+        }
+        let mid = runs.len() / 2;
+        let first = &runs[..mid];
+        let second = &runs[mid..];
+
+        let calc_pace = |segs: &[&Seg]| -> f64 {
+            let meters: f64 = segs.iter().map(|s| s.distance).sum();
+            let secs: f64 = segs.iter().map(|s| s.seconds).sum();
+            if meters > 0.0 { secs / (meters / 1000.0) } else { 0.0 }
+        };
+        let calc_hr = |segs: &[&Seg]| -> Option<f64> {
+            let vals: Vec<f64> = segs.iter().filter_map(|s| s.avg_hr).collect();
+            if vals.is_empty() { None } else { Some(vals.iter().sum::<f64>() / vals.len() as f64) }
+        };
+        let r1 = |v: f64| (v * 10.0).round() / 10.0;
+
+        let first_pace = r1(calc_pace(first));
+        let second_pace = r1(calc_pace(second));
+        let first_hr = calc_hr(first).map(r1);
+        let second_hr = calc_hr(second).map(r1);
+        let drift = match (first_hr, second_hr) {
+            (Some(a), Some(b)) => Some(r1(b - a)),
+            _ => None,
+        };
+
+        Some(Self {
+            run_segment_count: runs.len(),
+            first_half_avg_pace_sec_per_km: first_pace,
+            second_half_avg_pace_sec_per_km: second_pace,
+            pace_fade_sec_per_km: r1(second_pace - first_pace),
+            first_half_avg_hr: first_hr,
+            second_half_avg_hr: second_hr,
+            hr_drift_bpm: drift,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FitTrackAnalysis {
     pub garmin_id: i64,
     pub chart_points: Vec<FitTrackPoint>,
     pub full_points: Vec<FitTrackPoint>,
     pub splits: Vec<FitSplit>,
+    #[serde(default)]
+    pub laps: Vec<FitLap>,
+    #[serde(default)]
+    pub compromised_run_audit: Option<CompromisedRunAudit>,
     pub decoupling_pct: Option<f64>,
     pub audit: FitGuardrailAudit,
 }

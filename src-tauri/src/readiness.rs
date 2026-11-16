@@ -56,7 +56,29 @@ impl ReadinessEngine {
             })
         });
 
+        let is_hybrid = input.athlete_config.objective.goal_type == GoalType::HybridHyrox;
+        let mut high_strain_sessions: Vec<&ActivityRecord> = input
+            .activities
+            .iter()
+            .filter(|a| is_high_strain_session(a) && parse_iso_utc(&a.start_iso).map_or(false, |dt| dt <= now))
+            .collect();
+        high_strain_sessions.sort_by(|a, b| b.start_iso.cmp(&a.start_iso));
+
+        let hours_since_last_high_strain: Option<f64> = high_strain_sessions.first().and_then(|latest| {
+            parse_iso_utc(&latest.start_iso).map(|dt| {
+                let hrs = (now - dt).num_seconds() as f64 / 3600.0;
+                round2(hrs.max(0.0))
+            })
+        });
+
         let seven_days_ago = now - Duration::days(7);
+        let hybrid_sessions_7d_count = high_strain_sessions
+            .iter()
+            .filter(|a| {
+                !is_running_type(&a.type_key)
+                    && parse_iso_utc(&a.start_iso).map_or(false, |dt| dt >= seven_days_ago)
+            })
+            .count();
         let runs_7d: Vec<&ActivityRecord> = prior_runs
             .iter()
             .copied()
@@ -87,10 +109,12 @@ impl ReadinessEngine {
         // 3. Hard Blocks (`CONTRACT.md §3.2`)
         let mut hard_blocks = Vec::new();
         let min_spacing_hours = input.athlete_config.medical.min_rest_hours_between_runs.unwrap_or(36) as f64;
-        if let Some(hrs) = hours_since_last_run {
+        let spacing_ref_hours = if is_hybrid { hours_since_last_high_strain } else { hours_since_last_run };
+        let spacing_label = if is_hybrid { "high-strain session" } else { "run" };
+        if let Some(hrs) = spacing_ref_hours {
             if hrs < min_spacing_hours {
                 hard_blocks.push(format!(
-                    "STRUCTURAL_SPACING_VIOLATION: {hrs:.1}h since last run (min required: {}h).",
+                    "STRUCTURAL_SPACING_VIOLATION: {hrs:.1}h since last {spacing_label} (min required: {}h).",
                     min_spacing_hours as i32
                 ));
             }
@@ -261,7 +285,7 @@ impl ReadinessEngine {
                 )
             };
 
-        let audit_summary = if run_permitted {
+        let mut audit_summary = if run_permitted {
             format!(
                 "Gatekeeper clear ({} caution flag(s)). Rolling 7d: {rolling_7d_km:.1} km.",
                 caution_flags.len()
@@ -291,6 +315,15 @@ impl ReadinessEngine {
             checklist.push("Adhere to gatekeeper running prohibition.".to_string());
             let walk_cap = input.plan.and_then(|p| p.envelope.walk_hr_cap_bpm).unwrap_or(110);
             checklist.push(format!("Optional walking must stay <= {walk_cap} bpm."));
+        }
+        if is_hybrid {
+            audit_summary.push_str(&format!(
+                " Hybrid 7d load: {hybrid_sessions_7d_count} strength/erg session(s)."
+            ));
+            checklist.push(format!(
+                "Hybrid spacing: high-strain strength/erg sessions count toward the {}h structural spacing rule.",
+                min_spacing_hours as i32
+            ));
         }
 
         let planned_session_snapshot = today_session.map(|s| PlannedSessionSnapshot {
@@ -402,6 +435,21 @@ impl ReadinessEngine {
 fn is_running_type(type_key: &str) -> bool {
     let lower = type_key.to_lowercase();
     lower.contains("run") || lower == "trail_running" || lower == "treadmill_running"
+}
+
+pub fn is_high_strain_session(activity: &ActivityRecord) -> bool {
+    if is_running_type(&activity.type_key) {
+        return true;
+    }
+    let lower = activity.type_key.to_lowercase();
+    let is_hybrid_type = matches!(
+        lower.as_str(),
+        "strength_training" | "hiit" | "cardio" | "indoor_rowing"
+    );
+    if !is_hybrid_type {
+        return false;
+    }
+    activity.training_load.unwrap_or(0.0) >= 80.0
 }
 
 fn parse_iso_utc(raw: &str) -> Option<DateTime<Utc>> {

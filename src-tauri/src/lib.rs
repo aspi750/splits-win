@@ -50,6 +50,9 @@ fn get_bootstrap_state(state: State<'_, AppState>) -> Result<serde_json::Value, 
     let activities = db.list_activities(50).map_err(|e| e.to_string())?;
     let days = db.list_days(60).map_err(|e| e.to_string())?;
     let settings = state.settings.lock().unwrap().clone();
+    let profile_md = store.read_text("COACH_PROFILE.md").map_err(|e| e.to_string())?.unwrap_or_default();
+    let plan_md = store.read_text("TRAINING_PLAN.md").map_err(|e| e.to_string())?.unwrap_or_default();
+    let needs_initial_coach_setup = profile_md.trim().is_empty() || plan_md.trim().is_empty();
 
     Ok(serde_json::json!({
         "has_garmin_key": has_garmin_key,
@@ -61,6 +64,7 @@ fn get_bootstrap_state(state: State<'_, AppState>) -> Result<serde_json::Value, 
         "readiness_state": readiness,
         "activities": activities,
         "days": days,
+        "needs_initial_coach_setup": needs_initial_coach_setup,
     }))
 }
 
@@ -128,11 +132,15 @@ fn recompute_readiness(state: State<'_, AppState>) -> Result<ReadinessState, Str
 
 #[tauri::command]
 async fn sync_garmin_now(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+    let db = state.open_db()?;
+    let initial_backfill = db.list_activities(1).map_err(|e| e.to_string())?.is_empty();
     let client = garmin::GarminClient::new(None);
-    let (synced_activities, synced_days) = client.sync_recent(35).await.map_err(|e| e.to_string())?;
+    let (synced_activities, synced_days) = client
+        .sync_lifetime_and_wellness(initial_backfill)
+        .await
+        .map_err(|e| e.to_string())?;
 
     let store = state.load_store()?;
-    let db = state.open_db()?;
     let acts = synced_activities.len();
     let days_count = synced_days.len();
     for a in &synced_activities {
@@ -190,6 +198,28 @@ fn apply_coach_proposal(state: State<'_, AppState>, proposal: CoachUpdateProposa
 }
 
 #[tauri::command]
+fn generate_starter_coach_files(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+    let store = state.load_store()?;
+    let db = state.open_db()?;
+    let config = store.load_athlete_config().map_err(|e| e.to_string())?.unwrap_or_default();
+    let activities = db.list_activities(5000).map_err(|e| e.to_string())?;
+    let summary = coach::analyze_training_history(&activities, &config, Utc::now());
+
+    let profile_existing = store.read_text("COACH_PROFILE.md").map_err(|e| e.to_string())?.unwrap_or_default();
+    let plan_existing = store.read_text("TRAINING_PLAN.md").map_err(|e| e.to_string())?.unwrap_or_default();
+
+    if profile_existing.trim().is_empty() {
+        let md = coach::starter_coach_profile_markdown(&config, &summary);
+        store.write_text_atomic("COACH_PROFILE.md", &md).map_err(|e| e.to_string())?;
+    }
+    if plan_existing.trim().is_empty() {
+        let md = coach::starter_training_plan_markdown(&config, &summary);
+        store.write_text_atomic("TRAINING_PLAN.md", &md).map_err(|e| e.to_string())?;
+    }
+    Ok(serde_json::json!({ "ok": true, "days_of_history": summary.days_of_history }))
+}
+
+#[tauri::command]
 async fn get_activity_detail(
     state: State<'_, AppState>,
     activity_id: i64,
@@ -234,14 +264,11 @@ async fn send_coach_message(
     let store = state.load_store()?;
     let db = state.open_db()?;
     let config = store.load_athlete_config().map_err(|e| e.to_string())?.unwrap_or_default();
-    let activities = db.list_activities(50).map_err(|e| e.to_string())?;
-    let days = db.list_days(60).map_err(|e| e.to_string())?;
+    let activities = db.list_activities(5000).map_err(|e| e.to_string())?;
+    let days = db.list_days(365).map_err(|e| e.to_string())?;
 
     if let Some(api_key) = CredentialStore::read_secret(APP_SERVICE, GEMINI_ACCOUNT) {
-        let sys = format!(
-            "You are a training-planning coach inside Splits Coach. Use metric units.\n\n{}",
-            config.prompt_summary(None)
-        );
+        let sys = coach::build_static_system_instruction(&store, &config, &activities);
         let (text, proposals) =
             coach::run_gemini_coach_turn(Some(&app), &api_key, &sys, &prompt, &store, Some(&db), &activities, &days)
                 .await?;
@@ -313,6 +340,7 @@ pub fn run() {
             build_coach_packet,
             send_coach_message,
             apply_coach_proposal,
+            generate_starter_coach_files,
             get_activity_detail,
         ])
         .run(tauri::generate_context!())

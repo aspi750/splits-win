@@ -1,5 +1,9 @@
 use chrono::{Duration, TimeZone, Utc};
-use splits_win_lib::coach::{apply_coach_proposal, replacing_section, slice_fit_track_by_km, CoachPacketBuilder};
+use splits_win_lib::coach::{
+    analyze_training_history, apply_coach_proposal, compact_history_markdown, replacing_section,
+    slice_fit_track_by_km, starter_coach_profile_markdown, starter_training_plan_markdown,
+    CoachPacketBuilder,
+};
 use splits_win_lib::garmin::analyze_fit_points;
 use splits_win_lib::models::*;
 use splits_win_lib::readiness::{ReadinessEngine, ReadinessInput};
@@ -294,4 +298,158 @@ fn test_query_run_slice_against_sqlite_fit_tracks() {
     let slice = slice_fit_track_by_km(&loaded, 0.5, 1.5);
     assert_eq!(slice["garmin_id"].as_i64(), Some(777));
     assert_eq!(slice["point_count"].as_u64(), Some(2));
+}
+
+#[test]
+fn test_stage2_2_hybrid_hyrox_spacing_and_compromised_run_audit() {
+    let now = Utc.with_ymd_and_hms(2026, 11, 16, 10, 0, 0).unwrap();
+    let mut days = Vec::new();
+    for offset in 0..10 {
+        let d = (now - Duration::days(offset)).format("%Y-%m-%d").to_string();
+        days.push(DayRecord {
+            date: d,
+            resting_hr: Some(50),
+            stress_avg: None,
+            body_battery_high: Some(85),
+            body_battery_latest: Some(60),
+            steps: Some(8000),
+            step_goal: Some(8000),
+            sleep_seconds: Some(27_000),
+            sleep_score: Some(84),
+            hrv_last_night: Some(55),
+            hrv_status: Some("BALANCED".to_string()),
+        });
+    }
+
+    let strength = ActivityRecord {
+        garmin_id: 901,
+        name: "Heavy Leg Strength & Sled".to_string(),
+        type_key: "strength_training".to_string(),
+        start_iso: (now - Duration::hours(12)).to_rfc3339(),
+        distance_m: 0.0,
+        duration_sec: 3600.0,
+        moving_duration_sec: 3600.0,
+        elevation_gain_m: 0.0,
+        average_hr: Some(138.0),
+        max_hr: Some(165.0),
+        cadence_spm: None,
+        training_load: Some(120.0),
+        shoe_name: None,
+    };
+
+    let mut hybrid_config = AthleteConfig::default();
+    hybrid_config.objective.goal_type = GoalType::HybridHyrox;
+    hybrid_config.medical.min_rest_hours_between_runs = Some(36);
+    hybrid_config.objective.hybrid_profile = Some(HybridProfile {
+        division: Some("Open Men".to_string()),
+        focus_stations: vec!["Sled Push".to_string(), "Wall Balls".to_string()],
+        weekly_hybrid_sessions_target: Some(3),
+    });
+
+    let hybrid_out = ReadinessEngine::evaluate(ReadinessInput {
+        now,
+        athlete_config: &hybrid_config,
+        activities: &[strength.clone()],
+        days: &days,
+        plan: None,
+        gear_inventory: None,
+    });
+    assert!(!hybrid_out.readiness_state.gatekeeper.run_permitted);
+    assert!(hybrid_out
+        .readiness_state
+        .gatekeeper
+        .hard_blocks
+        .iter()
+        .any(|b| b.starts_with("STRUCTURAL_SPACING_VIOLATION")));
+
+    let mut base_config = hybrid_config.clone();
+    base_config.objective.goal_type = GoalType::BaseBuilding;
+    let base_out = ReadinessEngine::evaluate(ReadinessInput {
+        now,
+        athlete_config: &base_config,
+        activities: &[strength],
+        days: &days,
+        plan: None,
+        gear_inventory: None,
+    });
+    assert!(base_out.readiness_state.gatekeeper.run_permitted);
+
+    // CompromisedRunAudit
+    let laps = vec![
+        FitLap { elapsed_sec: 260.0, moving_sec: 260.0, distance_m: 1000.0, avg_hr_bpm: Some(152.0) },
+        FitLap { elapsed_sec: 120.0, moving_sec: 120.0, distance_m: 50.0, avg_hr_bpm: Some(160.0) },
+        FitLap { elapsed_sec: 265.0, moving_sec: 265.0, distance_m: 1000.0, avg_hr_bpm: Some(156.0) },
+        FitLap { elapsed_sec: 140.0, moving_sec: 140.0, distance_m: 40.0, avg_hr_bpm: Some(166.0) },
+        FitLap { elapsed_sec: 290.0, moving_sec: 290.0, distance_m: 1000.0, avg_hr_bpm: Some(168.0) },
+        FitLap { elapsed_sec: 150.0, moving_sec: 150.0, distance_m: 30.0, avg_hr_bpm: Some(172.0) },
+        FitLap { elapsed_sec: 300.0, moving_sec: 300.0, distance_m: 1000.0, avg_hr_bpm: Some(172.0) },
+        FitLap { elapsed_sec: 130.0, moving_sec: 130.0, distance_m: 20.0, avg_hr_bpm: Some(175.0) },
+    ];
+    let audit = CompromisedRunAudit::compute(&laps).unwrap();
+    assert_eq!(audit.run_segment_count, 4);
+    assert_eq!(audit.pace_fade_sec_per_km, 32.5);
+    assert_eq!(audit.hr_drift_bpm, Some(16.0));
+}
+
+#[test]
+fn test_stage2_2_training_history_analyzer_and_starter_templates() {
+    let now = Utc.with_ymd_and_hms(2026, 11, 16, 10, 0, 0).unwrap();
+    let mut activities = Vec::new();
+    for offset in (1..=45).step_by(2) {
+        let start = now - Duration::days(offset);
+        activities.push(ActivityRecord {
+            garmin_id: offset * 10,
+            name: format!("Easy Run {offset}"),
+            type_key: "running".to_string(),
+            start_iso: start.to_rfc3339(),
+            distance_m: 8000.0,
+            duration_sec: 2880.0,
+            moving_duration_sec: 2880.0,
+            elevation_gain_m: 40.0,
+            average_hr: Some(142.0),
+            max_hr: Some(155.0),
+            cadence_spm: Some(174.0),
+            training_load: Some(60.0),
+            shoe_name: None,
+        });
+        if offset % 4 == 1 {
+            activities.push(ActivityRecord {
+                garmin_id: offset * 10 + 1,
+                name: "Hybrid Erg & Sled".to_string(),
+                type_key: "strength_training".to_string(),
+                start_iso: (start + Duration::hours(1)).to_rfc3339(),
+                distance_m: 0.0,
+                duration_sec: 2700.0,
+                moving_duration_sec: 2700.0,
+                elevation_gain_m: 0.0,
+                average_hr: Some(135.0),
+                max_hr: Some(162.0),
+                cadence_spm: None,
+                training_load: Some(90.0),
+                shoe_name: None,
+            });
+        }
+    }
+
+    let mut config = AthleteConfig::default();
+    config.specs.display_name = "Test Athlete".to_string();
+    config.objective.goal_type = GoalType::HybridHyrox;
+
+    let summary = analyze_training_history(&activities, &config, now);
+    assert!(summary.has_enough_history_for_audit);
+    assert!(summary.lifetime.total_run_km > 150.0);
+    assert!(summary.trailing.run_sessions > 15);
+    assert!(summary.trailing.hybrid_sessions > 5);
+
+    let md = compact_history_markdown(&summary);
+    assert!(md.contains("Lifetime"));
+    assert!(md.contains("Trailing"));
+
+    let profile = starter_coach_profile_markdown(&config, &summary);
+    assert!(profile.contains("## Athlete Identity"));
+    assert!(profile.contains("## AVAILABILITY & CONTEXT"));
+
+    let plan = starter_training_plan_markdown(&config, &summary);
+    assert!(plan.contains("## Current Phase & Baseline"));
+    assert!(plan.contains("## Change History"));
 }

@@ -1,6 +1,6 @@
 use crate::models::{
-    ActivityRecord, AthleteConfig, DayRecord, FitGuardrailAudit, FitSplit, FitTrackAnalysis,
-    FitTrackPoint, APP_SERVICE, GARMIN_ACCOUNT,
+    ActivityRecord, AthleteConfig, CompromisedRunAudit, DayRecord, FitGuardrailAudit, FitLap,
+    FitSplit, FitTrackAnalysis, FitTrackPoint, APP_SERVICE, GARMIN_ACCOUNT,
 };
 use crate::storage::CredentialStore;
 use chrono::{Duration, Utc};
@@ -293,6 +293,141 @@ impl GarminClient {
         let days: Vec<DayRecord> = days_map.into_values().collect();
         Ok((activities, days))
     }
+
+    /// Full lifetime activity pagination + 365-day wellness backfill on first sync,
+    /// or incremental 35-day sync when `initial_backfill` is false.
+    pub async fn sync_lifetime_and_wellness(
+        &self,
+        initial_backfill: bool,
+    ) -> Result<(Vec<ActivityRecord>, Vec<DayRecord>), GarminError> {
+        if !initial_backfill {
+            return self.sync_recent(35).await;
+        }
+
+        let now = Utc::now();
+        let mut activities = Vec::new();
+        let mut start = 0usize;
+        const PAGE_SIZE: usize = 100;
+        const MAX_PAGES: usize = 50;
+
+        for _ in 0..MAX_PAGES {
+            let start_param = start.to_string();
+            let limit_param = PAGE_SIZE.to_string();
+            let act_bytes = self
+                .get_bytes(
+                    "/activitylist-service/activities/search/activities",
+                    &[("start", &start_param), ("limit", &limit_param)],
+                    "application/json",
+                )
+                .await?;
+            let dtos: Vec<ActivityDTO> = serde_json::from_slice(&act_bytes).unwrap_or_default();
+            let count = dtos.len();
+            for dto in dtos {
+                activities.push(ActivityRecord {
+                    garmin_id: dto.activity_id,
+                    name: dto.activity_name.unwrap_or_default(),
+                    type_key: dto
+                        .activity_type
+                        .and_then(|t| t.type_key)
+                        .unwrap_or_else(|| "other".to_string()),
+                    start_iso: dto.start_time_local.unwrap_or_else(|| now.to_rfc3339()),
+                    distance_m: dto.distance.unwrap_or(0.0),
+                    duration_sec: dto.duration.unwrap_or(0.0),
+                    moving_duration_sec: dto.moving_duration.or(dto.duration).unwrap_or(0.0),
+                    elevation_gain_m: dto.elevation_gain.unwrap_or(0.0),
+                    average_hr: dto.average_hr,
+                    max_hr: dto.max_hr,
+                    cadence_spm: dto.average_running_cadence_in_steps_per_minute,
+                    training_load: dto.activity_training_load,
+                    shoe_name: None,
+                });
+            }
+            if count < PAGE_SIZE {
+                break;
+            }
+            start += PAGE_SIZE;
+        }
+
+        // 365-day wellness backfill in 35-day chunks
+        let mut days_map: HashMap<String, DayRecord> = HashMap::new();
+        let mut chunk_end = now;
+        let earliest = now - Duration::days(365);
+        while chunk_end > earliest {
+            let chunk_start = (chunk_end - Duration::days(35)).max(earliest);
+            let s_str = chunk_start.format("%Y-%m-%d").to_string();
+            let e_str = chunk_end.format("%Y-%m-%d").to_string();
+
+            if let Ok(sum_bytes) = self
+                .get_bytes(
+                    "/usersummary-service/v2/dailysummaries",
+                    &[("startDate", &s_str), ("endDate", &e_str)],
+                    "application/json",
+                )
+                .await
+            {
+                if let Ok(summaries) = serde_json::from_slice::<DailySummariesDTO>(&sum_bytes) {
+                    for d in summaries.data {
+                        if let Some(date) = d.calendar_date {
+                            let entry = days_map.entry(date.clone()).or_insert_with(|| empty_day(&date));
+                            entry.resting_hr = d.heart_rate.and_then(|h| h.resting_value);
+                            entry.stress_avg = d.stress.and_then(|s| s.avg_level);
+                            if let Some(bb) = d.body_battery {
+                                entry.body_battery_high = bb.max_value;
+                                entry.body_battery_latest = bb.latest_value;
+                            }
+                            if let Some(steps) = d.movement.and_then(|m| m.steps) {
+                                entry.steps = steps.count.or(steps.value);
+                                entry.step_goal = steps.goal;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if let Ok(sleep_bytes) = self
+                .get_bytes(
+                    "/sleep-service/sleep/dailySleepSummariesByDate",
+                    &[("startDate", &s_str), ("endDate", &e_str)],
+                    "application/json",
+                )
+                .await
+            {
+                if let Ok(sleeps) = serde_json::from_slice::<Vec<SleepDTO>>(&sleep_bytes) {
+                    for s in sleeps {
+                        if let Some(date) = s.calendar_date {
+                            let entry = days_map.entry(date.clone()).or_insert_with(|| empty_day(&date));
+                            entry.sleep_seconds = s.sleep_time_seconds;
+                            entry.sleep_score = s.sleep_scores.and_then(|sc| sc.overall).and_then(|o| o.value);
+                        }
+                    }
+                }
+            }
+
+            if let Ok(hrv_bytes) = self
+                .get_bytes(
+                    &format!("/hrv-service/hrv/daily/{s_str}/{e_str}"),
+                    &[],
+                    "application/json",
+                )
+                .await
+            {
+                if let Ok(hrv) = serde_json::from_slice::<HRVRangeDTO>(&hrv_bytes) {
+                    for h in hrv.hrv_summaries.unwrap_or_default() {
+                        if let Some(date) = h.calendar_date {
+                            let entry = days_map.entry(date.clone()).or_insert_with(|| empty_day(&date));
+                            entry.hrv_last_night = h.last_night_avg;
+                            entry.hrv_status = h.status;
+                        }
+                    }
+                }
+            }
+
+            chunk_end = chunk_start - Duration::days(1);
+        }
+
+        let days: Vec<DayRecord> = days_map.into_values().collect();
+        Ok((activities, days))
+    }
 }
 
 fn empty_day(date: &str) -> DayRecord {
@@ -439,9 +574,34 @@ pub fn parse_fit_track(
 ) -> Result<FitTrackAnalysis, String> {
     let records = fitparser::from_bytes(bytes).map_err(|e| format!("FIT parse error: {e}"))?;
     let mut points = Vec::new();
+    let mut laps = Vec::new();
     let mut base_ts: Option<f64> = None;
 
     for msg in records {
+        if msg.kind() == fitparser::profile::MesgNum::Lap {
+            let mut elapsed_sec = 0.0;
+            let mut moving_sec = 0.0;
+            let mut distance_m = 0.0;
+            let mut avg_hr_bpm: Option<f64> = None;
+            for field in msg.fields() {
+                match field.name() {
+                    "total_elapsed_time" => elapsed_sec = value_as_f64(field.value()).unwrap_or(0.0),
+                    "total_timer_time" => moving_sec = value_as_f64(field.value()).unwrap_or(0.0),
+                    "total_distance" => distance_m = value_as_f64(field.value()).unwrap_or(0.0),
+                    "avg_heart_rate" => avg_hr_bpm = value_as_f64(field.value()),
+                    _ => {}
+                }
+            }
+            if elapsed_sec > 0.0 || moving_sec > 0.0 || distance_m > 0.0 {
+                laps.push(FitLap {
+                    elapsed_sec,
+                    moving_sec: if moving_sec > 0.0 { moving_sec } else { elapsed_sec },
+                    distance_m,
+                    avg_hr_bpm,
+                });
+            }
+            continue;
+        }
         if msg.kind() != fitparser::profile::MesgNum::Record {
             continue;
         }
@@ -494,7 +654,10 @@ pub fn parse_fit_track(
         });
     }
 
-    Ok(analyze_fit_points(garmin_id, points, config))
+    let mut analysis = analyze_fit_points(garmin_id, points, config);
+    analysis.compromised_run_audit = CompromisedRunAudit::compute(&laps);
+    analysis.laps = laps;
+    Ok(analysis)
 }
 
 pub fn analyze_fit_points(
@@ -537,6 +700,8 @@ pub fn analyze_fit_points(
         chart_points,
         full_points,
         splits,
+        laps: Vec::new(),
+        compromised_run_audit: None,
         decoupling_pct,
         audit: FitGuardrailAudit {
             pace_floor_sec_per_km: pace_floor,

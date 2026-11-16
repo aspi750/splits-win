@@ -1,7 +1,8 @@
 use crate::models::*;
 use crate::readiness::{ReadinessEngine, ReadinessInput};
 use crate::storage::{CredentialStore, Database, SharedStore};
-use chrono::{DateTime, Duration, Local, NaiveDate, Utc};
+use chrono::{DateTime, Datelike, Duration, Local, NaiveDate, Utc};
+use std::collections::BTreeMap;
 use futures_util::StreamExt;
 use reqwest::Client;
 use serde_json::{json, Value};
@@ -309,6 +310,11 @@ pub fn gemini_tool_declarations() -> Value {
             "name": "get_readiness_and_plan",
             "description": "Return readiness_state.json, plan.json, today_adapted_target.json, and coaching logs.",
             "parameters": { "type": "OBJECT", "properties": {} }
+        },
+        {
+            "name": "get_lifetime_and_yearly_history",
+            "description": "Return a two-tier training history overview: Tier 1 (lifetime totals, annual breakdown, peak 7d/28d) and Tier 2 (trailing 365-day block audit, consistency, run-to-hybrid ratio).",
+            "parameters": { "type": "OBJECT", "properties": {} }
         }
     ])
 }
@@ -363,6 +369,7 @@ fn tool_status_label(name: &str) -> &'static str {
         "get_wellness_history" => "Analyzing sleep, HRV & wellness history…",
         "get_training_load_and_records" => "Computing training load & records…",
         "get_readiness_and_plan" => "Checking readiness gatekeeper & plan…",
+        "get_lifetime_and_yearly_history" => "Auditing lifetime & 365-day training history…",
         "propose_coach_update" => "Drafting profile/plan update…",
         "query_run_slice" => "Inspecting run kilometer slice…",
         _ => "Running coach tool…",
@@ -591,6 +598,8 @@ fn execute_tool(
                     "activity": act,
                     "fit_track_cached": track.is_some(),
                     "splits": track.as_ref().map(|t| &t.splits),
+                    "laps": track.as_ref().map(|t| &t.laps),
+                    "compromised_run_audit": track.as_ref().and_then(|t| t.compromised_run_audit.as_ref()),
                     "decoupling_pct": track.as_ref().and_then(|t| t.decoupling_pct),
                     "guardrail_audit": track.as_ref().map(|t| &t.audit),
                 })
@@ -628,6 +637,14 @@ fn execute_tool(
                 "plan": plan
             })
         }
+        "get_lifetime_and_yearly_history" => {
+            let config = store.load_athlete_config().ok().flatten().unwrap_or_default();
+            let summary = analyze_training_history(activities, &config, Utc::now());
+            json!({
+                "summary": summary,
+                "compact_markdown": compact_history_markdown(&summary)
+            })
+        }
         _ => json!({ "status": "ok", "note": "Local summary returned", "count": activities.len() }),
     }
 }
@@ -663,4 +680,339 @@ fn format_minutes(minutes: f64) -> String {
     } else {
         format!("{m}m")
     }
+}
+
+pub const MIN_HISTORY_DAYS_FOR_AUDIT: i64 = 14;
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct YearStat {
+    pub year: i32,
+    pub run_km: f64,
+    pub hours: f64,
+    pub run_count: usize,
+    pub activity_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct LifetimeHistory {
+    pub earliest_iso: Option<String>,
+    pub total_activities: usize,
+    pub total_run_km: f64,
+    pub years: Vec<YearStat>,
+    pub peak_7d_km: f64,
+    pub peak_28d_km: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct TrailingAudit {
+    pub weeks_analyzed: usize,
+    pub avg_weekly_km: f64,
+    pub avg_weekly_runs: f64,
+    pub long_run_km_low: Option<f64>,
+    pub long_run_km_high: Option<f64>,
+    pub run_sessions: usize,
+    pub hybrid_sessions: usize,
+    pub run_to_hybrid_ratio: Option<f64>,
+    pub consistency_pct: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct TrainingHistorySummary {
+    pub generated_at: String,
+    pub goal_type: GoalType,
+    pub days_of_history: i64,
+    pub has_enough_history_for_audit: bool,
+    pub lifetime: LifetimeHistory,
+    pub trailing: TrailingAudit,
+}
+
+fn is_run_type(type_key: &str) -> bool {
+    type_key.to_lowercase().contains("run")
+}
+
+fn is_hybrid_type(type_key: &str) -> bool {
+    let lower = type_key.to_lowercase();
+    matches!(lower.as_str(), "strength_training" | "hiit" | "cardio" | "indoor_rowing")
+}
+
+fn round1(v: f64) -> f64 {
+    (v * 10.0).round() / 10.0
+}
+
+pub fn analyze_training_history(
+    activities: &[ActivityRecord],
+    config: &AthleteConfig,
+    now: DateTime<Utc>,
+) -> TrainingHistorySummary {
+    let mut past: Vec<(&ActivityRecord, DateTime<Utc>)> = activities
+        .iter()
+        .filter_map(|a| parse_iso(&a.start_iso).filter(|dt| *dt <= now).map(|dt| (a, dt)))
+        .collect();
+    past.sort_by_key(|(_, dt)| *dt);
+
+    let earliest_dt = past.first().map(|(_, dt)| *dt);
+    let days_of_history = earliest_dt.map_or(0, |e| (now - e).num_days().max(0));
+
+    let runs: Vec<(&ActivityRecord, DateTime<Utc>)> = past
+        .iter()
+        .copied()
+        .filter(|(a, _)| is_run_type(&a.type_key))
+        .collect();
+
+    let total_run_km = round1(runs.iter().map(|(a, _)| a.distance_km()).sum());
+
+    let mut by_year: BTreeMap<i32, (f64, f64, usize, usize)> = BTreeMap::new();
+    for (a, dt) in &past {
+        let entry = by_year.entry(dt.year()).or_insert((0.0, 0.0, 0, 0));
+        entry.1 += a.moving_duration_sec / 3600.0;
+        entry.3 += 1;
+        if is_run_type(&a.type_key) {
+            entry.0 += a.distance_km();
+            entry.2 += 1;
+        }
+    }
+    let years: Vec<YearStat> = by_year
+        .into_iter()
+        .map(|(year, (run_km, hours, run_count, activity_count))| YearStat {
+            year,
+            run_km: round1(run_km),
+            hours: round1(hours),
+            run_count,
+            activity_count,
+        })
+        .collect();
+
+    // Rolling peak 7d & 28d across runs
+    let mut peak_7d = 0.0_f64;
+    let mut peak_28d = 0.0_f64;
+    for (_, end_dt) in &runs {
+        let w7_start = *end_dt - Duration::days(7);
+        let w28_start = *end_dt - Duration::days(28);
+        let s7: f64 = runs
+            .iter()
+            .filter(|(_, dt)| *dt >= w7_start && *dt <= *end_dt)
+            .map(|(a, _)| a.distance_km())
+            .sum();
+        let s28: f64 = runs
+            .iter()
+            .filter(|(_, dt)| *dt >= w28_start && *dt <= *end_dt)
+            .map(|(a, _)| a.distance_km())
+            .sum();
+        peak_7d = peak_7d.max(s7);
+        peak_28d = peak_28d.max(s28);
+    }
+
+    // Trailing 365 days
+    let cutoff_365 = now - Duration::days(365);
+    let trailing_acts: Vec<(&ActivityRecord, DateTime<Utc>)> = past
+        .iter()
+        .copied()
+        .filter(|(_, dt)| *dt >= cutoff_365)
+        .collect();
+    let trailing_runs: Vec<(&ActivityRecord, DateTime<Utc>)> = trailing_acts
+        .iter()
+        .copied()
+        .filter(|(a, _)| is_run_type(&a.type_key))
+        .collect();
+    let run_sessions = trailing_runs.len();
+    let hybrid_sessions = trailing_acts
+        .iter()
+        .filter(|(a, _)| is_hybrid_type(&a.type_key))
+        .count();
+
+    let weeks_analyzed = if days_of_history > 0 {
+        ((days_of_history.min(365) as f64) / 7.0).ceil().max(1.0) as usize
+    } else {
+        0
+    };
+    let trailing_km: f64 = trailing_runs.iter().map(|(a, _)| a.distance_km()).sum();
+    let avg_weekly_km = if weeks_analyzed > 0 {
+        round1(trailing_km / weeks_analyzed as f64)
+    } else {
+        0.0
+    };
+    let avg_weekly_runs = if weeks_analyzed > 0 {
+        round1(run_sessions as f64 / weeks_analyzed as f64)
+    } else {
+        0.0
+    };
+
+    let mut week_buckets: BTreeMap<(i32, u32), f64> = BTreeMap::new();
+    for (a, dt) in &trailing_runs {
+        let iso = dt.iso_week();
+        *week_buckets.entry((iso.year(), iso.week())).or_insert(0.0) += a.distance_km();
+    }
+    let active_weeks = week_buckets.values().filter(|&&km| km > 0.0).count();
+    let consistency_pct = if weeks_analyzed > 0 {
+        round1((active_weeks as f64 / weeks_analyzed as f64) * 100.0).min(100.0)
+    } else {
+        0.0
+    };
+
+    let mut run_dists: Vec<f64> = trailing_runs.iter().map(|(a, _)| a.distance_km()).collect();
+    run_dists.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let (long_run_km_low, long_run_km_high) = if run_dists.len() >= 4 {
+        let top_start = (run_dists.len() * 3) / 4;
+        let top = &run_dists[top_start..];
+        (
+            top.first().map(|v| round1(*v)),
+            top.last().map(|v| round1(*v)),
+        )
+    } else {
+        (None, None)
+    };
+
+    let run_to_hybrid_ratio = if hybrid_sessions > 0 {
+        Some(round1(run_sessions as f64 / hybrid_sessions as f64))
+    } else {
+        None
+    };
+
+    TrainingHistorySummary {
+        generated_at: now.to_rfc3339(),
+        goal_type: config.objective.goal_type,
+        days_of_history,
+        has_enough_history_for_audit: days_of_history >= MIN_HISTORY_DAYS_FOR_AUDIT,
+        lifetime: LifetimeHistory {
+            earliest_iso: earliest_dt.map(|d| d.to_rfc3339()),
+            total_activities: past.len(),
+            total_run_km,
+            years,
+            peak_7d_km: round1(peak_7d),
+            peak_28d_km: round1(peak_28d),
+        },
+        trailing: TrailingAudit {
+            weeks_analyzed,
+            avg_weekly_km,
+            avg_weekly_runs,
+            long_run_km_low,
+            long_run_km_high,
+            run_sessions,
+            hybrid_sessions,
+            run_to_hybrid_ratio,
+            consistency_pct,
+        },
+    }
+}
+
+pub fn compact_history_markdown(summary: &TrainingHistorySummary) -> String {
+    let mut lines = vec![
+        "### Tier 1: Lifetime Training Overview".to_string(),
+        format!(
+            "- **Totals**: {} activities, {:.1} km running across {} year(s)",
+            summary.lifetime.total_activities,
+            summary.lifetime.total_run_km,
+            summary.lifetime.years.len()
+        ),
+        format!(
+            "- **Peak Volume**: {:.1} km (7d) · {:.1} km (28d)",
+            summary.lifetime.peak_7d_km, summary.lifetime.peak_28d_km
+        ),
+    ];
+    for y in &summary.lifetime.years {
+        lines.push(format!(
+            "  - {}: {:.1} km ({} runs, {} total activities, {:.1}h)",
+            y.year, y.run_km, y.run_count, y.activity_count, y.hours
+        ));
+    }
+    lines.push(format!(
+        "### Tier 2: Trailing 365-Day Block Audit ({} weeks)",
+        summary.trailing.weeks_analyzed
+    ));
+    lines.push(format!(
+        "- **Weekly Baseline**: {:.1} km/wk · {:.1} runs/wk · Consistency {:.1}%",
+        summary.trailing.avg_weekly_km,
+        summary.trailing.avg_weekly_runs,
+        summary.trailing.consistency_pct
+    ));
+    if summary.trailing.hybrid_sessions > 0 {
+        lines.push(format!(
+            "- **Hybrid Mix**: {} runs, {} strength/erg sessions",
+            summary.trailing.run_sessions, summary.trailing.hybrid_sessions
+        ));
+    }
+    lines.join("\n")
+}
+
+pub fn starter_coach_profile_markdown(config: &AthleteConfig, summary: &TrainingHistorySummary) -> String {
+    let today = Local::now().format("%Y-%m-%d").to_string();
+    let name = config.specs.display_name.trim();
+    let display_name = if name.is_empty() { "Athlete" } else { name };
+    let vt1_line = config
+        .specs
+        .vt1_ceiling_bpm
+        .map_or("- `TODO: add VT1 aerobic ceiling`".to_string(), |v| {
+            format!("- **VT1 aerobic ceiling**: {v} bpm")
+        });
+    let rest_line = config
+        .medical
+        .min_rest_hours_between_runs
+        .map_or("- **Min spacing**: 36 hours".to_string(), |v| {
+            format!("- **Min spacing**: {v} hours between high-strain sessions")
+        });
+
+    format!(
+        "# COACH PROFILE\n\n## Athlete Identity\n- **Athlete**: {display_name}\n- **Units**: Metric (km, min/km, bpm, kg)\n- **Objective**: {}\n\n## Lab Data & Heart Rate Zones\n{vt1_line}\n\n## Medical & Biomechanical Guardrails\n{rest_line}\n\n## AVAILABILITY & CONTEXT\n| key | value | valid_from | valid_until | source | last_confirmed |\n| --- | --- | --- | --- | --- | --- |\n| training_days | {} days/week | {today} | open | athlete_config | {today} |\n\n## Change History\n- `{today}`: Seeded starter COACH_PROFILE.md from AthleteConfig and {} days of history.\n",
+        config.objective.goal_type.display_name(),
+        config.availability.available_days.len(),
+        summary.days_of_history
+    )
+}
+
+pub fn starter_training_plan_markdown(config: &AthleteConfig, summary: &TrainingHistorySummary) -> String {
+    let today = Local::now().format("%Y-%m-%d").to_string();
+    let baseline = if summary.has_enough_history_for_audit {
+        format!(
+            "- **Recent baseline (trailing 365 days)**: {:.1} km/week and {:.1} runs/week",
+            summary.trailing.avg_weekly_km, summary.trailing.avg_weekly_runs
+        )
+    } else {
+        "- **Recent baseline**: fewer than 14 days of synced history; start conservatively and re-baseline after two weeks.".to_string()
+    };
+    let race_line = match config.objective.race_name.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(rn) => format!("- **Target Event**: {rn}"),
+        None => "- **Target Event**: Open / Base progression".to_string(),
+    };
+
+    format!(
+        "# TRAINING PLAN\n\n## Current Phase & Baseline\n- **Objective**: {}\n{baseline}\n\n## Mesocycle & Block Structure\n- **Block Rhythm**: 3 build weeks followed by 1 deload week.\n\n## Race Calendar & Targets\n{race_line}\n\n## Change History\n- `{today}`: Seeded starter TRAINING_PLAN.md from synced history.\n",
+        config.objective.goal_type.display_name()
+    )
+}
+
+pub fn first_use_setup_instructions(summary: &TrainingHistorySummary) -> String {
+    if summary.has_enough_history_for_audit {
+        format!(
+            "FIRST-USE COACH SETUP: COACH_PROFILE.md and/or TRAINING_PLAN.md do not exist yet. Call `get_lifetime_and_yearly_history`, review the athlete's {} days of synced history, and propose grounded starter `COACH_PROFILE.md` and `TRAINING_PLAN.md` documents via `propose_coach_update` using the standard `##` headings.",
+            summary.days_of_history
+        )
+    } else {
+        "FIRST-USE COACH SETUP: COACH_PROFILE.md and/or TRAINING_PLAN.md do not exist yet and fewer than 14 days of history are synced. Propose conservative starter `COACH_PROFILE.md` and `TRAINING_PLAN.md` documents via `propose_coach_update` seeded from ATHLETE CONFIG.".to_string()
+    }
+}
+
+pub fn build_static_system_instruction(
+    store: &SharedStore,
+    config: &AthleteConfig,
+    activities: &[ActivityRecord],
+) -> String {
+    let profile_md = store.read_text("COACH_PROFILE.md").ok().flatten().unwrap_or_default();
+    let plan_md = store.read_text("TRAINING_PLAN.md").ok().flatten().unwrap_or_default();
+    let needs_setup = profile_md.trim().is_empty() || plan_md.trim().is_empty();
+
+    let mut sections = vec![
+        "You are a Living Markdown training-planning coach inside Splits Coach. Use metric units (km, min/km, bpm, kg). Always use `propose_coach_update` for Markdown changes. Use `get_recent_activities`, `get_activity_detail`, `get_wellness_history`, `get_training_load_and_records`, `get_readiness_and_plan`, `get_lifetime_and_yearly_history`, and `query_run_slice` for drill-downs.".to_string(),
+        format!("=== ATHLETE CONFIG ===\n{}", config.prompt_summary(None)),
+    ];
+    if !profile_md.trim().is_empty() {
+        sections.push(format!("=== COACH_PROFILE.md ===\n{profile_md}"));
+    }
+    if !plan_md.trim().is_empty() {
+        sections.push(format!("=== TRAINING_PLAN.md ===\n{plan_md}"));
+    }
+    if needs_setup {
+        let summary = analyze_training_history(activities, config, Utc::now());
+        sections.push(first_use_setup_instructions(&summary));
+    }
+    sections.join("\n\n")
 }

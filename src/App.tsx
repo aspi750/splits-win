@@ -522,6 +522,95 @@ export default function App() {
               </div>
             </div>
 
+            {state.needs_initial_coach_setup && (
+              <div
+                style={{
+                  marginBottom: 12,
+                  padding: 12,
+                  borderRadius: 8,
+                  border: "1px solid var(--border)",
+                  background: "var(--bg)",
+                  display: "flex",
+                  justifyContent: "space-between",
+                  alignItems: "center",
+                  gap: 12,
+                }}
+              >
+                <div>
+                  <strong>First-Use Coach Setup</strong>
+                  <div className="muted" style={{ fontSize: 12 }}>
+                    COACH_PROFILE.md or TRAINING_PLAN.md is empty. Audit your lifetime + 365-day history or generate starter templates.
+                  </div>
+                </div>
+                <div style={{ display: "flex", gap: 8, flexShrink: 0 }}>
+                  <button
+                    className="secondary"
+                    disabled={busy}
+                    onClick={async () => {
+                      await invoke("generate_starter_coach_files");
+                      await reload();
+                    }}
+                  >
+                    Generate Starter Templates Now
+                  </button>
+                  <button
+                    className="primary"
+                    disabled={busy || state.engine_mode !== "gemini_api"}
+                    onClick={async () => {
+                      const prompt =
+                        "Please review my lifetime and trailing 365-day training history, inspect my athlete config, and propose grounded starter COACH_PROFILE.md and TRAINING_PLAN.md documents via propose_coach_update.";
+                      setMessages((prev) => [...prev, { role: "user", text: prompt }, { role: "assistant", text: "" }]);
+                      setBusy(true);
+                      try {
+                        const res = await invoke<{ mode: string; text: string; proposals?: CoachUpdateProposal[] }>(
+                          "send_coach_message",
+                          { prompt }
+                        );
+                        setMessages((prev) => {
+                          const next = [...prev];
+                          next[next.length - 1] = { role: "assistant", text: res.text, proposals: res.proposals };
+                          return next;
+                        });
+                      } finally {
+                        setBusy(false);
+                        setLiveToolLabel(null);
+                      }
+                    }}
+                  >
+                    Review My History & Build Starter Plan
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {messages.length === 0 && (
+              <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 12 }}>
+                {[
+                  {
+                    label: "Analyze last run",
+                    prompt: "Analyze my latest run in detail, including splits, heart rate drift, and pacing.",
+                  },
+                  {
+                    label: "Today's readiness check",
+                    prompt: "Check today's gatekeeper readiness, recovery status, and recommended session.",
+                  },
+                  {
+                    label: "Lifetime & 365d history",
+                    prompt: "Review my lifetime training overview and trailing 365-day block audit.",
+                  },
+                ].map((q) => (
+                  <button
+                    key={q.label}
+                    className="secondary"
+                    disabled={busy}
+                    onClick={() => setChatInput(q.prompt)}
+                  >
+                    {q.label}
+                  </button>
+                ))}
+              </div>
+            )}
+
             {liveToolLabel && (
               <div className="pill amber" style={{ marginBottom: 12 }}>
                 {liveToolLabel}
@@ -687,9 +776,79 @@ export default function App() {
                     <option value="base_building">Base Building</option>
                     <option value="race">Target Race</option>
                     <option value="return_from_injury">Return from Injury</option>
+                    <option value="hybrid_hyrox">Hyrox / Hybrid Athlete</option>
                   </select>
                 </div>
               </div>
+              {draftConfig.objective.goalType === "hybrid_hyrox" && (
+                <div className="form-row" style={{ marginTop: 10 }}>
+                  <div>
+                    <label className="muted">Hyrox Division</label>
+                    <input
+                      placeholder="e.g. Open Men, Pro Women, Doubles"
+                      value={draftConfig.objective.hybridProfile?.division ?? ""}
+                      onChange={(e) =>
+                        setDraftConfig({
+                          ...draftConfig,
+                          objective: {
+                            ...draftConfig.objective,
+                            hybridProfile: {
+                              division: e.target.value || null,
+                              focusStations: draftConfig.objective.hybridProfile?.focusStations ?? [],
+                              weeklyHybridSessionsTarget:
+                                draftConfig.objective.hybridProfile?.weeklyHybridSessionsTarget ?? 3,
+                            },
+                          },
+                        })
+                      }
+                    />
+                  </div>
+                  <div>
+                    <label className="muted">Focus Stations (comma-separated)</label>
+                    <input
+                      placeholder="e.g. Sled Push, Wall Balls, SkiErg"
+                      value={(draftConfig.objective.hybridProfile?.focusStations ?? []).join(", ")}
+                      onChange={(e) =>
+                        setDraftConfig({
+                          ...draftConfig,
+                          objective: {
+                            ...draftConfig.objective,
+                            hybridProfile: {
+                              division: draftConfig.objective.hybridProfile?.division ?? null,
+                              focusStations: e.target.value
+                                .split(",")
+                                .map((s) => s.trim())
+                                .filter(Boolean),
+                              weeklyHybridSessionsTarget:
+                                draftConfig.objective.hybridProfile?.weeklyHybridSessionsTarget ?? 3,
+                            },
+                          },
+                        })
+                      }
+                    />
+                  </div>
+                  <div>
+                    <label className="muted">Hybrid Sessions / Week</label>
+                    <input
+                      type="number"
+                      value={draftConfig.objective.hybridProfile?.weeklyHybridSessionsTarget ?? ""}
+                      onChange={(e) =>
+                        setDraftConfig({
+                          ...draftConfig,
+                          objective: {
+                            ...draftConfig.objective,
+                            hybridProfile: {
+                              division: draftConfig.objective.hybridProfile?.division ?? null,
+                              focusStations: draftConfig.objective.hybridProfile?.focusStations ?? [],
+                              weeklyHybridSessionsTarget: e.target.value ? Number(e.target.value) : null,
+                            },
+                          },
+                        })
+                      }
+                    />
+                  </div>
+                </div>
+              )}
               <div className="form-row">
                 <div>
                   <label className="muted">VT1 Ceiling (bpm)</label>

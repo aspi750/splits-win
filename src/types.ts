@@ -1,6 +1,17 @@
 export type ExecutionMode = "self_contained" | "external_server";
 export type CoachEngineMode = "gemini_api" | "clipboard_packet";
-export type GoalType = "race" | "base_building" | "general_fitness" | "return_from_injury";
+export type GoalType =
+  | "race"
+  | "base_building"
+  | "general_fitness"
+  | "return_from_injury"
+  | "hybrid_hyrox";
+
+export interface HybridProfile {
+  division: string | null;
+  focusStations: string[];
+  weeklyHybridSessionsTarget: number | null;
+}
 
 export interface AthleteConfig {
   specs: {
@@ -25,6 +36,7 @@ export interface AthleteConfig {
     raceDistanceKm: number | null;
     raceDate: string | null;
     targetTimeDescription: string | null;
+    hybridProfile?: HybridProfile | null;
   };
   availability: {
     availableDays: number[];
@@ -118,6 +130,7 @@ export interface BootstrapState {
   readiness_state: ReadinessState | null;
   activities: ActivityRecord[];
   days: DayRecord[];
+  needs_initial_coach_setup?: boolean;
 }
 
 export interface CoachUpdateProposal {
