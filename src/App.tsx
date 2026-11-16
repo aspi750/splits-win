@@ -1,12 +1,16 @@
 import { useEffect, useMemo, useState } from "react";
+import { getVersion } from "@tauri-apps/api/app";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
+import { relaunch } from "@tauri-apps/plugin-process";
+import { check, type Update } from "@tauri-apps/plugin-updater";
 import {
   Activity,
   ArrowLeft,
   Check,
   Clipboard,
+  Download,
   MessageSquare,
   RefreshCw,
   Settings,
@@ -68,14 +72,77 @@ export default function App() {
 
   const [draftConfig, setDraftConfig] = useState<AthleteConfig | null>(null);
 
+  const [appVersion, setAppVersion] = useState<string>("0.1.2");
+  const [availableUpdate, setAvailableUpdate] = useState<Update | null>(null);
+  const [updateStatus, setUpdateStatus] = useState<string | null>(null);
+  const [updateChecking, setUpdateChecking] = useState(false);
+  const [updateInstalling, setUpdateInstalling] = useState(false);
+  const [updateReadyToRestart, setUpdateReadyToRestart] = useState(false);
+  const [updateProgress, setUpdateProgress] = useState<{ downloaded: number; total: number | null } | null>(null);
+
   async function reload() {
     const data = await invoke<BootstrapState>("get_bootstrap_state");
     setState(data);
     setDraftConfig(data.athlete_config);
   }
 
+  async function runUpdateCheck(silent: boolean) {
+    if (!silent) {
+      setUpdateChecking(true);
+      setUpdateStatus("Checking…");
+    }
+    try {
+      const update = await check();
+      if (update) {
+        setAvailableUpdate(update);
+        setUpdateStatus(`v${update.version} available`);
+      } else if (!silent) {
+        setAvailableUpdate(null);
+        setUpdateStatus("Up to date");
+      }
+    } catch (err) {
+      if (!silent) {
+        setUpdateStatus(`Update check failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    } finally {
+      if (!silent) {
+        setUpdateChecking(false);
+      }
+    }
+  }
+
+  async function handleInstallUpdate() {
+    if (!availableUpdate) return;
+    setUpdateInstalling(true);
+    setUpdateProgress({ downloaded: 0, total: null });
+    setUpdateStatus(`Downloading v${availableUpdate.version}…`);
+    let downloaded = 0;
+    let total: number | null = null;
+    try {
+      await availableUpdate.downloadAndInstall((event) => {
+        if (event.event === "Started") {
+          total = event.data.contentLength ?? null;
+          setUpdateProgress({ downloaded: 0, total });
+        } else if (event.event === "Progress") {
+          downloaded += event.data.chunkLength;
+          setUpdateProgress({ downloaded, total });
+        } else if (event.event === "Finished") {
+          setUpdateProgress({ downloaded: total ?? downloaded, total });
+        }
+      });
+      setUpdateReadyToRestart(true);
+      setUpdateStatus(`v${availableUpdate.version} installed. Restart to apply.`);
+    } catch (err) {
+      setUpdateStatus(`Install failed: ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      setUpdateInstalling(false);
+    }
+  }
+
   useEffect(() => {
     void reload();
+    void getVersion().then(setAppVersion).catch(() => {});
+    void runUpdateCheck(true);
   }, []);
 
   useEffect(() => {
@@ -373,6 +440,39 @@ export default function App() {
       </aside>
 
       <main className="main">
+        {availableUpdate && (
+          <div
+            style={{
+              marginBottom: 14,
+              padding: "10px 14px",
+              borderRadius: 10,
+              border: "1px solid var(--border)",
+              background: "var(--card)",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "space-between",
+              gap: 12,
+            }}
+          >
+            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+              <span className="pill green">Update v{availableUpdate.version} available</span>
+              <span className="muted" style={{ fontSize: 13 }}>
+                {updateReadyToRestart
+                  ? "Ready to restart and finish installing."
+                  : "A signed update is ready to install."}
+              </span>
+            </div>
+            {updateReadyToRestart ? (
+              <button className="primary" onClick={() => void relaunch()}>
+                Restart Now
+              </button>
+            ) : (
+              <button className="secondary" onClick={() => setTab("settings")}>
+                View Update
+              </button>
+            )}
+          </div>
+        )}
         {tab === "today" && (
           <>
             <div className="card">
@@ -891,6 +991,99 @@ export default function App() {
                 Save Profile
               </button>
               {statusMsg && <span className="muted" style={{ marginLeft: 12 }}>{statusMsg}</span>}
+            </div>
+
+            <div className="card">
+              <div className="card-header">
+                <div>
+                  <h3>App Updates</h3>
+                  <div className="muted">Installed version: v{appVersion}</div>
+                </div>
+                <button
+                  className="secondary"
+                  style={{ display: "flex", alignItems: "center", gap: 6 }}
+                  disabled={updateChecking || updateInstalling}
+                  onClick={() => void runUpdateCheck(false)}
+                >
+                  <RefreshCw size={14} />
+                  {updateChecking ? "Checking…" : "Check for Updates"}
+                </button>
+              </div>
+              {updateStatus && (
+                <div className="muted" style={{ marginBottom: 10 }}>
+                  Status: <strong>{updateStatus}</strong>
+                </div>
+              )}
+              {availableUpdate && (
+                <div
+                  style={{
+                    padding: 12,
+                    borderRadius: 8,
+                    border: "1px solid var(--border)",
+                    background: "var(--bg)",
+                  }}
+                >
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12 }}>
+                    <div>
+                      <strong>Splits Coach v{availableUpdate.version}</strong>
+                      {availableUpdate.body && (
+                        <div className="muted" style={{ fontSize: 12, marginTop: 4, whiteSpace: "pre-wrap" }}>
+                          {availableUpdate.body}
+                        </div>
+                      )}
+                    </div>
+                    {updateReadyToRestart ? (
+                      <button className="primary" onClick={() => void relaunch()}>
+                        Restart Now
+                      </button>
+                    ) : (
+                      <button
+                        className="primary"
+                        style={{ display: "flex", alignItems: "center", gap: 6, flexShrink: 0 }}
+                        disabled={updateInstalling}
+                        onClick={() => void handleInstallUpdate()}
+                      >
+                        <Download size={14} />
+                        {updateInstalling ? "Installing…" : "Download & Install"}
+                      </button>
+                    )}
+                  </div>
+                  {updateProgress && (
+                    <div style={{ marginTop: 10 }}>
+                      <div
+                        style={{
+                          height: 8,
+                          borderRadius: 999,
+                          background: "var(--border)",
+                          overflow: "hidden",
+                        }}
+                      >
+                        <div
+                          style={{
+                            height: "100%",
+                            width: `${
+                              updateProgress.total && updateProgress.total > 0
+                                ? Math.min(100, Math.round((updateProgress.downloaded / updateProgress.total) * 100))
+                                : 100
+                            }%`,
+                            background: "var(--accent)",
+                            transition: "width 120ms ease",
+                          }}
+                        />
+                      </div>
+                      <div className="muted" style={{ fontSize: 12, marginTop: 4 }}>
+                        {(updateProgress.downloaded / (1024 * 1024)).toFixed(2)} MB
+                        {updateProgress.total
+                          ? ` / ${(updateProgress.total / (1024 * 1024)).toFixed(2)} MB (${Math.min(
+                              100,
+                              Math.round((updateProgress.downloaded / updateProgress.total) * 100)
+                            )}%)`
+                          : ""}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
             </div>
           </>
         )}

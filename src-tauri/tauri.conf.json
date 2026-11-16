@@ -26,10 +26,19 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "createUpdaterArtifacts": true,
     "icon": [
       "icons/32x32.png",
       "icons/icon.png"
     ],
     "copyright": "© 2026 A750LABS. Based on Splits by Bytefabrika."
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IERGNDQ3REM0QUM4MTE5NjgKUldSb0dZR3N4SDFFMzVyOWZmMDBJODk3NXE5ZWRoM0hvWk93Tnc2NStlQVVmWlpjV2lqSkNLTVgK",
+      "endpoints": [
+        "https://github.com/aspi750/splits-win/releases/latest/download/latest.json"
+      ]
+    }
   }
 }
