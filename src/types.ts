@@ -119,3 +119,54 @@ export interface BootstrapState {
   activities: ActivityRecord[];
   days: DayRecord[];
 }
+
+export interface CoachUpdateProposal {
+  id: string;
+  target_file: string;
+  reason: string;
+  updated_section_markdown: string;
+  expires_on: string | null;
+  diff_preview: string;
+  status: string;
+}
+
+export interface FitTrackPoint {
+  timestamp_sec: number;
+  distance_m: number;
+  speed_mps: number;
+  pace_sec_per_km: number | null;
+  heart_rate_bpm: number | null;
+  cadence_spm: number | null;
+  altitude_m: number | null;
+}
+
+export interface FitSplit {
+  km_index: number;
+  distance_m: number;
+  duration_sec: number;
+  pace_sec_per_km: number | null;
+  avg_hr_bpm: number | null;
+  avg_cadence_spm: number | null;
+  elevation_gain_m: number;
+}
+
+export interface FitGuardrailAudit {
+  pace_floor_sec_per_km: number | null;
+  easy_hr_ceiling_bpm: number | null;
+  pace_floor_violations: number;
+  hr_ceiling_violations: number;
+  compliant: boolean;
+}
+
+export interface FitTrackAnalysis {
+  garmin_id: number;
+  chart_points: FitTrackPoint[];
+  splits: FitSplit[];
+  decoupling_pct: number | null;
+  audit: FitGuardrailAudit;
+}
+
+export interface ActivityDetailPayload {
+  activity: ActivityRecord;
+  track: FitTrackAnalysis | null;
+}

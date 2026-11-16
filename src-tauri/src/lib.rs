@@ -14,7 +14,7 @@ use storage::{AppSettings, CredentialStore, Database, SharedStore};
 use tauri::{
     menu::{Menu, MenuItem},
     tray::TrayIconBuilder,
-    Manager, State,
+    AppHandle, Manager, State,
 };
 
 pub struct AppState {
@@ -184,7 +184,50 @@ fn build_coach_packet(state: State<'_, AppState>, draft_prompt: String) -> Resul
 }
 
 #[tauri::command]
+fn apply_coach_proposal(state: State<'_, AppState>, proposal: CoachUpdateProposal) -> Result<(), String> {
+    let store = state.load_store()?;
+    coach::apply_coach_proposal(&store, &proposal)
+}
+
+#[tauri::command]
+async fn get_activity_detail(
+    state: State<'_, AppState>,
+    activity_id: i64,
+) -> Result<ActivityDetailPayload, String> {
+    let store = state.load_store()?;
+    let db = state.open_db()?;
+    let activity = db
+        .get_activity(activity_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("Activity {activity_id} not found"))?;
+
+    if let Some(track) = db.get_fit_track(activity_id).map_err(|e| e.to_string())? {
+        return Ok(ActivityDetailPayload {
+            activity,
+            track: Some(track),
+        });
+    }
+
+    // Lazily fetch & decode .fit if Garmin key is available
+    let config = store.load_athlete_config().map_err(|e| e.to_string())?.unwrap_or_default();
+    let client = garmin::GarminClient::new(None);
+    let track = match client.download_fit_bytes(activity_id).await {
+        Ok(bytes) => match garmin::parse_fit_track(activity_id, &bytes, &config) {
+            Ok(parsed) => {
+                let _ = db.upsert_fit_track(activity_id, &parsed);
+                Some(parsed)
+            }
+            Err(_) => None,
+        },
+        Err(_) => None,
+    };
+
+    Ok(ActivityDetailPayload { activity, track })
+}
+
+#[tauri::command]
 async fn send_coach_message(
+    app: AppHandle,
     state: State<'_, AppState>,
     prompt: String,
 ) -> Result<serde_json::Value, String> {
@@ -200,7 +243,8 @@ async fn send_coach_message(
             config.prompt_summary(None)
         );
         let (text, proposals) =
-            coach::run_gemini_coach_turn(&api_key, &sys, &prompt, &store, &activities, &days).await?;
+            coach::run_gemini_coach_turn(Some(&app), &api_key, &sys, &prompt, &store, Some(&db), &activities, &days)
+                .await?;
         Ok(serde_json::json!({
             "mode": "gemini_api",
             "text": text,
@@ -268,6 +312,8 @@ pub fn run() {
             sync_garmin_now,
             build_coach_packet,
             send_coach_message,
+            apply_coach_proposal,
+            get_activity_detail,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Splits Coach");

@@ -1,5 +1,6 @@
 use chrono::{Duration, TimeZone, Utc};
-use splits_win_lib::coach::{replacing_section, CoachPacketBuilder};
+use splits_win_lib::coach::{apply_coach_proposal, replacing_section, slice_fit_track_by_km, CoachPacketBuilder};
+use splits_win_lib::garmin::analyze_fit_points;
 use splits_win_lib::models::*;
 use splits_win_lib::readiness::{ReadinessEngine, ReadinessInput};
 use splits_win_lib::scheduler::{
@@ -217,4 +218,80 @@ fn test_scheduler_catch_up_and_deduplication() {
     assert!(!should_catch_up_briefing(16, true, true, true));
     assert!(should_send_morning_notification(16, true, true, true, Some("2026-11-15"), "2026-11-16"));
     assert!(!should_send_morning_notification(16, true, true, true, Some("2026-11-16"), "2026-11-16"));
+}
+
+#[test]
+fn test_fit_splits_decoupling_and_guardrail_audit() {
+    let mut config = AthleteConfig::default();
+    config.medical.enforce_pace_floor = true;
+    config.medical.min_pace_sec_per_km = Some(390); // 6:30/km
+    config.medical.enforce_easy_hr_ceiling = true;
+    config.medical.easy_hr_ceiling_bpm = Some(135);
+
+    // 1st half: 3.0 m/s @ 120 bpm (EF = 0.025); 2nd half: 3.0 m/s @ 150 bpm (EF = 0.020) -> 20.0% decoupling
+    let points = vec![
+        FitTrackPoint { timestamp_sec: 0.0, distance_m: 0.0, speed_mps: 3.0, pace_sec_per_km: Some(333.3), heart_rate_bpm: Some(120.0), cadence_spm: Some(174.0), altitude_m: Some(10.0) },
+        FitTrackPoint { timestamp_sec: 160.0, distance_m: 500.0, speed_mps: 3.0, pace_sec_per_km: Some(333.3), heart_rate_bpm: Some(120.0), cadence_spm: Some(174.0), altitude_m: Some(12.0) },
+        FitTrackPoint { timestamp_sec: 340.0, distance_m: 1000.0, speed_mps: 3.0, pace_sec_per_km: Some(333.3), heart_rate_bpm: Some(120.0), cadence_spm: Some(174.0), altitude_m: Some(15.0) },
+        FitTrackPoint { timestamp_sec: 520.0, distance_m: 1500.0, speed_mps: 3.0, pace_sec_per_km: Some(333.3), heart_rate_bpm: Some(150.0), cadence_spm: Some(172.0), altitude_m: Some(15.0) },
+        FitTrackPoint { timestamp_sec: 700.0, distance_m: 2000.0, speed_mps: 3.0, pace_sec_per_km: Some(333.3), heart_rate_bpm: Some(150.0), cadence_spm: Some(172.0), altitude_m: Some(16.0) },
+        FitTrackPoint { timestamp_sec: 880.0, distance_m: 2500.0, speed_mps: 3.0, pace_sec_per_km: Some(333.3), heart_rate_bpm: Some(150.0), cadence_spm: Some(172.0), altitude_m: Some(16.0) },
+    ];
+
+    let analysis = analyze_fit_points(999, points, &config);
+    assert_eq!(analysis.decoupling_pct, Some(20.0));
+    assert_eq!(analysis.splits.len(), 3);
+    assert!(!analysis.audit.compliant);
+    assert!(analysis.audit.pace_floor_violations > 0);
+    assert!(analysis.audit.hr_ceiling_violations > 0);
+}
+
+#[test]
+fn test_apply_coach_proposal_and_history_backup() {
+    let dir = make_temp_dir("proposal");
+    let store = SharedStore::new(Some(dir.clone())).unwrap();
+    store
+        .write_text_atomic(
+            "COACH_PROFILE.md",
+            "# COACH_PROFILE.md\n\n## AVAILABILITY & CONTEXT\n| key | value |\n| --- | --- |\n| pool | false |\n\n## Change History\n- seed\n",
+        )
+        .unwrap();
+
+    let proposal = CoachUpdateProposal {
+        id: "p1".to_string(),
+        target_file: "COACH_PROFILE.md".to_string(),
+        reason: "Pool reopened".to_string(),
+        updated_section_markdown: "## AVAILABILITY & CONTEXT\n| key | value |\n| --- | --- |\n| pool | true |".to_string(),
+        expires_on: None,
+        diff_preview: String::new(),
+        status: "pending_user_approval".to_string(),
+    };
+
+    apply_coach_proposal(&store, &proposal).unwrap();
+    let updated = store.read_text("COACH_PROFILE.md").unwrap().unwrap();
+    assert!(updated.contains("| pool | true |"));
+    assert!(updated.contains("Pool reopened [target: COACH_PROFILE.md]"));
+    let history_entries: Vec<_> = std::fs::read_dir(dir.join("history")).unwrap().collect();
+    assert!(!history_entries.is_empty());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_query_run_slice_against_sqlite_fit_tracks() {
+    let db = Database::open_in_memory().unwrap();
+    let config = AthleteConfig::default();
+    let points = vec![
+        FitTrackPoint { timestamp_sec: 0.0, distance_m: 0.0, speed_mps: 3.0, pace_sec_per_km: Some(333.3), heart_rate_bpm: Some(125.0), cadence_spm: Some(174.0), altitude_m: Some(10.0) },
+        FitTrackPoint { timestamp_sec: 200.0, distance_m: 600.0, speed_mps: 3.0, pace_sec_per_km: Some(333.3), heart_rate_bpm: Some(130.0), cadence_spm: Some(175.0), altitude_m: Some(11.0) },
+        FitTrackPoint { timestamp_sec: 400.0, distance_m: 1200.0, speed_mps: 3.0, pace_sec_per_km: Some(333.3), heart_rate_bpm: Some(135.0), cadence_spm: Some(176.0), altitude_m: Some(12.0) },
+        FitTrackPoint { timestamp_sec: 600.0, distance_m: 1800.0, speed_mps: 3.0, pace_sec_per_km: Some(333.3), heart_rate_bpm: Some(138.0), cadence_spm: Some(176.0), altitude_m: Some(14.0) },
+    ];
+    let analysis = analyze_fit_points(777, points, &config);
+    db.upsert_fit_track(777, &analysis).unwrap();
+
+    let loaded = db.get_fit_track(777).unwrap().unwrap();
+    let slice = slice_fit_track_by_km(&loaded, 0.5, 1.5);
+    assert_eq!(slice["garmin_id"].as_i64(), Some(777));
+    assert_eq!(slice["point_count"].as_u64(), Some(2));
 }

@@ -1,4 +1,7 @@
-use crate::models::{ActivityRecord, DayRecord, APP_SERVICE, GARMIN_ACCOUNT};
+use crate::models::{
+    ActivityRecord, AthleteConfig, DayRecord, FitGuardrailAudit, FitSplit, FitTrackAnalysis,
+    FitTrackPoint, APP_SERVICE, GARMIN_ACCOUNT,
+};
 use crate::storage::CredentialStore;
 use chrono::{Duration, Utc};
 use reqwest::Client;
@@ -409,4 +412,224 @@ struct HRVSummaryDTO {
     calendar_date: Option<String>,
     last_night_avg: Option<i32>,
     status: Option<String>,
+}
+
+// MARK: - .fit Track Decoding, Splits, Cardiac Decoupling & Guardrail Audit
+
+fn value_as_f64(val: &fitparser::Value) -> Option<f64> {
+    match val {
+        fitparser::Value::Float32(v) => Some(*v as f64),
+        fitparser::Value::Float64(v) => Some(*v),
+        fitparser::Value::SInt8(v) => Some(*v as f64),
+        fitparser::Value::UInt8(v) => Some(*v as f64),
+        fitparser::Value::SInt16(v) => Some(*v as f64),
+        fitparser::Value::UInt16(v) => Some(*v as f64),
+        fitparser::Value::SInt32(v) => Some(*v as f64),
+        fitparser::Value::UInt32(v) => Some(*v as f64),
+        fitparser::Value::SInt64(v) => Some(*v as f64),
+        fitparser::Value::UInt64(v) => Some(*v as f64),
+        _ => None,
+    }
+}
+
+pub fn parse_fit_track(
+    garmin_id: i64,
+    bytes: &[u8],
+    config: &AthleteConfig,
+) -> Result<FitTrackAnalysis, String> {
+    let records = fitparser::from_bytes(bytes).map_err(|e| format!("FIT parse error: {e}"))?;
+    let mut points = Vec::new();
+    let mut base_ts: Option<f64> = None;
+
+    for msg in records {
+        if msg.kind() != fitparser::profile::MesgNum::Record {
+            continue;
+        }
+        let mut ts_sec: Option<f64> = None;
+        let mut distance_m: Option<f64> = None;
+        let mut speed_mps: Option<f64> = None;
+        let mut hr: Option<f64> = None;
+        let mut cadence: Option<f64> = None;
+        let mut altitude: Option<f64> = None;
+
+        for field in msg.fields() {
+            match field.name() {
+                "timestamp" => {
+                    if let fitparser::Value::Timestamp(dt) = field.value() {
+                        ts_sec = Some(dt.timestamp() as f64);
+                    }
+                }
+                "distance" => distance_m = value_as_f64(field.value()),
+                "enhanced_speed" | "speed" => {
+                    if speed_mps.is_none() || field.name() == "enhanced_speed" {
+                        speed_mps = value_as_f64(field.value());
+                    }
+                }
+                "heart_rate" => hr = value_as_f64(field.value()),
+                "cadence" => cadence = value_as_f64(field.value()).map(|c| c * 2.0),
+                "enhanced_altitude" | "altitude" => {
+                    if altitude.is_none() || field.name() == "enhanced_altitude" {
+                        altitude = value_as_f64(field.value());
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let Some(dist) = distance_m else { continue };
+        let abs_ts = ts_sec.unwrap_or(points.len() as f64);
+        let origin = *base_ts.get_or_insert(abs_ts);
+        let rel_ts = (abs_ts - origin).max(0.0);
+        let spd = speed_mps.unwrap_or(0.0).max(0.0);
+        let pace = if spd > 0.2 { Some(1000.0 / spd) } else { None };
+
+        points.push(FitTrackPoint {
+            timestamp_sec: rel_ts,
+            distance_m: dist,
+            speed_mps: spd,
+            pace_sec_per_km: pace,
+            heart_rate_bpm: hr,
+            cadence_spm: cadence,
+            altitude_m: altitude,
+        });
+    }
+
+    Ok(analyze_fit_points(garmin_id, points, config))
+}
+
+pub fn analyze_fit_points(
+    garmin_id: i64,
+    full_points: Vec<FitTrackPoint>,
+    config: &AthleteConfig,
+) -> FitTrackAnalysis {
+    let chart_points = downsample_points(&full_points, 240);
+    let splits = compute_km_splits(&full_points);
+    let decoupling_pct = compute_decoupling_pct(&full_points);
+
+    let pace_floor = if config.medical.enforce_pace_floor {
+        config.medical.min_pace_sec_per_km
+    } else {
+        None
+    };
+    let hr_ceiling = if config.medical.enforce_easy_hr_ceiling {
+        config.medical.easy_hr_ceiling_bpm.or(config.specs.vt1_ceiling_bpm)
+    } else {
+        config.specs.vt1_ceiling_bpm
+    };
+
+    let mut pace_floor_violations = 0;
+    let mut hr_ceiling_violations = 0;
+    for s in &splits {
+        if let (Some(floor_sec), Some(pace_sec)) = (pace_floor, s.pace_sec_per_km) {
+            if pace_sec < floor_sec as f64 {
+                pace_floor_violations += 1;
+            }
+        }
+        if let (Some(ceil_bpm), Some(avg_hr)) = (hr_ceiling, s.avg_hr_bpm) {
+            if avg_hr > ceil_bpm as f64 {
+                hr_ceiling_violations += 1;
+            }
+        }
+    }
+
+    FitTrackAnalysis {
+        garmin_id,
+        chart_points,
+        full_points,
+        splits,
+        decoupling_pct,
+        audit: FitGuardrailAudit {
+            pace_floor_sec_per_km: pace_floor,
+            easy_hr_ceiling_bpm: hr_ceiling,
+            pace_floor_violations,
+            hr_ceiling_violations,
+            compliant: pace_floor_violations == 0 && hr_ceiling_violations == 0,
+        },
+    }
+}
+
+fn downsample_points(points: &[FitTrackPoint], max_points: usize) -> Vec<FitTrackPoint> {
+    if points.len() <= max_points || max_points == 0 {
+        return points.to_vec();
+    }
+    let step = (points.len() as f64 / max_points as f64).ceil() as usize;
+    points.iter().step_by(step.max(1)).cloned().collect()
+}
+
+fn compute_km_splits(points: &[FitTrackPoint]) -> Vec<FitSplit> {
+    if points.len() < 2 {
+        return Vec::new();
+    }
+    let mut splits = Vec::new();
+    let mut bucket_start = 0usize;
+    let mut km_index = 1i32;
+
+    for i in 1..points.len() {
+        let target_m = (km_index as f64) * 1000.0;
+        if points[i].distance_m >= target_m || i == points.len() - 1 {
+            let slice = &points[bucket_start..=i];
+            let d = (slice.last().unwrap().distance_m - slice.first().unwrap().distance_m).max(0.0);
+            let t = (slice.last().unwrap().timestamp_sec - slice.first().unwrap().timestamp_sec).max(0.0);
+            if d >= 100.0 && t > 0.0 {
+                let pace = Some(t / (d / 1000.0));
+                let hrs: Vec<f64> = slice.iter().filter_map(|p| p.heart_rate_bpm).collect();
+                let cads: Vec<f64> = slice.iter().filter_map(|p| p.cadence_spm).collect();
+                let avg_hr = if hrs.is_empty() { None } else { Some(hrs.iter().sum::<f64>() / hrs.len() as f64) };
+                let avg_cad = if cads.is_empty() { None } else { Some(cads.iter().sum::<f64>() / cads.len() as f64) };
+                let mut elev_gain = 0.0;
+                for w in slice.windows(2) {
+                    if let (Some(a0), Some(a1)) = (w[0].altitude_m, w[1].altitude_m) {
+                        if a1 > a0 {
+                            elev_gain += a1 - a0;
+                        }
+                    }
+                }
+                splits.push(FitSplit {
+                    km_index,
+                    distance_m: d,
+                    duration_sec: t,
+                    pace_sec_per_km: pace,
+                    avg_hr_bpm: avg_hr,
+                    avg_cadence_spm: avg_cad,
+                    elevation_gain_m: (elev_gain * 10.0).rounded_1(),
+                });
+                km_index += 1;
+                bucket_start = i;
+            }
+        }
+    }
+    splits
+}
+
+trait RoundExt {
+    fn rounded_1(self) -> f64;
+}
+impl RoundExt for f64 {
+    fn rounded_1(self) -> f64 {
+        (self * 10.0).round() / 10.0
+    }
+}
+
+pub fn compute_decoupling_pct(points: &[FitTrackPoint]) -> Option<f64> {
+    let valid: Vec<f64> = points
+        .iter()
+        .filter_map(|p| {
+            let hr = p.heart_rate_bpm?;
+            if p.speed_mps > 0.3 && hr > 40.0 {
+                Some(p.speed_mps / hr)
+            } else {
+                None
+            }
+        })
+        .collect();
+    if valid.len() < 4 {
+        return None;
+    }
+    let mid = valid.len() / 2;
+    let ef1 = valid[..mid].iter().sum::<f64>() / mid as f64;
+    let ef2 = valid[mid..].iter().sum::<f64>() / (valid.len() - mid) as f64;
+    if ef1 <= 0.0 {
+        return None;
+    }
+    Some((((ef1 - ef2) / ef1) * 100.0).rounded_1())
 }

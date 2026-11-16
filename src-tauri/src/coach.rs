@@ -1,9 +1,11 @@
 use crate::models::*;
 use crate::readiness::{ReadinessEngine, ReadinessInput};
-use crate::storage::{CredentialStore, SharedStore};
-use chrono::{DateTime, Duration, NaiveDate, Utc};
+use crate::storage::{CredentialStore, Database, SharedStore};
+use chrono::{DateTime, Duration, Local, NaiveDate, Utc};
+use futures_util::StreamExt;
 use reqwest::Client;
 use serde_json::{json, Value};
+use tauri::{AppHandle, Emitter};
 
 pub const GEMINI_MODEL_ID: &str = "gemini-4-hydrogen";
 
@@ -311,17 +313,75 @@ pub fn gemini_tool_declarations() -> Value {
     ])
 }
 
+pub fn apply_coach_proposal(store: &SharedStore, proposal: &CoachUpdateProposal) -> Result<(), String> {
+    if proposal.target_file != "COACH_PROFILE.md" && proposal.target_file != "TRAINING_PLAN.md" {
+        return Err(format!("Unsupported proposal target_file: {}", proposal.target_file));
+    }
+    let current = store.read_text(&proposal.target_file).map_err(|e| e.to_string())?.unwrap_or_default();
+    let mut updated = replacing_section(&current, &proposal.updated_section_markdown);
+    let today = Local::now().format("%Y-%m-%d").to_string();
+    let history_entry = format!("- `{today}`: {} [target: {}]", proposal.reason, proposal.target_file);
+    updated = append_history_entry(&history_entry, &updated);
+    store
+        .write_text_atomic(&proposal.target_file, &updated)
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn append_history_entry(entry: &str, markdown: &str) -> String {
+    let lines: Vec<&str> = markdown.lines().collect();
+    if let Some(idx) = lines.iter().position(|l| l.trim() == "## Change History") {
+        let mut next: Vec<String> = lines.iter().map(|s| s.to_string()).collect();
+        next.insert(idx + 1, entry.to_string());
+        format!("{}\n", next.join("\n"))
+    } else {
+        format!("{}\n\n## Change History\n{entry}\n", markdown.trim_end())
+    }
+}
+
+pub fn slice_fit_track_by_km(track: &FitTrackAnalysis, start_km: f64, end_km: f64) -> Value {
+    let start_m = start_km.max(0.0) * 1000.0;
+    let end_m = end_km.max(start_km) * 1000.0;
+    let pts: Vec<&FitTrackPoint> = track
+        .full_points
+        .iter()
+        .filter(|p| p.distance_m >= start_m && p.distance_m <= end_m)
+        .collect();
+    json!({
+        "garmin_id": track.garmin_id,
+        "start_km": start_km,
+        "end_km": end_km,
+        "point_count": pts.len(),
+        "points": pts.into_iter().take(180).collect::<Vec<_>>()
+    })
+}
+
+fn tool_status_label(name: &str) -> &'static str {
+    match name {
+        "get_activity_detail" => "Auditing .fit track & decoupling…",
+        "get_recent_activities" => "Reading recent activities…",
+        "get_wellness_history" => "Analyzing sleep, HRV & wellness history…",
+        "get_training_load_and_records" => "Computing training load & records…",
+        "get_readiness_and_plan" => "Checking readiness gatekeeper & plan…",
+        "propose_coach_update" => "Drafting profile/plan update…",
+        "query_run_slice" => "Inspecting run kilometer slice…",
+        _ => "Running coach tool…",
+    }
+}
+
 pub async fn run_gemini_coach_turn(
+    app: Option<&AppHandle>,
     api_key: &str,
     system_instruction: &str,
     user_prompt: &str,
     store: &SharedStore,
+    db: Option<&Database>,
     activities: &[ActivityRecord],
     days: &[DayRecord],
 ) -> Result<(String, Vec<CoachUpdateProposal>), String> {
     let client = Client::new();
     let endpoint = format!(
-        "https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL_ID}:generateContent?key={api_key}"
+        "https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL_ID}:streamGenerateContent?alt=sse&key={api_key}"
     );
 
     let mut contents = vec![json!({
@@ -357,36 +417,93 @@ pub async fn run_gemini_coach_turn(
             return Err(format!("Gemini API error ({code}): {text}"));
         }
 
-        let obj: Value = resp.json().await.map_err(|e| e.to_string())?;
-        let parts = obj["candidates"][0]["content"]["parts"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default();
+        let mut model_parts: Vec<Value> = Vec::new();
+        let mut function_calls: Vec<(String, Value)> = Vec::new();
+        let mut finish_reason = "STOP".to_string();
+        let mut usage_entry: Option<CoachUsageEntry> = None;
 
-        let mut model_parts = Vec::new();
-        let mut function_calls = Vec::new();
+        let mut stream = resp.bytes_stream();
+        let mut buffer = String::new();
 
-        for part in parts {
-            let is_thought = part["thought"].as_bool() == Some(true);
-            if let Some(fc) = part.get("functionCall") {
-                let name = fc["name"].as_str().unwrap_or_default().to_string();
-                let args = fc["args"].clone();
-                let mut fc_part = json!({ "functionCall": { "name": name, "args": args } });
-                if let Some(sig) = part.get("thoughtSignature").or_else(|| part.get("thought_signature")) {
-                    fc_part["thoughtSignature"] = sig.clone();
+        while let Some(chunk) = stream.next().await {
+            let bytes = chunk.map_err(|e| e.to_string())?;
+            buffer.push_str(&String::from_utf8_lossy(&bytes));
+
+            while let Some(pos) = buffer.find('\n') {
+                let line = buffer[..pos].trim_end_matches('\r').to_string();
+                buffer.drain(..=pos);
+
+                if !line.starts_with("data: ") {
+                    continue;
                 }
-                model_parts.push(fc_part);
-                function_calls.push((name, args));
-            } else {
-                if is_thought || part.get("text").is_none() {
-                    model_parts.push(part.clone());
+                let json_str = line["data: ".len()..].trim();
+                if json_str.is_empty() || json_str == "[DONE]" {
+                    continue;
                 }
-                if !is_thought {
-                    if let Some(t) = part["text"].as_str() {
-                        final_text.push_str(t);
+                let Ok(obj) = serde_json::from_str::<Value>(json_str) else {
+                    continue;
+                };
+
+                if let Some(reason) = obj["candidates"][0]["finishReason"].as_str() {
+                    finish_reason = reason.to_string();
+                }
+
+                if let Some(parts) = obj["candidates"][0]["content"]["parts"].as_array() {
+                    for part in parts {
+                        let is_thought = part["thought"].as_bool() == Some(true);
+                        if let Some(fc) = part.get("functionCall") {
+                            let name = fc["name"].as_str().unwrap_or_default().to_string();
+                            let args = fc["args"].clone();
+                            let mut fc_part = json!({ "functionCall": { "name": name, "args": args } });
+                            if let Some(sig) = part.get("thoughtSignature").or_else(|| part.get("thought_signature")) {
+                                fc_part["thoughtSignature"] = sig.clone();
+                            }
+                            model_parts.push(fc_part);
+                            function_calls.push((name, args));
+                        } else {
+                            if is_thought || part.get("text").is_none() {
+                                let mut normalized = part.clone();
+                                if normalized.get("thoughtSignature").is_none() {
+                                    if let Some(sig) = normalized.get("thought_signature").cloned() {
+                                        if let Some(map) = normalized.as_object_mut() {
+                                            map.insert("thoughtSignature".to_string(), sig);
+                                            map.remove("thought_signature");
+                                        }
+                                    }
+                                }
+                                model_parts.push(normalized);
+                            }
+                            if !is_thought {
+                                if let Some(delta) = part["text"].as_str() {
+                                    if !delta.is_empty() {
+                                        final_text.push_str(delta);
+                                        if let Some(app_handle) = app {
+                                            let _ = app_handle.emit("coach:delta", json!({ "delta": delta }));
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
+
+                if let Some(usage) = obj.get("usageMetadata") {
+                    usage_entry = Some(CoachUsageEntry {
+                        timestamp: Utc::now().to_rfc3339(),
+                        profile: "CHAT".to_string(),
+                        model: GEMINI_MODEL_ID.to_string(),
+                        prompt_tokens: usage["promptTokenCount"].as_i64().unwrap_or(0) as i32,
+                        candidates_tokens: usage["candidatesTokenCount"].as_i64().unwrap_or(0) as i32,
+                        thoughts_tokens: usage["thoughtsTokenCount"].as_i64().unwrap_or(0) as i32,
+                        total_tokens: usage["totalTokenCount"].as_i64().unwrap_or(0) as i32,
+                        finish_reason: finish_reason.clone(),
+                    });
+                }
             }
+        }
+
+        if let Some(entry) = usage_entry {
+            let _ = store.append_usage_log(&entry);
         }
 
         if function_calls.is_empty() {
@@ -395,7 +512,20 @@ pub async fn run_gemini_coach_turn(
 
         let mut response_parts = Vec::new();
         for (name, args) in function_calls {
-            let tool_resp = execute_tool(&name, &args, store, activities, days, &mut proposals);
+            let label = tool_status_label(&name);
+            if let Some(app_handle) = app {
+                let _ = app_handle.emit(
+                    "coach:tool_status",
+                    json!({ "tool": name, "label": label, "active": true }),
+                );
+            }
+            let tool_resp = execute_tool(&name, &args, store, db, activities, days, &mut proposals);
+            if let Some(app_handle) = app {
+                let _ = app_handle.emit(
+                    "coach:tool_status",
+                    json!({ "tool": name, "label": label, "active": false }),
+                );
+            }
             response_parts.push(json!({
                 "functionResponse": {
                     "name": name,
@@ -415,6 +545,7 @@ fn execute_tool(
     name: &str,
     args: &Value,
     store: &SharedStore,
+    db: Option<&Database>,
     activities: &[ActivityRecord],
     days: &[DayRecord],
     proposals: &mut Vec<CoachUpdateProposal>,
@@ -436,6 +567,36 @@ fn execute_tool(
                 status: "pending_user_approval".to_string(),
             });
             json!({ "status": "pending_user_approval", "proposal_id": id, "target_file": target })
+        }
+        "query_run_slice" => {
+            let activity_id = args["activity_id"].as_i64().unwrap_or(0);
+            let start_km = args["start_km"].as_f64().unwrap_or(0.0);
+            let end_km = args["end_km"].as_f64().unwrap_or(1.0);
+            if let Some(Some(track)) = db.and_then(|d| d.get_fit_track(activity_id).ok()) {
+                slice_fit_track_by_km(&track, start_km, end_km)
+            } else {
+                json!({ "error": format!("No cached .fit track found for activity_id {activity_id}") })
+            }
+        }
+        "get_activity_detail" => {
+            let raw_id = args["activity_id"].as_str().unwrap_or("latest");
+            let target_act = match raw_id {
+                "latest" => activities.first(),
+                "latest_run" => activities.iter().find(|a| a.type_key.to_lowercase().contains("run")),
+                other => other.parse::<i64>().ok().and_then(|id| activities.iter().find(|a| a.garmin_id == id)),
+            };
+            if let Some(act) = target_act {
+                let track = db.and_then(|d| d.get_fit_track(act.garmin_id).ok()).flatten();
+                json!({
+                    "activity": act,
+                    "fit_track_cached": track.is_some(),
+                    "splits": track.as_ref().map(|t| &t.splits),
+                    "decoupling_pct": track.as_ref().and_then(|t| t.decoupling_pct),
+                    "guardrail_audit": track.as_ref().map(|t| &t.audit),
+                })
+            } else {
+                json!({ "error": format!("Activity '{raw_id}' not found in synced store.") })
+            }
         }
         "get_recent_activities" => {
             let limit = args["limit"].as_u64().unwrap_or(15).min(50) as usize;

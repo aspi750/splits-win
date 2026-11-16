@@ -653,3 +653,50 @@ pub struct CoachUpdateProposal {
     pub diff_preview: String,
     pub status: String,
 }
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FitTrackPoint {
+    pub timestamp_sec: f64,
+    pub distance_m: f64,
+    pub speed_mps: f64,
+    pub pace_sec_per_km: Option<f64>,
+    pub heart_rate_bpm: Option<f64>,
+    pub cadence_spm: Option<f64>,
+    pub altitude_m: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FitSplit {
+    pub km_index: i32,
+    pub distance_m: f64,
+    pub duration_sec: f64,
+    pub pace_sec_per_km: Option<f64>,
+    pub avg_hr_bpm: Option<f64>,
+    pub avg_cadence_spm: Option<f64>,
+    pub elevation_gain_m: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FitGuardrailAudit {
+    pub pace_floor_sec_per_km: Option<i32>,
+    pub easy_hr_ceiling_bpm: Option<i32>,
+    pub pace_floor_violations: i32,
+    pub hr_ceiling_violations: i32,
+    pub compliant: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FitTrackAnalysis {
+    pub garmin_id: i64,
+    pub chart_points: Vec<FitTrackPoint>,
+    pub full_points: Vec<FitTrackPoint>,
+    pub splits: Vec<FitSplit>,
+    pub decoupling_pct: Option<f64>,
+    pub audit: FitGuardrailAudit,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ActivityDetailPayload {
+    pub activity: ActivityRecord,
+    pub track: Option<FitTrackAnalysis>,
+}

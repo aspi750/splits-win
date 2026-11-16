@@ -5,6 +5,7 @@ use serde::{de::DeserializeOwned, Serialize};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -171,7 +172,7 @@ impl CredentialStore {
 }
 
 pub struct Database {
-    conn: Connection,
+    conn: Mutex<Connection>,
 }
 
 impl Database {
@@ -180,20 +181,20 @@ impl Database {
             fs::create_dir_all(parent)?;
         }
         let conn = Connection::open(path)?;
-        let db = Self { conn };
+        let db = Self { conn: Mutex::new(conn) };
         db.migrate()?;
         Ok(db)
     }
 
     pub fn open_in_memory() -> Result<Self, StorageError> {
         let conn = Connection::open_in_memory()?;
-        let db = Self { conn };
+        let db = Self { conn: Mutex::new(conn) };
         db.migrate()?;
         Ok(db)
     }
 
     fn migrate(&self) -> Result<(), StorageError> {
-        self.conn.execute_batch(
+        self.conn.lock().unwrap().execute_batch(
             "CREATE TABLE IF NOT EXISTS activities (
                 garmin_id INTEGER PRIMARY KEY,
                 name TEXT NOT NULL,
@@ -221,13 +222,18 @@ impl Database {
                 sleep_score INTEGER,
                 hrv_last_night INTEGER,
                 hrv_status TEXT
+            );
+            CREATE TABLE IF NOT EXISTS fit_tracks (
+                garmin_id INTEGER PRIMARY KEY,
+                track_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL
             );",
         )?;
         Ok(())
     }
 
     pub fn upsert_activity(&self, act: &ActivityRecord) -> Result<(), StorageError> {
-        self.conn.execute(
+        self.conn.lock().unwrap().execute(
             "INSERT INTO activities (
                 garmin_id, name, type_key, start_iso, distance_m, duration_sec, moving_duration_sec,
                 elevation_gain_m, average_hr, max_hr, cadence_spm, training_load, shoe_name
@@ -248,7 +254,8 @@ impl Database {
     }
 
     pub fn list_activities(&self, limit: usize) -> Result<Vec<ActivityRecord>, StorageError> {
-        let mut stmt = self.conn.prepare(
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
             "SELECT garmin_id, name, type_key, start_iso, distance_m, duration_sec, moving_duration_sec,
                     elevation_gain_m, average_hr, max_hr, cadence_spm, training_load, shoe_name
              FROM activities ORDER BY start_iso DESC LIMIT ?1",
@@ -274,7 +281,7 @@ impl Database {
     }
 
     pub fn upsert_day(&self, day: &DayRecord) -> Result<(), StorageError> {
-        self.conn.execute(
+        self.conn.lock().unwrap().execute(
             "INSERT INTO days (
                 date, resting_hr, stress_avg, body_battery_high, body_battery_latest,
                 steps, step_goal, sleep_seconds, sleep_score, hrv_last_night, hrv_status
@@ -300,7 +307,8 @@ impl Database {
     }
 
     pub fn list_days(&self, limit: usize) -> Result<Vec<DayRecord>, StorageError> {
-        let mut stmt = self.conn.prepare(
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
             "SELECT date, resting_hr, stress_avg, body_battery_high, body_battery_latest,
                     steps, step_goal, sleep_seconds, sleep_score, hrv_last_night, hrv_status
              FROM days ORDER BY date DESC LIMIT ?1",
@@ -321,5 +329,64 @@ impl Database {
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn get_activity(&self, garmin_id: i64) -> Result<Option<ActivityRecord>, StorageError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT garmin_id, name, type_key, start_iso, distance_m, duration_sec, moving_duration_sec,
+                    elevation_gain_m, average_hr, max_hr, cadence_spm, training_load, shoe_name
+             FROM activities WHERE garmin_id = ?1 LIMIT 1",
+        )?;
+        let mut rows = stmt.query_map(params![garmin_id], |r| {
+            Ok(ActivityRecord {
+                garmin_id: r.get(0)?,
+                name: r.get(1)?,
+                type_key: r.get(2)?,
+                start_iso: r.get(3)?,
+                distance_m: r.get(4)?,
+                duration_sec: r.get(5)?,
+                moving_duration_sec: r.get(6)?,
+                elevation_gain_m: r.get(7)?,
+                average_hr: r.get(8)?,
+                max_hr: r.get(9)?,
+                cadence_spm: r.get(10)?,
+                training_load: r.get(11)?,
+                shoe_name: r.get(12)?,
+            })
+        })?;
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn upsert_fit_track(&self, garmin_id: i64, track: &FitTrackAnalysis) -> Result<(), StorageError> {
+        let json = serde_json::to_string(track)?;
+        let updated_at = chrono::Utc::now().to_rfc3339();
+        self.conn.lock().unwrap().execute(
+            "INSERT INTO fit_tracks (garmin_id, track_json, updated_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(garmin_id) DO UPDATE SET
+                track_json = excluded.track_json,
+                updated_at = excluded.updated_at",
+            params![garmin_id, json, updated_at],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_fit_track(&self, garmin_id: i64) -> Result<Option<FitTrackAnalysis>, StorageError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT track_json FROM fit_tracks WHERE garmin_id = ?1 LIMIT 1")?;
+        let mut rows = stmt.query_map(params![garmin_id], |r| r.get::<_, String>(0))?;
+        match rows.next() {
+            Some(raw) => {
+                let text = raw?;
+                let parsed: FitTrackAnalysis = serde_json::from_str(&text)?;
+                Ok(Some(parsed))
+            }
+            None => Ok(None),
+        }
     }
 }

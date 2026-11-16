@@ -1,22 +1,52 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
   Activity,
+  ArrowLeft,
   Check,
   Clipboard,
   MessageSquare,
   RefreshCw,
   Settings,
+  Sparkles,
+  SquarePen,
   Sun,
 } from "lucide-react";
-import type { AthleteConfig, BootstrapState, ExecutionMode, GoalType } from "./types";
+import type {
+  ActivityDetailPayload,
+  ActivityRecord,
+  AthleteConfig,
+  BootstrapState,
+  CoachUpdateProposal,
+  ExecutionMode,
+  FitTrackPoint,
+  GoalType,
+} from "./types";
 
 type NavTab = "today" | "activities" | "coach" | "settings";
 
 interface ChatMessage {
   role: "user" | "assistant";
   text: string;
+  proposals?: CoachUpdateProposal[];
+}
+
+function formatPace(secPerKm: number | null | undefined): string {
+  if (!secPerKm || !Number.isFinite(secPerKm) || secPerKm <= 0) return "–";
+  const total = Math.round(secPerKm);
+  return `${Math.floor(total / 60)}:${String(total % 60).padStart(2, "0")}/km`;
+}
+
+function formatDuration(sec: number): string {
+  const total = Math.max(0, Math.round(sec));
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  return h > 0
+    ? `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`
+    : `${m}:${String(s).padStart(2, "0")}`;
 }
 
 export default function App() {
@@ -30,7 +60,11 @@ export default function App() {
 
   const [chatInput, setChatInput] = useState("");
   const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [liveToolLabel, setLiveToolLabel] = useState<string | null>(null);
   const [copiedPacket, setCopiedPacket] = useState(false);
+
+  const [selectedActivity, setSelectedActivity] = useState<ActivityDetailPayload | null>(null);
+  const [loadingDetail, setLoadingDetail] = useState(false);
 
   const [draftConfig, setDraftConfig] = useState<AthleteConfig | null>(null);
 
@@ -43,6 +77,55 @@ export default function App() {
   useEffect(() => {
     void reload();
   }, []);
+
+  useEffect(() => {
+    const unlistenDelta = listen<{ delta: string }>("coach:delta", (event) => {
+      const delta = event.payload?.delta ?? "";
+      if (!delta) return;
+      setLiveToolLabel(null);
+      setMessages((prev) => {
+        if (prev.length === 0) return prev;
+        const next = [...prev];
+        const last = next[next.length - 1];
+        if (last.role === "assistant") {
+          next[next.length - 1] = { ...last, text: last.text + delta };
+        }
+        return next;
+      });
+    });
+
+    const unlistenTool = listen<{ tool: string; label: string; active: boolean }>(
+      "coach:tool_status",
+      (event) => {
+        setLiveToolLabel(event.payload?.active ? event.payload.label : null);
+      }
+    );
+
+    return () => {
+      void unlistenDelta.then((f) => f());
+      void unlistenTool.then((f) => f());
+    };
+  }, []);
+
+  const weeklyBars = useMemo(() => {
+    if (!state) return [];
+    const now = new Date();
+    const out: { label: string; km: number; runs: number }[] = [];
+    for (let i = 6; i >= 0; i--) {
+      const d = new Date(now);
+      d.setDate(now.getDate() - i);
+      const key = d.toISOString().slice(0, 10);
+      const dayActs = state.activities.filter(
+        (a) => a.start_iso.slice(0, 10) === key && a.type_key.toLowerCase().includes("run")
+      );
+      out.push({
+        label: d.toLocaleDateString(undefined, { weekday: "short" }),
+        km: dayActs.reduce((acc, a) => acc + a.distance_m / 1000, 0),
+        runs: dayActs.length,
+      });
+    }
+    return out;
+  }, [state]);
 
   if (!state || !draftConfig) {
     return <div className="main">Loading Splits Coach…</div>;
@@ -148,6 +231,7 @@ export default function App() {
 
   const r = state.readiness_state;
   const todayDay = state.days[0];
+  const latestRun = state.activities.find((a) => a.type_key.toLowerCase().includes("run")) ?? state.activities[0];
   const pillClass = !r ? "amber" : !r.gatekeeper.run_permitted ? "red" : r.gatekeeper.caution_flags.length > 0 ? "amber" : "green";
 
   async function handleCopyPacket() {
@@ -157,31 +241,93 @@ export default function App() {
     setTimeout(() => setCopiedPacket(false), 1500);
   }
 
-  async function handleSendCoach() {
-    const trimmed = chatInput.trim();
-    if (!trimmed) return;
-    setChatInput("");
-    setMessages((prev) => [...prev, { role: "user", text: trimmed }]);
+  async function sendPrompt(promptText: string) {
+    const trimmed = promptText.trim();
+    if (!trimmed || busy) return;
+    setMessages((prev) => [
+      ...prev,
+      { role: "user", text: trimmed },
+      { role: "assistant", text: "" },
+    ]);
     setBusy(true);
+    setLiveToolLabel(null);
     try {
-      const res = await invoke<{ mode: string; text?: string; packet?: string }>("send_coach_message", {
-        prompt: trimmed,
+      const res = await invoke<{
+        mode: string;
+        text?: string;
+        packet?: string;
+        proposals?: CoachUpdateProposal[];
+      }>("send_coach_message", { prompt: trimmed });
+
+      setMessages((prev) => {
+        const next = [...prev];
+        const idx = next.length - 1;
+        if (idx >= 0 && next[idx].role === "assistant") {
+          if (res.mode === "gemini_api") {
+            next[idx] = {
+              role: "assistant",
+              text: res.text || next[idx].text,
+              proposals: res.proposals ?? [],
+            };
+          } else {
+            if (res.packet) void navigator.clipboard.writeText(res.packet);
+            next[idx] = {
+              role: "assistant",
+              text: "No Gemini API key is configured. Your complete Markdown Coach Packet has been copied to the clipboard — paste it into any AI chat.",
+            };
+          }
+        }
+        return next;
       });
-      if (res.mode === "gemini_api") {
-        setMessages((prev) => [...prev, { role: "assistant", text: res.text ?? "" }]);
-      } else {
-        if (res.packet) await navigator.clipboard.writeText(res.packet);
-        setMessages((prev) => [
-          ...prev,
-          {
-            role: "assistant",
-            text: "No Gemini API key is configured. Your complete Markdown Coach Packet has been copied to the clipboard — paste it into any AI chat.",
-          },
-        ]);
-      }
     } finally {
       setBusy(false);
+      setLiveToolLabel(null);
     }
+  }
+
+  async function handleSendCoach() {
+    const text = chatInput;
+    setChatInput("");
+    await sendPrompt(text);
+  }
+
+  async function analyzeInCoach(activity: ActivityRecord) {
+    setTab("coach");
+    const prompt = `Analyze my activity "${activity.name || activity.type_key}" on ${activity.start_iso.slice(0, 10)} (activity_id: ${activity.garmin_id}) in detail. Fetch its .fit splits and telemetry via get_activity_detail, evaluate per-km pacing, cardiac decoupling / HR drift, and interpret it against my active plan and readiness context.`;
+    await sendPrompt(prompt);
+  }
+
+  async function openActivityDetail(activity: ActivityRecord) {
+    setLoadingDetail(true);
+    try {
+      const detail = await invoke<ActivityDetailPayload>("get_activity_detail", {
+        activityId: activity.garmin_id,
+      });
+      setSelectedActivity(detail);
+    } finally {
+      setLoadingDetail(false);
+    }
+  }
+
+  async function handleProposalDecision(msgIdx: number, propId: string, approve: boolean) {
+    const targetProp = messages[msgIdx]?.proposals?.find((p) => p.id === propId);
+    if (!targetProp) return;
+    if (approve) {
+      await invoke("apply_coach_proposal", { proposal: targetProp });
+      await reload();
+    }
+    setMessages((prev) =>
+      prev.map((m, i) =>
+        i !== msgIdx
+          ? m
+          : {
+              ...m,
+              proposals: m.proposals?.map((p) =>
+                p.id === propId ? { ...p, status: approve ? "applied" : "dismissed" } : p
+              ),
+            }
+      )
+    );
   }
 
   return (
@@ -191,7 +337,13 @@ export default function App() {
         <button className={`nav-btn ${tab === "today" ? "active" : ""}`} onClick={() => setTab("today")}>
           <Sun size={16} /> Today
         </button>
-        <button className={`nav-btn ${tab === "activities" ? "active" : ""}`} onClick={() => setTab("activities")}>
+        <button
+          className={`nav-btn ${tab === "activities" ? "active" : ""}`}
+          onClick={() => {
+            setSelectedActivity(null);
+            setTab("activities");
+          }}
+        >
           <Activity size={16} /> Activities
         </button>
         <button className={`nav-btn ${tab === "coach" ? "active" : ""}`} onClick={() => setTab("coach")}>
@@ -229,15 +381,26 @@ export default function App() {
                   <strong>Coach Readiness</strong>
                   <div className="muted">{r ? `${r.date} · ${r.updated_by}` : "Not computed yet"}</div>
                 </div>
-                <button
-                  className="secondary"
-                  onClick={async () => {
-                    await invoke("recompute_readiness");
-                    await reload();
-                  }}
-                >
-                  Recompute
-                </button>
+                <div style={{ display: "flex", gap: 8 }}>
+                  {latestRun && (
+                    <button
+                      className="secondary"
+                      style={{ display: "flex", alignItems: "center", gap: 5 }}
+                      onClick={() => void analyzeInCoach(latestRun)}
+                    >
+                      <Sparkles size={14} /> Analyze Latest Run
+                    </button>
+                  )}
+                  <button
+                    className="secondary"
+                    onClick={async () => {
+                      await invoke("recompute_readiness");
+                      await reload();
+                    }}
+                  >
+                    Recompute
+                  </button>
+                </div>
               </div>
               {r ? (
                 <div>
@@ -255,6 +418,17 @@ export default function App() {
               ) : (
                 <div className="muted">Click Recompute to evaluate local readiness from your synced history.</div>
               )}
+            </div>
+
+            <div className="card">
+              <div className="card-header">
+                <strong>7-Day Running Volume</strong>
+                <span className="muted">
+                  {weeklyBars.reduce((s, b) => s + b.km, 0).toFixed(1)} km ·{" "}
+                  {weeklyBars.reduce((s, b) => s + b.runs, 0)} runs
+                </span>
+              </div>
+              <WeeklyVolumeChart bars={weeklyBars} />
             </div>
 
             <div className="grid">
@@ -278,16 +452,24 @@ export default function App() {
           </>
         )}
 
-        {tab === "activities" && (
+        {tab === "activities" && !selectedActivity && (
           <div className="card">
             <h3>Recent Activities ({state.activities.length})</h3>
+            {loadingDetail && <div className="muted">Loading .fit track…</div>}
             {state.activities.length === 0 ? (
               <div className="muted">No activities synced yet.</div>
             ) : (
               state.activities.map((a) => (
                 <div
                   key={a.garmin_id}
-                  style={{ display: "flex", justifyContent: "space-between", padding: "10px 0", borderBottom: "1px solid var(--border)" }}
+                  onClick={() => void openActivityDetail(a)}
+                  style={{
+                    display: "flex",
+                    justifyContent: "space-between",
+                    padding: "10px 6px",
+                    borderBottom: "1px solid var(--border)",
+                    cursor: "pointer",
+                  }}
                 >
                   <div>
                     <strong>{a.name || a.type_key}</strong>
@@ -303,16 +485,32 @@ export default function App() {
           </div>
         )}
 
+        {tab === "activities" && selectedActivity && (
+          <ActivityDetailView
+            detail={selectedActivity}
+            onBack={() => setSelectedActivity(null)}
+            onAnalyze={() => void analyzeInCoach(selectedActivity.activity)}
+          />
+        )}
+
         {tab === "coach" && (
-          <>
-            <div className="card">
-              <div className="card-header">
-                <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-                  <strong>Living Coach</strong>
-                  <span className="pill green">
-                    {state.engine_mode === "gemini_api" ? "Gemini API" : "Clipboard Packet"}
-                  </span>
-                </div>
+          <div className="card">
+            <div className="card-header">
+              <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                <strong>Living Coach</strong>
+                <span className="pill green">
+                  {state.engine_mode === "gemini_api" ? "Gemini API" : "Clipboard Packet"}
+                </span>
+              </div>
+              <div style={{ display: "flex", gap: 8 }}>
+                <button
+                  className="secondary"
+                  style={{ display: "flex", alignItems: "center", gap: 6 }}
+                  disabled={busy || messages.length === 0}
+                  onClick={() => setMessages([])}
+                >
+                  <SquarePen size={14} /> New Chat
+                </button>
                 <button
                   className="secondary"
                   style={{ display: "flex", alignItems: "center", gap: 6 }}
@@ -322,28 +520,73 @@ export default function App() {
                   {copiedPacket ? "Copied" : "Copy Coach Packet"}
                 </button>
               </div>
-              <div className="chat-box">
-                {messages.map((m, i) => (
-                  <div key={i} className={`bubble ${m.role}`}>
-                    {m.text}
-                  </div>
-                ))}
-              </div>
-              <div style={{ display: "flex", gap: 10, marginTop: 14 }}>
-                <input
-                  placeholder="Ask your coach…"
-                  value={chatInput}
-                  onChange={(e) => setChatInput(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter") void handleSendCoach();
-                  }}
-                />
-                <button className="primary" disabled={busy} onClick={handleSendCoach}>
-                  Send
-                </button>
-              </div>
             </div>
-          </>
+
+            {liveToolLabel && (
+              <div className="pill amber" style={{ marginBottom: 12 }}>
+                {liveToolLabel}
+              </div>
+            )}
+
+            <div className="chat-box">
+              {messages.map((m, i) => (
+                <div key={i} className={`bubble ${m.role}`}>
+                  <div>{m.text || (busy && m.role === "assistant" ? "Thinking…" : "")}</div>
+                  {m.proposals?.map((p) => (
+                    <div
+                      key={p.id}
+                      style={{
+                        marginTop: 12,
+                        padding: 10,
+                        borderRadius: 8,
+                        border: "1px solid var(--border)",
+                        background: "var(--bg)",
+                      }}
+                    >
+                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                        <strong>
+                          {p.target_file} — {p.reason}
+                        </strong>
+                        <span className="muted">{p.status}</span>
+                      </div>
+                      {p.expires_on && <div className="muted">Expires: {p.expires_on}</div>}
+                      <pre style={{ fontSize: 12, overflowX: "auto", margin: "8px 0" }}>{p.diff_preview}</pre>
+                      {p.status === "pending_user_approval" && (
+                        <div style={{ display: "flex", gap: 8 }}>
+                          <button
+                            className="primary"
+                            onClick={() => void handleProposalDecision(i, p.id, true)}
+                          >
+                            Approve & Apply
+                          </button>
+                          <button
+                            className="secondary"
+                            onClick={() => void handleProposalDecision(i, p.id, false)}
+                          >
+                            Dismiss
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              ))}
+            </div>
+
+            <div style={{ display: "flex", gap: 10, marginTop: 14 }}>
+              <input
+                placeholder="Ask your coach…"
+                value={chatInput}
+                onChange={(e) => setChatInput(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") void handleSendCoach();
+                }}
+              />
+              <button className="primary" disabled={busy} onClick={handleSendCoach}>
+                Send
+              </button>
+            </div>
+          </div>
         )}
 
         {tab === "settings" && (
@@ -494,5 +737,174 @@ export default function App() {
         )}
       </main>
     </div>
+  );
+}
+
+function WeeklyVolumeChart({ bars }: { bars: { label: string; km: number; runs: number }[] }) {
+  const maxKm = Math.max(5, ...bars.map((b) => b.km));
+  return (
+    <svg viewBox="0 0 560 120" style={{ width: "100%", height: 120 }}>
+      {bars.map((b, idx) => {
+        const barW = 48;
+        const x = 16 + idx * 78;
+        const h = Math.round((b.km / maxKm) * 72);
+        const y = 86 - h;
+        return (
+          <g key={idx}>
+            <rect x={x} y={y} width={barW} height={Math.max(2, h)} rx={6} fill="var(--accent)" opacity={0.85} />
+            <text x={x + barW / 2} y={y - 5} textAnchor="middle" fontSize="10" fill="var(--muted)">
+              {b.km > 0 ? b.km.toFixed(1) : ""}
+            </text>
+            <text x={x + barW / 2} y={106} textAnchor="middle" fontSize="11" fill="var(--muted)">
+              {b.label}
+            </text>
+          </g>
+        );
+      })}
+    </svg>
+  );
+}
+
+function ActivityDetailView({
+  detail,
+  onBack,
+  onAnalyze,
+}: {
+  detail: ActivityDetailPayload;
+  onBack: () => void;
+  onAnalyze: () => void;
+}) {
+  const a = detail.activity;
+  const track = detail.track;
+  const km = a.distance_m / 1000;
+  const avgPace = km > 0.1 && a.moving_duration_sec > 0 ? a.moving_duration_sec / km : null;
+
+  return (
+    <>
+      <div className="card">
+        <div className="card-header">
+          <button className="secondary" style={{ display: "flex", alignItems: "center", gap: 6 }} onClick={onBack}>
+            <ArrowLeft size={14} /> Back
+          </button>
+          <button className="primary" style={{ display: "flex", alignItems: "center", gap: 6 }} onClick={onAnalyze}>
+            <Sparkles size={14} /> Analyze in Coach
+          </button>
+        </div>
+        <h2 style={{ margin: "4px 0" }}>{a.name || a.type_key}</h2>
+        <div className="muted" style={{ marginBottom: 14 }}>
+          {a.start_iso.slice(0, 10)} · {a.type_key}
+        </div>
+        <div className="grid">
+          <div className="card">
+            <div className="muted">Distance</div>
+            <div className="metric-val">{km.toFixed(2)} km</div>
+          </div>
+          <div className="card">
+            <div className="muted">Duration</div>
+            <div className="metric-val">{formatDuration(a.moving_duration_sec || a.duration_sec)}</div>
+          </div>
+          <div className="card">
+            <div className="muted">Avg Pace</div>
+            <div className="metric-val">{formatPace(avgPace)}</div>
+          </div>
+          <div className="card">
+            <div className="muted">Avg / Max HR</div>
+            <div className="metric-val">
+              {a.average_hr ? Math.round(a.average_hr) : "–"} / {a.max_hr ? Math.round(a.max_hr) : "–"}
+            </div>
+          </div>
+          <div className="card">
+            <div className="muted">Cadence / Elev</div>
+            <div className="metric-val">
+              {a.cadence_spm ? Math.round(a.cadence_spm) : "–"} · {Math.round(a.elevation_gain_m)}m
+            </div>
+          </div>
+          <div className="card">
+            <div className="muted">Cardiac Decoupling</div>
+            <div className="metric-val">
+              {track?.decoupling_pct != null ? `${track.decoupling_pct.toFixed(1)}%` : "–"}
+            </div>
+            {track && (
+              <span className={`pill ${track.audit.compliant ? "green" : "amber"}`}>
+                {track.audit.compliant ? "Guardrails Compliant" : "Guardrail Violation"}
+              </span>
+            )}
+          </div>
+        </div>
+      </div>
+
+      {track && track.chart_points.length > 1 && (
+        <div className="card">
+          <h3>Heart Rate (bpm) & Pace across Distance</h3>
+          <FitDualChart points={track.chart_points} />
+        </div>
+      )}
+
+      {track && track.splits.length > 0 && (
+        <div className="card">
+          <h3>Per-km Splits</h3>
+          <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
+            <thead>
+              <tr style={{ textAlign: "left", borderBottom: "1px solid var(--border)" }}>
+                <th style={{ padding: 6 }}>Km</th>
+                <th style={{ padding: 6 }}>Pace</th>
+                <th style={{ padding: 6 }}>Avg HR</th>
+                <th style={{ padding: 6 }}>Cadence</th>
+                <th style={{ padding: 6 }}>Elev</th>
+              </tr>
+            </thead>
+            <tbody>
+              {track.splits.map((s) => (
+                <tr key={s.km_index} style={{ borderBottom: "1px solid var(--border)" }}>
+                  <td style={{ padding: 6 }}>{s.km_index}</td>
+                  <td style={{ padding: 6 }}>{formatPace(s.pace_sec_per_km)}</td>
+                  <td style={{ padding: 6 }}>{s.avg_hr_bpm ? `${Math.round(s.avg_hr_bpm)} bpm` : "–"}</td>
+                  <td style={{ padding: 6 }}>{s.avg_cadence_spm ? `${Math.round(s.avg_cadence_spm)} spm` : "–"}</td>
+                  <td style={{ padding: 6 }}>+{s.elevation_gain_m.toFixed(0)} m</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </>
+  );
+}
+
+function FitDualChart({ points }: { points: FitTrackPoint[] }) {
+  const maxDist = Math.max(1, points[points.length - 1]?.distance_m ?? 1);
+  const hrs = points.map((p) => p.heart_rate_bpm).filter((v): v is number => v != null);
+  const minHr = hrs.length ? Math.min(...hrs) - 5 : 90;
+  const maxHr = hrs.length ? Math.max(...hrs) + 5 : 190;
+
+  const paces = points.map((p) => p.pace_sec_per_km).filter((v): v is number => v != null && v < 900);
+  const minPace = paces.length ? Math.min(...paces) - 10 : 240;
+  const maxPace = paces.length ? Math.max(...paces) + 10 : 480;
+
+  const hrPath = points
+    .filter((p) => p.heart_rate_bpm != null)
+    .map((p, i) => {
+      const x = (p.distance_m / maxDist) * 600;
+      const y = 140 - (((p.heart_rate_bpm! - minHr) / Math.max(1, maxHr - minHr)) * 120);
+      return `${i === 0 ? "M" : "L"}${x.toFixed(1)},${y.toFixed(1)}`;
+    })
+    .join(" ");
+
+  const pacePath = points
+    .filter((p) => p.pace_sec_per_km != null && p.pace_sec_per_km < 900)
+    .map((p, i) => {
+      const x = (p.distance_m / maxDist) * 600;
+      const y = 140 - (((maxPace - p.pace_sec_per_km!) / Math.max(1, maxPace - minPace)) * 120);
+      return `${i === 0 ? "M" : "L"}${x.toFixed(1)},${y.toFixed(1)}`;
+    })
+    .join(" ");
+
+  return (
+    <svg viewBox="0 0 600 155" style={{ width: "100%", height: 160 }}>
+      {pacePath && <path d={pacePath} fill="none" stroke="var(--accent)" strokeWidth="2" opacity={0.8} />}
+      {hrPath && <path d={hrPath} fill="none" stroke="var(--red)" strokeWidth="2" />}
+      <text x={8} y={14} fontSize="11" fill="var(--red)">HR (bpm)</text>
+      <text x={80} y={14} fontSize="11" fill="var(--accent)">Pace (/km)</text>
+    </svg>
   );
 }
