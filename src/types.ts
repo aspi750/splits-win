@@ -1,0 +1,121 @@
+export type ExecutionMode = "self_contained" | "external_server";
+export type CoachEngineMode = "gemini_api" | "clipboard_packet";
+export type GoalType = "race" | "base_building" | "general_fitness" | "return_from_injury";
+
+export interface AthleteConfig {
+  specs: {
+    displayName: string;
+    weightKg: number | null;
+    maxHR: number | null;
+    restingHRBaseline: number | null;
+    vt1CeilingBPM: number | null;
+    timezoneIdentifier: string;
+  };
+  medical: {
+    conditionsAndNotes: string;
+    enforceEasyHRCeiling: boolean;
+    easyHRCeilingBPM: number | null;
+    enforcePaceFloor: boolean;
+    minPaceSecPerKm: number | null;
+    minRestHoursBetweenRuns: number | null;
+  };
+  objective: {
+    goalType: GoalType;
+    raceName: string | null;
+    raceDistanceKm: number | null;
+    raceDate: string | null;
+    targetTimeDescription: string | null;
+  };
+  availability: {
+    availableDays: number[];
+    preferredLongRunDay: number | null;
+    maxWeekdayMinutes: number | null;
+    crossTrainingNotes: string;
+  };
+  updatedAt: string;
+}
+
+export interface ReadinessState {
+  version: number;
+  updated_at: string;
+  updated_by: string;
+  date: string;
+  gatekeeper: {
+    run_permitted: boolean;
+    hard_blocks: string[];
+    caution_flags: string[];
+    hours_since_last_run: number;
+    rolling_7d_km: number;
+    rolling_7d_runs: number;
+    remaining_weekly_budget_km: number;
+    effective_today_max_km: number;
+  };
+  plan_context: {
+    source: string;
+    revision: number;
+    mesocycle_phase: string;
+    walk_hr_cap_bpm: number;
+  };
+  shoe_eligibility: {
+    eligible_run_shoes: string[];
+    gated_shoes: string[];
+    blocked_shoes: string[];
+  };
+  telemetry_provenance: {
+    source: string;
+    date: string;
+  };
+  prescription_summary: {
+    decision: string;
+    distance_km: number;
+    duration_mins: number;
+    shoe_platform: string;
+    hr_ceiling_bpm: number;
+  };
+}
+
+export interface ActivityRecord {
+  garmin_id: number;
+  name: string;
+  type_key: string;
+  start_iso: string;
+  distance_m: number;
+  duration_sec: number;
+  moving_duration_sec: number;
+  elevation_gain_m: number;
+  average_hr: number | null;
+  max_hr: number | null;
+  cadence_spm: number | null;
+  training_load: number | null;
+  shoe_name: string | null;
+}
+
+export interface DayRecord {
+  date: string;
+  resting_hr: number | null;
+  stress_avg: number | null;
+  body_battery_high: number | null;
+  body_battery_latest: number | null;
+  steps: number | null;
+  step_goal: number | null;
+  sleep_seconds: number | null;
+  sleep_score: number | null;
+  hrv_last_night: number | null;
+  hrv_status: string | null;
+}
+
+export interface BootstrapState {
+  has_garmin_key: boolean;
+  has_gemini_key: boolean;
+  engine_mode: CoachEngineMode;
+  shared_dir: string;
+  settings: {
+    custom_shared_coach_directory_path: string | null;
+    execution_mode: ExecutionMode;
+    profile_onboarded: boolean;
+  };
+  athlete_config: AthleteConfig;
+  readiness_state: ReadinessState | null;
+  activities: ActivityRecord[];
+  days: DayRecord[];
+}
