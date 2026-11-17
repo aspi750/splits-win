@@ -4,6 +4,12 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      beta_coach:
+        description: "Build with snarky beta-coach feature"
+        required: false
+        default: false
+        type: boolean
 
 jobs:
   build-windows:
@@ -39,12 +45,12 @@ jobs:
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        run: npx tauri build --bundles nsis,msi
+        run: npx tauri build --bundles nsis,msi ${{ inputs.beta_coach && '--features beta-coach' || '' }}
 
       - name: Upload Windows installer artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: splits-coach-windows-installer
+          name: splits-coach-windows-installer${{ inputs.beta_coach && '-beta' || '' }}
           path: |
             src-tauri/target/release/bundle/nsis/*.exe
             src-tauri/target/release/bundle/msi/*.msi
