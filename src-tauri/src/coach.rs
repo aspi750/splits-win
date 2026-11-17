@@ -1074,5 +1074,9 @@ pub fn build_static_system_instruction(
         let summary = analyze_training_history(activities, config, Utc::now());
         sections.push(first_use_setup_instructions(&summary));
     }
+    #[cfg(feature = "beta-coach")]
+    sections.push(
+        "BETA COACH PERSONA DIRECTIVE: Keep all physiological, heart-rate zone, decoupling, and pace calculations 100% rigorous and accurate, while delivering dry, deadpan, slightly snarky commentary on cardiac drift, skipped recovery days, or sluggish HYROX transitions.".to_string()
+    );
     sections.join("\n\n")
 }

@@ -232,6 +232,14 @@ export interface FitTrackAnalysis {
   audit: FitGuardrailAudit;
 }
 
+export interface FitBaselineProbe {
+  scanned_files: number;
+  detected_max_hr: number | null;
+  detected_rhr_baseline: number | null;
+  estimated_lthr: number | null;
+  weekly_km_est: number | null;
+}
+
 export interface ActivityDetailPayload {
   activity: ActivityRecord;
   track: FitTrackAnalysis | null;

@@ -18,6 +18,7 @@ import {
   SquarePen,
   Sun,
 } from "lucide-react";
+import { OnboardingWizard } from "./components/OnboardingWizard";
 import type {
   ActivityDetailPayload,
   ActivityRecord,
@@ -71,6 +72,7 @@ export default function App() {
   const [loadingDetail, setLoadingDetail] = useState(false);
 
   const [draftConfig, setDraftConfig] = useState<AthleteConfig | null>(null);
+  const [showOnboarding, setShowOnboarding] = useState(false);
 
   const [appVersion, setAppVersion] = useState<string>("0.1.2");
   const [availableUpdate, setAvailableUpdate] = useState<Update | null>(null);
@@ -196,6 +198,70 @@ export default function App() {
 
   if (!state || !draftConfig) {
     return <div className="main">Loading Splits Coach…</div>;
+  }
+
+  const shouldShowOnboarding =
+    showOnboarding || state.user_profile?.onboarding_completed === false;
+
+  if (shouldShowOnboarding) {
+    const defaultProfile = state.user_profile ?? {
+      athlete_type: "runner" as const,
+      onboarding_completed: false,
+      runner_config: {
+        primary_distance: null,
+        hr_first_governor: true,
+        pace_floor_sec_per_km: null,
+        z2_range_bpm: null,
+        z3_range_bpm: null,
+        lthr_bpm: null,
+      },
+      hyrox_config: {
+        division: null,
+        watch_logging_mode: null,
+        target_total_time_sec: null,
+        fresh_1km_pace_sec: null,
+        compromised_1km_target_sec: null,
+        weak_stations: [],
+      },
+    };
+    return (
+      <OnboardingWizard
+        initialConfig={draftConfig}
+        initialProfile={defaultProfile}
+        hasGarminKey={state.has_garmin_key}
+        hasGeminiKey={state.has_gemini_key}
+        canDismiss={Boolean(state.user_profile?.onboarding_completed)}
+        onDismiss={() => setShowOnboarding(false)}
+        onComplete={async (initialCoachPrompt) => {
+          setShowOnboarding(false);
+          await reload();
+          setTab("coach");
+          setMessages([
+            { role: "user", text: initialCoachPrompt },
+            { role: "assistant", text: "" },
+          ]);
+          setBusy(true);
+          try {
+            const res = await invoke<{ mode: string; text: string; packet?: string; proposals?: CoachUpdateProposal[] }>(
+              "send_coach_message",
+              { prompt: initialCoachPrompt }
+            );
+            setMessages((prev) => {
+              const next = [...prev];
+              next[next.length - 1] = {
+                role: "assistant",
+                text: res.mode === "clipboard_packet" ? res.packet ?? "" : res.text,
+                proposals: res.proposals,
+              };
+              return next;
+            });
+          } finally {
+            setBusy(false);
+            setLiveToolLabel(null);
+          }
+        }}
+      />
+    );
   }
 
   if (!state.has_garmin_key) {
@@ -693,20 +759,44 @@ export default function App() {
 
             {messages.length === 0 && (
               <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 12 }}>
-                {[
-                  {
-                    label: "Analyze last run",
-                    prompt: "Analyze my latest run in detail, including splits, heart rate drift, and pacing.",
-                  },
-                  {
-                    label: "Today's readiness check",
-                    prompt: "Check today's gatekeeper readiness, recovery status, and recommended session.",
-                  },
-                  {
-                    label: "Lifetime & 365d history",
-                    prompt: "Review my lifetime training overview and trailing 365-day block audit.",
-                  },
-                ].map((q) => (
+                {(state.user_profile?.athlete_type === "hyrox" ||
+                state.user_profile?.athlete_type === "hybrid_both"
+                  ? [
+                      {
+                        label: "Analyze compromised 1km run decay",
+                        prompt:
+                          "Analyze my latest HYROX / hybrid session's compromised 1km run decay and clean running efficiency.",
+                      },
+                      {
+                        label: "Audit Run vs. Station split ratio",
+                        prompt:
+                          "Audit my Run vs. Station split ratio and Roxzone transitions from my latest HYROX sim.",
+                      },
+                      {
+                        label: "Target weakest station session",
+                        prompt:
+                          "Design a targeted session for my weakest HYROX stations without compromising my aerobic running base.",
+                      },
+                      {
+                        label: "Today's readiness check",
+                        prompt: "Check today's gatekeeper readiness, recovery status, and recommended session.",
+                      },
+                    ]
+                  : [
+                      {
+                        label: "Analyze last run",
+                        prompt: "Analyze my latest run in detail, including splits, heart rate drift, and pacing.",
+                      },
+                      {
+                        label: "Today's readiness check",
+                        prompt: "Check today's gatekeeper readiness, recovery status, and recommended session.",
+                      },
+                      {
+                        label: "Lifetime & 365d history",
+                        prompt: "Review my lifetime training overview and trailing 365-day block audit.",
+                      },
+                    ]
+                ).map((q) => (
                   <button
                     key={q.label}
                     className="secondary"
@@ -858,7 +948,12 @@ export default function App() {
             </div>
 
             <div className="card">
-              <h3>Athlete Profile & Guardrails</h3>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
+                <h3 style={{ margin: 0 }}>Athlete Profile & Guardrails</h3>
+                <button className="secondary" onClick={() => setShowOnboarding(true)}>
+                  Edit Athlete Profile / Re-run Onboarding
+                </button>
+              </div>
               <div className="form-row">
                 <div>
                   <label className="muted">Display Name</label>
@@ -1141,6 +1236,19 @@ function ActivityDetailView({
   const km = a.distance_m / 1000;
   const avgPace = km > 0.1 && a.moving_duration_sec > 0 ? a.moving_duration_sec / km : null;
   const isHyroxActive = Boolean(a.is_hyrox ?? track?.hyrox_dissection?.is_hyrox_sim);
+  const [halfSim, setHalfSim] = useState(false);
+
+  const HYROX_STATION_LABELS = [
+    "1000m SkiErg",
+    "50m Sled Push",
+    "50m Sled Pull",
+    "80m Burpee Broad Jumps",
+    "1000m Row",
+    "200m Farmers Carry",
+    "100m Sandbag Lunges",
+    "100 Wall Balls",
+  ];
+  const roundCount = halfSim ? 4 : 8;
 
   return (
     <>
@@ -1194,6 +1302,56 @@ function ActivityDetailView({
                   ? `${track.hyrox_dissection.compromised_pace_decay_sec > 0 ? "+" : ""}${track.hyrox_dissection.compromised_pace_decay_sec.toFixed(1)} s/km`
                   : "–"}
               </strong>
+            </div>
+          </div>
+        )}
+        {isHyroxActive && track?.hyrox_dissection && (
+          <div style={{ marginBottom: 14 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+              <strong>Dual-Column {halfSim ? "4×4 Half-Sim" : "8×8"} HYROX Round Matrix</strong>
+              <button className="secondary" onClick={() => setHalfSim((v) => !v)}>
+                {halfSim ? "Switch to 8×8 Full" : "4×4 Half-Sim"}
+              </button>
+            </div>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+              {Array.from({ length: roundCount }, (_, idx) => {
+                const run = track.hyrox_dissection!.run_splits[idx];
+                const station = track.hyrox_dissection!.station_splits[idx];
+                const rox = track.hyrox_dissection!.roxzone_transitions[idx];
+                return (
+                  <div
+                    key={idx}
+                    style={{
+                      padding: 10,
+                      borderRadius: 8,
+                      border: "1px solid var(--border)",
+                      background: "var(--bg)",
+                      fontSize: 12,
+                    }}
+                  >
+                    <div style={{ fontWeight: 600, marginBottom: 4 }}>
+                      Round {idx + 1} · {HYROX_STATION_LABELS[idx] ?? `Station ${idx + 1}`}
+                    </div>
+                    <div style={{ display: "flex", justifyContent: "space-between" }}>
+                      <span>
+                        Run {idx + 1}:{" "}
+                        <strong>
+                          {run ? `${formatDuration(run.moving_sec)} (${formatPace(run.pace_sec_per_km)})` : "–"}
+                        </strong>
+                      </span>
+                      <span className="muted">{run?.avg_hr_bpm ? `${Math.round(run.avg_hr_bpm)} bpm` : ""}</span>
+                    </div>
+                    <div style={{ display: "flex", justifyContent: "space-between", marginTop: 2 }}>
+                      <span>
+                        Station: <strong>{station ? formatDuration(station.moving_sec) : "–"}</strong>
+                      </span>
+                      <span className="muted">
+                        {rox ? `Roxzone ${formatDuration(rox.moving_sec)}` : ""}
+                      </span>
+                    </div>
+                  </div>
+                );
+              })}
             </div>
           </div>
         )}

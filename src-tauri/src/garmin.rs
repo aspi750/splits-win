@@ -1,7 +1,7 @@
 use crate::models::{
     ActivityRecord, AthleteConfig, ClassifiedLap, CompromisedRunAudit, DayRecord,
-    FitGuardrailAudit, FitLap, FitSplit, FitTrackAnalysis, FitTrackPoint, HyroxDissection,
-    LapKind, APP_SERVICE, GARMIN_ACCOUNT,
+    FitBaselineProbe, FitGuardrailAudit, FitLap, FitSplit, FitTrackAnalysis, FitTrackPoint,
+    HyroxDissection, LapKind, APP_SERVICE, GARMIN_ACCOUNT, GARMIN_KEYRING_SERVICE,
 };
 use crate::storage::CredentialStore;
 use chrono::{Duration, Utc};
@@ -65,7 +65,9 @@ impl GarminClient {
                 return Ok(trimmed.to_string());
             }
         }
-        CredentialStore::read_secret(APP_SERVICE, GARMIN_ACCOUNT).ok_or(GarminError::NoKey)
+        CredentialStore::read_secret(GARMIN_KEYRING_SERVICE, GARMIN_ACCOUNT)
+            .or_else(|| CredentialStore::read_secret(APP_SERVICE, GARMIN_ACCOUNT))
+            .ok_or(GarminError::NoKey)
     }
 
     async fn pace_gap(&self) {
@@ -662,6 +664,118 @@ pub fn parse_fit_track(
     analysis.hyrox_dissection = dissect_hyrox_laps(&laps, false);
     analysis.laps = laps;
     Ok(analysis)
+}
+
+/// Scans a local folder of `.fit` files to pre-fill onboarding telemetry baselines:
+/// `detected_max_hr`, `detected_rhr_baseline`, `estimated_lthr`, and `weekly_km_est`.
+pub fn probe_fit_folder(folder_path: &std::path::Path) -> Result<FitBaselineProbe, String> {
+    if !folder_path.exists() || !folder_path.is_dir() {
+        return Err(format!("Folder does not exist: {}", folder_path.display()));
+    }
+    let mut fit_paths: Vec<std::path::PathBuf> = std::fs::read_dir(folder_path)
+        .map_err(|e| format!("Failed to read folder: {e}"))?
+        .filter_map(|e| e.ok().map(|x| x.path()))
+        .filter(|p| {
+            p.extension()
+                .and_then(|s| s.to_str())
+                .map_or(false, |ext| ext.eq_ignore_ascii_case("fit"))
+        })
+        .collect();
+    fit_paths.sort();
+    fit_paths.reverse();
+    fit_paths.truncate(30);
+
+    let mut max_hr_seen: Option<f64> = None;
+    let mut min_hr_seen: Option<f64> = None;
+    let mut total_dist_m = 0.0_f64;
+    let mut min_ts: Option<i64> = None;
+    let mut max_ts: Option<i64> = None;
+    let mut scanned = 0usize;
+
+    for path in &fit_paths {
+        let Ok(bytes) = std::fs::read(path) else { continue };
+        let Ok(records) = fitparser::from_bytes(&bytes) else { continue };
+        scanned += 1;
+
+        let mut session_dist = 0.0_f64;
+        let mut rec_max_dist = 0.0_f64;
+        for msg in records {
+            if msg.kind() == fitparser::profile::MesgNum::Session {
+                for field in msg.fields() {
+                    match field.name() {
+                        "total_distance" => {
+                            if let Some(d) = value_as_f64(field.value()) {
+                                session_dist = session_dist.max(d);
+                            }
+                        }
+                        "max_heart_rate" => {
+                            if let Some(hr) = value_as_f64(field.value()) {
+                                if hr > 80.0 && hr < 230.0 {
+                                    max_hr_seen = Some(max_hr_seen.map_or(hr, |m| m.max(hr)));
+                                }
+                            }
+                        }
+                        "min_heart_rate" => {
+                            if let Some(hr) = value_as_f64(field.value()) {
+                                if hr > 30.0 && hr < 120.0 {
+                                    min_hr_seen = Some(min_hr_seen.map_or(hr, |m| m.min(hr)));
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            } else if msg.kind() == fitparser::profile::MesgNum::Record {
+                for field in msg.fields() {
+                    match field.name() {
+                        "heart_rate" => {
+                            if let Some(hr) = value_as_f64(field.value()) {
+                                if hr > 80.0 && hr < 230.0 {
+                                    max_hr_seen = Some(max_hr_seen.map_or(hr, |m| m.max(hr)));
+                                }
+                            }
+                        }
+                        "distance" => {
+                            if let Some(d) = value_as_f64(field.value()) {
+                                rec_max_dist = rec_max_dist.max(d);
+                            }
+                        }
+                        "timestamp" => {
+                            if let fitparser::Value::Timestamp(dt) = field.value() {
+                                let ts = dt.timestamp();
+                                min_ts = Some(min_ts.map_or(ts, |m| m.min(ts)));
+                                max_ts = Some(max_ts.map_or(ts, |m| m.max(ts)));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        total_dist_m += if session_dist > 0.0 { session_dist } else { rec_max_dist };
+    }
+
+    let detected_max_hr = max_hr_seen.map(|v| v.round() as i32);
+    let estimated_lthr = max_hr_seen.map(|v| (v * 0.89).round() as i32);
+    let detected_rhr_baseline = min_hr_seen.map(|v| v.round() as i32);
+    let weekly_km_est = if total_dist_m > 0.0 {
+        let span_days = match (min_ts, max_ts) {
+            (Some(a), Some(b)) if b > a => ((b - a) as f64 / 86_400.0).max(7.0),
+            _ => 28.0,
+        };
+        let weeks = (span_days / 7.0).max(1.0);
+        Some(((total_dist_m / 1000.0) / weeks * 10.0).round() / 10.0)
+    } else {
+        None
+    };
+
+    Ok(FitBaselineProbe {
+        scanned_files: scanned,
+        detected_max_hr,
+        detected_rhr_baseline,
+        estimated_lthr,
+        weekly_km_est,
+    })
 }
 
 /// Classifies `.fit` laps into `Run`, `Station`, and `Roxzone` transitions and computes

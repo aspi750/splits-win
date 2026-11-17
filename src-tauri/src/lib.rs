@@ -43,7 +43,8 @@ impl AppState {
 fn get_bootstrap_state(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
     let store = state.load_store()?;
     let db = state.open_db()?;
-    let has_garmin_key = CredentialStore::read_secret(APP_SERVICE, GARMIN_ACCOUNT).is_some();
+    let has_garmin_key = CredentialStore::read_secret(GARMIN_KEYRING_SERVICE, GARMIN_ACCOUNT).is_some()
+        || CredentialStore::read_secret(APP_SERVICE, GARMIN_ACCOUNT).is_some();
     let has_gemini_key = CredentialStore::read_secret(APP_SERVICE, GEMINI_ACCOUNT).is_some();
     let config = store.load_athlete_config().map_err(|e| e.to_string())?.unwrap_or_default();
     let readiness: Option<ReadinessState> = store.read_json("readiness_state.json").map_err(|e| e.to_string())?;
@@ -72,7 +73,29 @@ fn get_bootstrap_state(state: State<'_, AppState>) -> Result<serde_json::Value, 
 
 #[tauri::command]
 fn save_garmin_key(key: String) -> Result<(), String> {
-    CredentialStore::save_secret(APP_SERVICE, GARMIN_ACCOUNT, &key).map_err(|e| e.to_string())
+    CredentialStore::save_secret(GARMIN_KEYRING_SERVICE, GARMIN_ACCOUNT, &key)
+        .map_err(|e| e.to_string())?;
+    let _ = CredentialStore::save_secret(APP_SERVICE, GARMIN_ACCOUNT, &key);
+    Ok(())
+}
+
+#[tauri::command]
+async fn verify_garmin_key(key: String) -> Result<serde_json::Value, String> {
+    let trimmed = key.trim().to_string();
+    if trimmed.is_empty() {
+        return Err("Garmin Personal API key cannot be empty.".to_string());
+    }
+    let client = garmin::GarminClient::new(Some(trimmed.clone()));
+    client.authenticate(true).await.map_err(|e| e.to_string())?;
+    CredentialStore::save_secret(GARMIN_KEYRING_SERVICE, GARMIN_ACCOUNT, &trimmed)
+        .map_err(|e| e.to_string())?;
+    let _ = CredentialStore::save_secret(APP_SERVICE, GARMIN_ACCOUNT, &trimmed);
+    Ok(serde_json::json!({ "ok": true, "token_cached": true }))
+}
+
+#[tauri::command]
+fn probe_fit_baseline(folder_path: String) -> Result<FitBaselineProbe, String> {
+    garmin::probe_fit_folder(std::path::Path::new(&folder_path))
 }
 
 #[tauri::command]
@@ -371,6 +394,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_bootstrap_state,
             save_garmin_key,
+            verify_garmin_key,
+            probe_fit_baseline,
             save_gemini_key,
             save_athlete_config,
             save_user_profile,

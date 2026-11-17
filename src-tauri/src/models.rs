@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 pub const APP_SERVICE: &str = "com.aspi.splits-coach";
+pub const GARMIN_KEYRING_SERVICE: &str = "splits-coach-garmin-api-key";
 pub const GARMIN_ACCOUNT: &str = "garmin-personal-api-key";
 pub const GEMINI_ACCOUNT: &str = "gemini_api_key";
 pub const UISERVER_ACCOUNT: &str = "uiserver-auth-token";
@@ -946,4 +947,13 @@ pub struct FitTrackAnalysis {
 pub struct ActivityDetailPayload {
     pub activity: ActivityRecord,
     pub track: Option<FitTrackAnalysis>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct FitBaselineProbe {
+    pub scanned_files: usize,
+    pub detected_max_hr: Option<i32>,
+    pub detected_rhr_baseline: Option<i32>,
+    pub estimated_lthr: Option<i32>,
+    pub weekly_km_est: Option<f64>,
 }
