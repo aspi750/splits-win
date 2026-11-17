@@ -615,6 +615,43 @@ pub struct GearInventoryFile {
     pub pending: Vec<GearPendingItem>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct OrthopedicCheckIn {
+    pub left_achilles: i32,
+    pub lumbar_sciatica: i32,
+    pub right_ankle: i32,
+    pub calves_soleus: i32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct PostRunContext {
+    pub shoe_model: String,
+    pub shoe_size: String,
+    pub pre_run_weight_kg: Option<f64>,
+    pub post_run_weight_kg: Option<f64>,
+    pub fluid_consumed_ml: Option<f64>,
+    pub net_fluid_deficit_kg: Option<f64>,
+    pub net_sweat_rate_l_hr: Option<f64>,
+    pub orthopedic: OrthopedicCheckIn,
+}
+
+impl PostRunContext {
+    pub fn with_computed_sweat(mut self, duration_sec: f64) -> Self {
+        if let (Some(pre), Some(post)) = (self.pre_run_weight_kg, self.post_run_weight_kg) {
+            if pre > 0.0 && post > 0.0 {
+                let fluid_l = self.fluid_consumed_ml.unwrap_or(0.0) / 1000.0;
+                let deficit = ((pre - post + fluid_l) * 100.0).round() / 100.0;
+                self.net_fluid_deficit_kg = Some(deficit);
+                if duration_sec > 60.0 {
+                    let hrs = duration_sec / 3600.0;
+                    self.net_sweat_rate_l_hr = Some(((deficit / hrs) * 100.0).round() / 100.0);
+                }
+            }
+        }
+        self
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ActivityRecord {
     pub garmin_id: i64,
@@ -632,6 +669,8 @@ pub struct ActivityRecord {
     pub shoe_name: Option<String>,
     #[serde(default)]
     pub is_hyrox: Option<bool>,
+    #[serde(default)]
+    pub post_run_context: Option<PostRunContext>,
 }
 
 impl ActivityRecord {
@@ -697,6 +736,30 @@ pub struct FitTrackPoint {
     pub heart_rate_bpm: Option<f64>,
     pub cadence_spm: Option<f64>,
     pub altitude_m: Option<f64>,
+    #[serde(default)]
+    pub power_w: Option<f64>,
+    #[serde(default)]
+    pub gct_ms: Option<f64>,
+    #[serde(default)]
+    pub stance_time_pct: Option<f64>,
+    #[serde(default)]
+    pub vertical_oscillation_mm: Option<f64>,
+    #[serde(default)]
+    pub vertical_ratio_pct: Option<f64>,
+    #[serde(default)]
+    pub step_length_mm: Option<f64>,
+    #[serde(default)]
+    pub stance_balance_left_pct: Option<f64>,
+    #[serde(default)]
+    pub temperature_c: Option<f64>,
+    #[serde(default)]
+    pub respiration_brpm: Option<f64>,
+    #[serde(default)]
+    pub latitude_deg: Option<f64>,
+    #[serde(default)]
+    pub longitude_deg: Option<f64>,
+    #[serde(default)]
+    pub impact_load: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -939,6 +1002,8 @@ pub struct FitTrackAnalysis {
     pub compromised_run_audit: Option<CompromisedRunAudit>,
     #[serde(default)]
     pub hyrox_dissection: Option<HyroxDissection>,
+    #[serde(default)]
+    pub forensic_telemetry: Option<crate::forensic_extractor::ForensicTelemetryReport>,
     pub decoupling_pct: Option<f64>,
     pub audit: FitGuardrailAudit,
 }

@@ -113,6 +113,24 @@ export interface UserProfile {
   hyrox_config: HyroxConfig;
 }
 
+export interface OrthopedicCheckIn {
+  left_achilles: number;
+  lumbar_sciatica: number;
+  right_ankle: number;
+  calves_soleus: number;
+}
+
+export interface PostRunContext {
+  shoe_model: string;
+  shoe_size: string;
+  pre_run_weight_kg: number | null;
+  post_run_weight_kg: number | null;
+  fluid_consumed_ml: number | null;
+  net_fluid_deficit_kg: number | null;
+  net_sweat_rate_l_hr: number | null;
+  orthopedic: OrthopedicCheckIn;
+}
+
 export interface ActivityRecord {
   garmin_id: number;
   name: string;
@@ -128,6 +146,7 @@ export interface ActivityRecord {
   training_load: number | null;
   shoe_name: string | null;
   is_hyrox?: boolean | null;
+  post_run_context?: PostRunContext | null;
 }
 
 export interface DayRecord {
@@ -180,6 +199,112 @@ export interface FitTrackPoint {
   heart_rate_bpm: number | null;
   cadence_spm: number | null;
   altitude_m: number | null;
+  power_w?: number | null;
+  gct_ms?: number | null;
+  stance_time_pct?: number | null;
+  vertical_oscillation_mm?: number | null;
+  vertical_ratio_pct?: number | null;
+  step_length_mm?: number | null;
+  stance_balance_left_pct?: number | null;
+  temperature_c?: number | null;
+  respiration_brpm?: number | null;
+  latitude_deg?: number | null;
+  longitude_deg?: number | null;
+  impact_load?: number | null;
+}
+
+export interface MetricDistribution {
+  mean: number;
+  min: number;
+  max: number;
+  first_half_mean: number | null;
+  second_half_mean: number | null;
+  drift: number | null;
+}
+
+export interface DirectionalHalfStats {
+  sample_count: number;
+  mean_hr: number | null;
+  mean_pace_sec_per_km: number | null;
+  mean_power_w: number | null;
+  mean_cadence_spm: number | null;
+  mean_gct_ms: number | null;
+  mean_left_stance_balance_pct: number | null;
+}
+
+export interface DirectionalVectorSplit {
+  turnaround_distance_m: number;
+  turnaround_elapsed_s: number;
+  max_displacement_m: number;
+  outbound: DirectionalHalfStats;
+  inbound: DirectionalHalfStats;
+}
+
+export interface VelocityBandStats {
+  band: string;
+  sample_count: number;
+  mean_gct_ms: number | null;
+  mean_cadence_spm: number | null;
+  mean_vert_osc_mm: number | null;
+  mean_vert_ratio_pct: number | null;
+  mean_step_length_mm: number | null;
+  mean_power_w: number | null;
+  mean_left_stance_balance_pct: number | null;
+}
+
+export interface LapForensicDistribution {
+  lap_index: number;
+  distance_m: number;
+  duration_s: number;
+  mean_hr: number | null;
+  mean_pace_sec_per_km: number | null;
+  mean_power_w: number | null;
+  mean_cadence_spm: number | null;
+  mean_gct_ms: number | null;
+  mean_vert_osc_mm: number | null;
+  mean_stride_mm: number | null;
+  mean_stance_balance_l_pct: number | null;
+}
+
+export interface ForensicMicroEvent {
+  kind: string;
+  elapsed_s: number;
+  duration_s: number | null;
+  distance_m: number | null;
+  summary: string;
+  pre_hr: number | null;
+  post_hr: number | null;
+  hr_bpm: number | null;
+  pace_min_per_km: string | null;
+  temp_c: number | null;
+}
+
+export interface ForensicTelemetryReport {
+  sample_count: number;
+  hr: MetricDistribution | null;
+  pace_sec_per_km: MetricDistribution | null;
+  power_w: MetricDistribution | null;
+  cadence_spm: MetricDistribution | null;
+  gct_ms: MetricDistribution | null;
+  vertical_oscillation_mm: MetricDistribution | null;
+  stride_length_mm: MetricDistribution | null;
+  stance_balance_l_pct: MetricDistribution | null;
+  left_stance_over_52_8_pct: number | null;
+  respiration_brpm: MetricDistribution | null;
+  impact_load_total: number | null;
+  pw_hr_decoupling_pct: number | null;
+  pa_hr_decoupling_pct: number | null;
+  walk_seconds: number;
+  run_seconds: number;
+  walk_segments: number;
+  run_segments: number;
+  vt1_breach_seconds: number;
+  vt2_breach_seconds: number;
+  z5_breach_seconds: number;
+  directional_vectors: DirectionalVectorSplit | null;
+  velocity_bands: VelocityBandStats[];
+  laps: LapForensicDistribution[];
+  micro_events: ForensicMicroEvent[];
 }
 
 export interface FitSplit {
@@ -228,6 +353,7 @@ export interface FitTrackAnalysis {
   chart_points: FitTrackPoint[];
   splits: FitSplit[];
   hyrox_dissection?: HyroxDissection | null;
+  forensic_telemetry?: ForensicTelemetryReport | null;
   decoupling_pct: number | null;
   audit: FitGuardrailAudit;
 }

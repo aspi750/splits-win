@@ -1,9 +1,11 @@
 use chrono::{Duration, TimeZone, Utc};
 use splits_win_lib::coach::{
-    analyze_training_history, apply_coach_proposal, compact_history_markdown,
-    format_user_profile_context, replacing_section, slice_fit_track_by_km,
-    starter_coach_profile_markdown, starter_training_plan_markdown, CoachPacketBuilder,
+    analyze_training_history, append_training_ledger_entry, apply_coach_proposal,
+    compact_history_markdown, fetch_1hz_window_from_track, format_user_profile_context,
+    replacing_section, slice_fit_track_by_km, starter_coach_profile_markdown,
+    starter_training_plan_markdown, CoachPacketBuilder,
 };
+use splits_win_lib::forensic_extractor::extract_forensic_telemetry;
 use splits_win_lib::garmin::{analyze_fit_points, dissect_hyrox_laps};
 use splits_win_lib::models::*;
 use splits_win_lib::readiness::{ReadinessEngine, ReadinessInput};
@@ -16,6 +18,41 @@ fn make_temp_dir(name: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("splits-win-{name}-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
     dir
+}
+
+fn make_fit_point(
+    timestamp_sec: f64,
+    distance_m: f64,
+    speed_mps: f64,
+    hr_bpm: Option<f64>,
+    cadence_spm: Option<f64>,
+    altitude_m: Option<f64>,
+) -> FitTrackPoint {
+    FitTrackPoint {
+        timestamp_sec,
+        distance_m,
+        speed_mps,
+        pace_sec_per_km: if speed_mps > 0.1 {
+            Some(1000.0 / speed_mps)
+        } else {
+            None
+        },
+        heart_rate_bpm: hr_bpm,
+        cadence_spm,
+        altitude_m,
+        power_w: None,
+        gct_ms: None,
+        stance_time_pct: None,
+        vertical_oscillation_mm: None,
+        vertical_ratio_pct: None,
+        step_length_mm: None,
+        stance_balance_left_pct: None,
+        temperature_c: None,
+        respiration_brpm: None,
+        latitude_deg: None,
+        longitude_deg: None,
+        impact_load: None,
+    }
 }
 
 #[test]
@@ -82,6 +119,7 @@ fn test_shared_store_and_sqlite_roundtrip() {
         training_load: Some(45.0),
         shoe_name: Some("Superblast 3".to_string()),
         is_hyrox: None,
+        post_run_context: None,
     })
     .unwrap();
     let acts = db.list_activities(10).unwrap();
@@ -134,6 +172,7 @@ fn test_readiness_engine_green_red_amber_and_persistence() {
             training_load: Some(40.0),
             shoe_name: Some("Superblast 3".to_string()),
             is_hyrox: None,
+            post_run_context: None,
         }],
         days: &[healthy_day.clone()],
         plan: None,
@@ -165,6 +204,7 @@ fn test_readiness_engine_green_red_amber_and_persistence() {
             training_load: Some(40.0),
             shoe_name: None,
             is_hyrox: None,
+            post_run_context: None,
         }],
         days: &[bad_day],
         plan: None,
@@ -237,12 +277,12 @@ fn test_fit_splits_decoupling_and_guardrail_audit() {
 
     // 1st half: 3.0 m/s @ 120 bpm (EF = 0.025); 2nd half: 3.0 m/s @ 150 bpm (EF = 0.020) -> 20.0% decoupling
     let points = vec![
-        FitTrackPoint { timestamp_sec: 0.0, distance_m: 0.0, speed_mps: 3.0, pace_sec_per_km: Some(333.3), heart_rate_bpm: Some(120.0), cadence_spm: Some(174.0), altitude_m: Some(10.0) },
-        FitTrackPoint { timestamp_sec: 160.0, distance_m: 500.0, speed_mps: 3.0, pace_sec_per_km: Some(333.3), heart_rate_bpm: Some(120.0), cadence_spm: Some(174.0), altitude_m: Some(12.0) },
-        FitTrackPoint { timestamp_sec: 340.0, distance_m: 1000.0, speed_mps: 3.0, pace_sec_per_km: Some(333.3), heart_rate_bpm: Some(120.0), cadence_spm: Some(174.0), altitude_m: Some(15.0) },
-        FitTrackPoint { timestamp_sec: 520.0, distance_m: 1500.0, speed_mps: 3.0, pace_sec_per_km: Some(333.3), heart_rate_bpm: Some(150.0), cadence_spm: Some(172.0), altitude_m: Some(15.0) },
-        FitTrackPoint { timestamp_sec: 700.0, distance_m: 2000.0, speed_mps: 3.0, pace_sec_per_km: Some(333.3), heart_rate_bpm: Some(150.0), cadence_spm: Some(172.0), altitude_m: Some(16.0) },
-        FitTrackPoint { timestamp_sec: 880.0, distance_m: 2500.0, speed_mps: 3.0, pace_sec_per_km: Some(333.3), heart_rate_bpm: Some(150.0), cadence_spm: Some(172.0), altitude_m: Some(16.0) },
+        make_fit_point(0.0, 0.0, 3.0, Some(120.0), Some(174.0), Some(10.0)),
+        make_fit_point(160.0, 500.0, 3.0, Some(120.0), Some(174.0), Some(12.0)),
+        make_fit_point(340.0, 1000.0, 3.0, Some(120.0), Some(174.0), Some(15.0)),
+        make_fit_point(520.0, 1500.0, 3.0, Some(150.0), Some(172.0), Some(15.0)),
+        make_fit_point(700.0, 2000.0, 3.0, Some(150.0), Some(172.0), Some(16.0)),
+        make_fit_point(880.0, 2500.0, 3.0, Some(150.0), Some(172.0), Some(16.0)),
     ];
 
     let analysis = analyze_fit_points(999, points, &config);
@@ -289,10 +329,10 @@ fn test_query_run_slice_against_sqlite_fit_tracks() {
     let db = Database::open_in_memory().unwrap();
     let config = AthleteConfig::default();
     let points = vec![
-        FitTrackPoint { timestamp_sec: 0.0, distance_m: 0.0, speed_mps: 3.0, pace_sec_per_km: Some(333.3), heart_rate_bpm: Some(125.0), cadence_spm: Some(174.0), altitude_m: Some(10.0) },
-        FitTrackPoint { timestamp_sec: 200.0, distance_m: 600.0, speed_mps: 3.0, pace_sec_per_km: Some(333.3), heart_rate_bpm: Some(130.0), cadence_spm: Some(175.0), altitude_m: Some(11.0) },
-        FitTrackPoint { timestamp_sec: 400.0, distance_m: 1200.0, speed_mps: 3.0, pace_sec_per_km: Some(333.3), heart_rate_bpm: Some(135.0), cadence_spm: Some(176.0), altitude_m: Some(12.0) },
-        FitTrackPoint { timestamp_sec: 600.0, distance_m: 1800.0, speed_mps: 3.0, pace_sec_per_km: Some(333.3), heart_rate_bpm: Some(138.0), cadence_spm: Some(176.0), altitude_m: Some(14.0) },
+        make_fit_point(0.0, 0.0, 3.0, Some(125.0), Some(174.0), Some(10.0)),
+        make_fit_point(200.0, 600.0, 3.0, Some(130.0), Some(175.0), Some(11.0)),
+        make_fit_point(400.0, 1200.0, 3.0, Some(135.0), Some(176.0), Some(12.0)),
+        make_fit_point(600.0, 1800.0, 3.0, Some(138.0), Some(176.0), Some(14.0)),
     ];
     let analysis = analyze_fit_points(777, points, &config);
     db.upsert_fit_track(777, &analysis).unwrap();
@@ -339,6 +379,7 @@ fn test_stage2_2_hybrid_hyrox_spacing_and_compromised_run_audit() {
         training_load: Some(120.0),
         shoe_name: None,
         is_hyrox: None,
+        post_run_context: None,
     };
 
     let mut hybrid_config = AthleteConfig::default();
@@ -416,6 +457,7 @@ fn test_stage2_2_training_history_analyzer_and_starter_templates() {
             training_load: Some(60.0),
             shoe_name: None,
             is_hyrox: None,
+            post_run_context: None,
         });
         if offset % 4 == 1 {
             activities.push(ActivityRecord {
@@ -433,6 +475,7 @@ fn test_stage2_2_training_history_analyzer_and_starter_templates() {
                 training_load: Some(90.0),
                 shoe_name: None,
                 is_hyrox: None,
+                post_run_context: None,
             });
         }
     }
@@ -514,6 +557,7 @@ fn test_stage3_1_user_profile_migration_and_hyrox_reclassification() {
         training_load: Some(180.0),
         shoe_name: None,
         is_hyrox: None,
+        post_run_context: None,
     };
     db.upsert_activity(&act).unwrap();
     db.set_activity_hyrox(555, true).unwrap();
@@ -556,4 +600,150 @@ fn test_stage3_1_hyrox_16_lap_dissection_and_compromised_decay() {
     assert!(dissection.clean_aerobic_efficiency.is_some());
     // Compromised decay: Runs 5-8 avg (280.0) - Run 1 (250.0) = +30.0 s/km
     assert_eq!(dissection.compromised_pace_decay_sec, Some(30.0));
+}
+
+#[test]
+fn test_v0_2_1_forensic_extractor_bands_vectors_decoupling_and_events() {
+    let mut pts = Vec::new();
+    let mut dist = 0.0_f64;
+    // 100s out-and-back synthetic run:
+    // t 0..49 outbound north (+0.0001 deg lat/s ≈ 11m/s GPS step so turnaround >= 200m)
+    // t 50..56 stationary stop (speed = 0.0)
+    // t 57..66 walk segment (speed = 1.6 m/s, cadence = 108 spm)
+    // t 67..99 inbound back south with 3 velocity bands & high HR/temp swings
+    for t in 0..100 {
+        let (speed, cad, hr, pw, temp, sb, lat_offset) = if (50..=56).contains(&t) {
+            (0.0, 0.0, 125.0, 0.0, 18.0, 50.0, 0.005)
+        } else if (57..=66).contains(&t) {
+            (1.6, 108.0, 130.0, 140.0, 19.0, 51.0, 0.005 - (t - 56) as f64 * 0.00005)
+        } else if t < 50 {
+            let lat_off = t as f64 * 0.0001; // up to +0.0049 deg ≈ 545m displacement
+            let spd = if t < 25 { 3.1 } else { 2.7 };
+            (spd, 176.0, 136.0, 260.0, 16.5, 53.2, lat_off)
+        } else {
+            let spd = if t < 82 { 2.2 } else { 3.1 };
+            let hr = 152.0; // triggers VT1, HR>=145 breach, positive Pw:Hr & Pa:Hr decoupling
+            (spd, 172.0, hr, 240.0, 21.0, 51.0, 0.0045 - (t - 66) as f64 * 0.00012)
+        };
+        dist += speed;
+        let mut p = make_fit_point(
+            t as f64,
+            dist,
+            speed,
+            Some(hr),
+            Some(cad),
+            Some(15.0),
+        );
+        p.power_w = if pw > 0.0 { Some(pw) } else { None };
+        p.gct_ms = if cad >= 120.0 { Some(250.0) } else { None };
+        p.vertical_oscillation_mm = if cad >= 120.0 { Some(82.0) } else { None };
+        p.vertical_ratio_pct = if cad >= 120.0 { Some(8.1) } else { None };
+        p.step_length_mm = if cad >= 120.0 { Some(980.0) } else { None };
+        p.stance_balance_left_pct = Some(sb);
+        p.temperature_c = Some(temp);
+        p.respiration_brpm = Some(if t < 50 { 30.0 } else { 38.0 });
+        p.latitude_deg = Some(40.4000 + lat_offset);
+        p.longitude_deg = Some(-3.7000);
+        p.impact_load = if cad >= 120.0 { Some(1.2) } else { None };
+        pts.push(p);
+    }
+
+    let laps = vec![
+        FitLap { elapsed_sec: 50.0, moving_sec: 50.0, distance_m: 145.0, avg_hr_bpm: Some(136.0) },
+        FitLap { elapsed_sec: 50.0, moving_sec: 43.0, distance_m: 110.0, avg_hr_bpm: Some(146.0) },
+    ];
+    let rep = extract_forensic_telemetry(&pts, &laps);
+    assert_eq!(rep.sample_count, 100);
+    assert!(rep.pw_hr_decoupling_pct.is_some());
+    assert!(rep.pa_hr_decoupling_pct.is_some());
+    assert_eq!(rep.left_stance_over_52_8_pct, Some(50.0));
+    assert!(rep.respiration_brpm.is_some());
+    assert!(rep.impact_load_total.unwrap_or(0.0) > 80.0);
+    assert!(rep.walk_segments >= 1);
+    assert!(rep.run_segments >= 2);
+    assert!(rep.vt1_breach_seconds > 25.0);
+
+    let dir = rep.directional_vectors.as_ref().expect("directional split should be detected");
+    assert!(dir.max_displacement_m >= 150.0);
+    assert!(dir.inbound.mean_hr.unwrap() > dir.outbound.mean_hr.unwrap());
+
+    let band_names: Vec<&str> = rep.velocity_bands.iter().map(|b| b.band.as_str()).collect();
+    assert!(band_names.contains(&"<5:45/km"));
+    assert!(band_names.contains(&"5:45-6:30/km"));
+    assert!(band_names.contains(&">6:30/km"));
+
+    let event_kinds: Vec<&str> = rep.micro_events.iter().map(|e| e.kind.as_str()).collect();
+    assert!(event_kinds.contains(&"stop_pause"));
+    assert!(event_kinds.contains(&"thermal_swing"));
+    assert!(event_kinds.contains(&"hr_zone_breach"));
+
+    let md = rep.to_markdown_summary();
+    assert!(md.contains("Pw:Hr Decoupling"));
+    assert!(md.contains("Pa:Hr Decoupling"));
+    assert!(md.contains("Left Stance > 52.8% L"));
+}
+
+#[test]
+fn test_v0_2_1_sweat_matrix_1hz_window_and_ledger() {
+    // 1. Sweat Matrix computation & DB persistence
+    let raw_ctx = PostRunContext {
+        shoe_model: "Superblast 2".to_string(),
+        shoe_size: "EU 43".to_string(),
+        pre_run_weight_kg: Some(75.0),
+        post_run_weight_kg: Some(74.0),
+        fluid_consumed_ml: Some(500.0),
+        net_fluid_deficit_kg: None,
+        net_sweat_rate_l_hr: None,
+        orthopedic: OrthopedicCheckIn {
+            left_achilles: 2,
+            lumbar_sciatica: 1,
+            right_ankle: 0,
+            calves_soleus: 3,
+        },
+    };
+    let computed = raw_ctx.with_computed_sweat(3600.0);
+    assert_eq!(computed.net_fluid_deficit_kg, Some(1.5));
+    assert_eq!(computed.net_sweat_rate_l_hr, Some(1.5));
+
+    let db = Database::open_in_memory().unwrap();
+    db.upsert_activity(&ActivityRecord {
+        garmin_id: 888,
+        name: "Sweat Test Run".to_string(),
+        type_key: "running".to_string(),
+        start_iso: "2026-11-17T07:00:00Z".to_string(),
+        distance_m: 10000.0,
+        duration_sec: 3600.0,
+        moving_duration_sec: 3600.0,
+        elevation_gain_m: 40.0,
+        average_hr: Some(140.0),
+        max_hr: Some(152.0),
+        cadence_spm: Some(176.0),
+        training_load: Some(80.0),
+        shoe_name: Some("Superblast 2".to_string()),
+        is_hyrox: None,
+        post_run_context: None,
+    })
+    .unwrap();
+    db.save_post_run_context(888, &computed).unwrap();
+    let loaded_act = db.get_activity(888).unwrap().unwrap();
+    assert_eq!(loaded_act.post_run_context, Some(computed));
+
+    // 2. fetch_1hz_window_from_track stepping
+    let points: Vec<FitTrackPoint> = (0..60)
+        .map(|s| make_fit_point(s as f64, s as f64 * 3.0, 3.0, Some(135.0), Some(174.0), Some(10.0)))
+        .collect();
+    let analysis = analyze_fit_points(888, points, &AthleteConfig::default());
+    let win = fetch_1hz_window_from_track(&analysis, 10.0, 50.0, 10);
+    assert_eq!(win["row_count"].as_u64(), Some(5)); // t=10, 20, 30, 40, 50
+
+    // 3. append_training_ledger_entry
+    let dir = make_temp_dir("ledger");
+    let store = SharedStore::new(Some(dir.clone())).unwrap();
+    let lines1 = append_training_ledger_entry(&store, "## 2026-11-17 Easy 10k\nFelt smooth.").unwrap();
+    let lines2 = append_training_ledger_entry(&store, "## 2026-11-18 Rest\nRecovery.").unwrap();
+    assert!(lines2 > lines1);
+    let saved = store.read_text("ASPI_Training_Log.txt").unwrap().unwrap();
+    assert!(saved.contains("Easy 10k"));
+    assert!(saved.contains("Recovery."));
+    let _ = std::fs::remove_dir_all(&dir);
 }

@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { getVersion } from "@tauri-apps/api/app";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { open } from "@tauri-apps/plugin-dialog";
+import { open, save } from "@tauri-apps/plugin-dialog";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { check, type Update } from "@tauri-apps/plugin-updater";
 import {
@@ -17,6 +17,7 @@ import {
   Sparkles,
   SquarePen,
   Sun,
+  Upload,
 } from "lucide-react";
 import { OnboardingWizard } from "./components/OnboardingWizard";
 import type {
@@ -28,6 +29,7 @@ import type {
   ExecutionMode,
   FitTrackPoint,
   GoalType,
+  PostRunContext,
 } from "./types";
 
 type NavTab = "today" | "activities" | "coach" | "settings";
@@ -73,8 +75,9 @@ export default function App() {
 
   const [draftConfig, setDraftConfig] = useState<AthleteConfig | null>(null);
   const [showOnboarding, setShowOnboarding] = useState(false);
+  const [ledgerNotice, setLedgerNotice] = useState<string | null>(null);
 
-  const [appVersion, setAppVersion] = useState<string>("0.1.2");
+  const [appVersion, setAppVersion] = useState<string>("0.2.1");
   const [availableUpdate, setAvailableUpdate] = useState<Update | null>(null);
   const [updateStatus, setUpdateStatus] = useState<string | null>(null);
   const [updateChecking, setUpdateChecking] = useState(false);
@@ -664,6 +667,14 @@ export default function App() {
               setSelectedActivity(updated);
               await reload();
             }}
+            onActivityUpdated={async (updatedActivity: ActivityRecord) => {
+              setSelectedActivity((prev) =>
+                prev && prev.activity.garmin_id === updatedActivity.garmin_id
+                  ? { ...prev, activity: updatedActivity }
+                  : prev
+              );
+              await reload();
+            }}
           />
         )}
 
@@ -675,8 +686,49 @@ export default function App() {
                 <span className="pill green">
                   {state.engine_mode === "gemini_api" ? "Gemini API" : "Clipboard Packet"}
                 </span>
+                {ledgerNotice && <span className="pill">{ledgerNotice}</span>}
               </div>
-              <div style={{ display: "flex", gap: 8 }}>
+              <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                <button
+                  className="secondary"
+                  style={{ display: "flex", alignItems: "center", gap: 6 }}
+                  onClick={async () => {
+                    const selected = await open({
+                      multiple: false,
+                      filters: [{ name: "Training Ledger", extensions: ["txt", "md"] }],
+                    });
+                    if (typeof selected === "string" && selected) {
+                      try {
+                        const lines = await invoke<number>("import_training_ledger", { sourcePath: selected });
+                        setLedgerNotice(`Imported ledger (${lines} lines)`);
+                      } catch (err) {
+                        setLedgerNotice(`Import error: ${err instanceof Error ? err.message : String(err)}`);
+                      }
+                    }
+                  }}
+                >
+                  <Upload size={14} /> Import Ledger
+                </button>
+                <button
+                  className="secondary"
+                  style={{ display: "flex", alignItems: "center", gap: 6 }}
+                  onClick={async () => {
+                    const target = await save({
+                      defaultPath: "ASPI_Training_Log.txt",
+                      filters: [{ name: "Training Ledger", extensions: ["txt", "md"] }],
+                    });
+                    if (target) {
+                      try {
+                        const lines = await invoke<number>("export_training_ledger", { targetPath: target });
+                        setLedgerNotice(`Exported ledger (${lines} lines)`);
+                      } catch (err) {
+                        setLedgerNotice(`Export error: ${err instanceof Error ? err.message : String(err)}`);
+                      }
+                    }
+                  }}
+                >
+                  <Download size={14} /> Export Ledger
+                </button>
                 <button
                   className="secondary"
                   style={{ display: "flex", alignItems: "center", gap: 6 }}
@@ -1220,23 +1272,156 @@ function WeeklyVolumeChart({ bars }: { bars: { label: string; km: number; runs: 
   );
 }
 
+function sanitizeFilenamePart(raw: string): string {
+  const cleaned = raw.trim().replace(/[^a-zA-Z0-9._-]+/g, "_").replace(/^_+|_+$/g, "");
+  return cleaned || "NA";
+}
+
+function parseOptionalNum(raw: string): number | null {
+  const n = Number(raw);
+  return raw.trim() !== "" && Number.isFinite(n) ? n : null;
+}
+
+function parseRatingOrZero(raw: string): number {
+  const n = Number(raw);
+  if (raw.trim() === "" || !Number.isFinite(n)) return 0;
+  return Math.max(0, Math.min(10, Math.round(n)));
+}
+
 function ActivityDetailView({
   detail,
   onBack,
   onAnalyze,
   onToggleHyrox,
+  onActivityUpdated,
 }: {
   detail: ActivityDetailPayload;
   onBack: () => void;
   onAnalyze: () => void;
   onToggleHyrox: (isHyrox: boolean) => Promise<void>;
+  onActivityUpdated: (updated: ActivityRecord) => Promise<void>;
 }) {
   const a = detail.activity;
   const track = detail.track;
+  const forensic = track?.forensic_telemetry ?? null;
   const km = a.distance_m / 1000;
+  const durSec = a.moving_duration_sec > 0 ? a.moving_duration_sec : a.duration_sec;
   const avgPace = km > 0.1 && a.moving_duration_sec > 0 ? a.moving_duration_sec / km : null;
   const isHyroxActive = Boolean(a.is_hyrox ?? track?.hyrox_dissection?.is_hyrox_sim);
   const [halfSim, setHalfSim] = useState(false);
+
+  const [shoeModel, setShoeModel] = useState(
+    a.post_run_context?.shoe_model || a.shoe_name || ""
+  );
+  const [shoeSize, setShoeSize] = useState(a.post_run_context?.shoe_size ?? "");
+  const [preWeight, setPreWeight] = useState(
+    a.post_run_context?.pre_run_weight_kg != null ? String(a.post_run_context.pre_run_weight_kg) : ""
+  );
+  const [postWeight, setPostWeight] = useState(
+    a.post_run_context?.post_run_weight_kg != null ? String(a.post_run_context.post_run_weight_kg) : ""
+  );
+  const [fluidMl, setFluidMl] = useState(
+    a.post_run_context?.fluid_consumed_ml != null ? String(a.post_run_context.fluid_consumed_ml) : ""
+  );
+  const [leftAchilles, setLeftAchilles] = useState(
+    String(a.post_run_context?.orthopedic?.left_achilles ?? 0)
+  );
+  const [lumbarSciatica, setLumbarSciatica] = useState(
+    String(a.post_run_context?.orthopedic?.lumbar_sciatica ?? 0)
+  );
+  const [rightAnkle, setRightAnkle] = useState(
+    String(a.post_run_context?.orthopedic?.right_ankle ?? 0)
+  );
+  const [calvesSoleus, setCalvesSoleus] = useState(
+    String(a.post_run_context?.orthopedic?.calves_soleus ?? 0)
+  );
+  const [savingContext, setSavingContext] = useState(false);
+  const [contextNotice, setContextNotice] = useState<string | null>(null);
+  const [csvNotice, setCsvNotice] = useState<string | null>(null);
+
+  useEffect(() => {
+    const ctx = a.post_run_context;
+    setShoeModel(ctx?.shoe_model || a.shoe_name || "");
+    setShoeSize(ctx?.shoe_size ?? "");
+    setPreWeight(ctx?.pre_run_weight_kg != null ? String(ctx.pre_run_weight_kg) : "");
+    setPostWeight(ctx?.post_run_weight_kg != null ? String(ctx.post_run_weight_kg) : "");
+    setFluidMl(ctx?.fluid_consumed_ml != null ? String(ctx.fluid_consumed_ml) : "");
+    setLeftAchilles(String(ctx?.orthopedic?.left_achilles ?? 0));
+    setLumbarSciatica(String(ctx?.orthopedic?.lumbar_sciatica ?? 0));
+    setRightAnkle(String(ctx?.orthopedic?.right_ankle ?? 0));
+    setCalvesSoleus(String(ctx?.orthopedic?.calves_soleus ?? 0));
+    setContextNotice(null);
+    setCsvNotice(null);
+  }, [a.garmin_id]);
+
+  const preNum = parseOptionalNum(preWeight);
+  const postNum = parseOptionalNum(postWeight);
+  const fluidNum = parseOptionalNum(fluidMl) ?? 0;
+  const liveDeficitKg =
+    preNum != null && postNum != null && preNum > 0 && postNum > 0
+      ? preNum - postNum + fluidNum / 1000
+      : null;
+  const durHours = durSec / 3600;
+  const liveSweatRateLHr =
+    liveDeficitKg != null && durSec > 60
+      ? liveDeficitKg / durHours
+      : null;
+
+  async function handleExport1HzCsv() {
+    const datePart = a.start_iso.slice(0, 10);
+    const namePart = sanitizeFilenamePart(a.name || a.type_key);
+    const distPart = `${km.toFixed(2)}km`;
+    const bpmPart = a.average_hr ? `${Math.round(a.average_hr)}bpm` : "NoHR";
+    const shoeLabel = [shoeModel.trim(), shoeSize.trim()].filter(Boolean).join("_");
+    const shoePart = sanitizeFilenamePart(shoeLabel || a.shoe_name || "NoShoe");
+    const defaultName = `${datePart}_${namePart}_${distPart}_${bpmPart}_${shoePart}.csv`;
+    const targetPath = await save({
+      defaultPath: defaultName,
+      filters: [{ name: "CSV", extensions: ["csv"] }],
+    });
+    if (!targetPath) return;
+    try {
+      const count = await invoke<number>("export_1hz_csv", {
+        activityId: a.garmin_id,
+        targetPath,
+      });
+      setCsvNotice(`Exported ${count} 1Hz rows`);
+    } catch (err) {
+      setCsvNotice(`CSV error: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  async function handleSavePostRunContext() {
+    setSavingContext(true);
+    setContextNotice(null);
+    try {
+      const payload: PostRunContext = {
+        shoe_model: shoeModel.trim(),
+        shoe_size: shoeSize.trim(),
+        pre_run_weight_kg: preNum,
+        post_run_weight_kg: postNum,
+        fluid_consumed_ml: parseOptionalNum(fluidMl),
+        net_fluid_deficit_kg: null,
+        net_sweat_rate_l_hr: null,
+        orthopedic: {
+          left_achilles: parseRatingOrZero(leftAchilles),
+          lumbar_sciatica: parseRatingOrZero(lumbarSciatica),
+          right_ankle: parseRatingOrZero(rightAnkle),
+          calves_soleus: parseRatingOrZero(calvesSoleus),
+        },
+      };
+      const updated = await invoke<ActivityRecord>("save_activity_post_run_context", {
+        activityId: a.garmin_id,
+        context: payload,
+      });
+      await onActivityUpdated(updated);
+      setContextNotice("Saved post-run context & sweat metrics");
+    } catch (err) {
+      setContextNotice(`Save error: ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      setSavingContext(false);
+    }
+  }
 
   const HYROX_STATION_LABELS = [
     "1000m SkiErg",
@@ -1257,7 +1442,15 @@ function ActivityDetailView({
           <button className="secondary" style={{ display: "flex", alignItems: "center", gap: 6 }} onClick={onBack}>
             <ArrowLeft size={14} /> Back
           </button>
-          <div style={{ display: "flex", gap: 8 }}>
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+            {csvNotice && <span className="pill">{csvNotice}</span>}
+            <button
+              className="secondary"
+              style={{ display: "flex", alignItems: "center", gap: 6 }}
+              onClick={() => void handleExport1HzCsv()}
+            >
+              <Download size={14} /> Export 1Hz CSV
+            </button>
             <button
               className="secondary"
               onClick={() => void onToggleHyrox(!isHyroxActive)}
@@ -1428,6 +1621,221 @@ function ActivityDetailView({
           </table>
         </div>
       )}
+
+      {forensic && (
+        <div className="card">
+          <div className="card-header">
+            <h3 style={{ margin: 0 }}>1Hz Forensic Telemetry ({forensic.sample_count} samples)</h3>
+            <span className="pill">
+              Walk {Math.round(forensic.walk_seconds)}s ({forensic.walk_segments}) · Run {Math.round(forensic.run_seconds)}s ({forensic.run_segments})
+            </span>
+          </div>
+          <div className="grid" style={{ marginBottom: 14 }}>
+            <div className="card">
+              <div className="muted">Pw:Hr Decoupling</div>
+              <div className="metric-val">
+                {forensic.pw_hr_decoupling_pct != null ? `${forensic.pw_hr_decoupling_pct.toFixed(2)}%` : "–"}
+              </div>
+            </div>
+            <div className="card">
+              <div className="muted">Pa:Hr Decoupling</div>
+              <div className="metric-val">
+                {forensic.pa_hr_decoupling_pct != null ? `${forensic.pa_hr_decoupling_pct.toFixed(2)}%` : "–"}
+              </div>
+            </div>
+            <div className="card">
+              <div className="muted">Left Stance &gt; 52.8%</div>
+              <div className="metric-val">
+                {forensic.left_stance_over_52_8_pct != null ? `${forensic.left_stance_over_52_8_pct.toFixed(1)}%` : "–"}
+              </div>
+            </div>
+            <div className="card">
+              <div className="muted">Respiration (brpm)</div>
+              <div className="metric-val">
+                {forensic.respiration_brpm ? `${forensic.respiration_brpm.mean.toFixed(1)} (${forensic.respiration_brpm.max.toFixed(0)})` : "–"}
+              </div>
+            </div>
+            <div className="card">
+              <div className="muted">Impact Load</div>
+              <div className="metric-val">
+                {forensic.impact_load_total != null ? forensic.impact_load_total.toFixed(1) : "–"}
+              </div>
+            </div>
+            <div className="card">
+              <div className="muted">Zone Breaches (VT1 / VT2 / Z5)</div>
+              <div className="metric-val" style={{ fontSize: 16 }}>
+                {Math.round(forensic.vt1_breach_seconds)}s / {Math.round(forensic.vt2_breach_seconds)}s / {Math.round(forensic.z5_breach_seconds)}s
+              </div>
+            </div>
+          </div>
+
+          {forensic.directional_vectors && (
+            <div style={{ marginBottom: 14, padding: 12, borderRadius: 8, border: "1px solid var(--border)", background: "var(--bg)" }}>
+              <strong>
+                Outbound vs Inbound Directional Split (turnaround {(forensic.directional_vectors.turnaround_distance_m / 1000).toFixed(2)} km ·{" "}
+                {Math.round(forensic.directional_vectors.max_displacement_m)}m max displacement)
+              </strong>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginTop: 8, fontSize: 13 }}>
+                <div>
+                  <div className="muted">Outbound ({forensic.directional_vectors.outbound.sample_count}s)</div>
+                  <div>
+                    HR {forensic.directional_vectors.outbound.mean_hr?.toFixed(0) ?? "–"} bpm · Pace{" "}
+                    {formatPace(forensic.directional_vectors.outbound.mean_pace_sec_per_km)} ·{" "}
+                    {forensic.directional_vectors.outbound.mean_power_w?.toFixed(0) ?? "–"} W · GCT{" "}
+                    {forensic.directional_vectors.outbound.mean_gct_ms?.toFixed(0) ?? "–"} ms
+                  </div>
+                </div>
+                <div>
+                  <div className="muted">Inbound ({forensic.directional_vectors.inbound.sample_count}s)</div>
+                  <div>
+                    HR {forensic.directional_vectors.inbound.mean_hr?.toFixed(0) ?? "–"} bpm · Pace{" "}
+                    {formatPace(forensic.directional_vectors.inbound.mean_pace_sec_per_km)} ·{" "}
+                    {forensic.directional_vectors.inbound.mean_power_w?.toFixed(0) ?? "–"} W · GCT{" "}
+                    {forensic.directional_vectors.inbound.mean_gct_ms?.toFixed(0) ?? "–"} ms
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {forensic.velocity_bands.length > 0 && (
+            <div style={{ marginBottom: 14 }}>
+              <strong>Velocity-Band Biomechanics (Active Running)</strong>
+              <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12, marginTop: 6 }}>
+                <thead>
+                  <tr style={{ textAlign: "left", borderBottom: "1px solid var(--border)" }}>
+                    <th style={{ padding: 6 }}>Band</th>
+                    <th style={{ padding: 6 }}>Sec</th>
+                    <th style={{ padding: 6 }}>GCT (ms)</th>
+                    <th style={{ padding: 6 }}>Cadence</th>
+                    <th style={{ padding: 6 }}>Vert Osc</th>
+                    <th style={{ padding: 6 }}>Vert Ratio</th>
+                    <th style={{ padding: 6 }}>Stride (mm)</th>
+                    <th style={{ padding: 6 }}>Power (W)</th>
+                    <th style={{ padding: 6 }}>L Stance %</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {forensic.velocity_bands.map((vb) => (
+                    <tr key={vb.band} style={{ borderBottom: "1px solid var(--border)" }}>
+                      <td style={{ padding: 6 }}><strong>{vb.band}</strong></td>
+                      <td style={{ padding: 6 }}>{vb.sample_count}</td>
+                      <td style={{ padding: 6 }}>{vb.mean_gct_ms?.toFixed(1) ?? "–"}</td>
+                      <td style={{ padding: 6 }}>{vb.mean_cadence_spm?.toFixed(0) ?? "–"}</td>
+                      <td style={{ padding: 6 }}>{vb.mean_vert_osc_mm?.toFixed(1) ?? "–"}</td>
+                      <td style={{ padding: 6 }}>{vb.mean_vert_ratio_pct?.toFixed(1) ?? "–"}</td>
+                      <td style={{ padding: 6 }}>{vb.mean_step_length_mm?.toFixed(0) ?? "–"}</td>
+                      <td style={{ padding: 6 }}>{vb.mean_power_w?.toFixed(0) ?? "–"}</td>
+                      <td style={{ padding: 6 }}>{vb.mean_left_stance_balance_pct?.toFixed(1) ?? "–"}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+
+          {forensic.micro_events.length > 0 && (
+            <div>
+              <strong>Detected 1Hz Micro-Events ({forensic.micro_events.length})</strong>
+              <div style={{ display: "flex", flexDirection: "column", gap: 4, marginTop: 6, fontSize: 12 }}>
+                {forensic.micro_events.slice(0, 12).map((ev, i) => (
+                  <div key={i} style={{ padding: "4px 8px", borderRadius: 6, background: "var(--bg)" }}>
+                    <strong>[{ev.kind}]</strong> @{Math.round(ev.elapsed_s)}s: {ev.summary}
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      <div className="card">
+        <div className="card-header">
+          <h3 style={{ margin: 0 }}>Post-Run Context &amp; Sweat Matrix</h3>
+          {contextNotice && <span className="pill">{contextNotice}</span>}
+        </div>
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+          <label>
+            <div className="muted" style={{ fontSize: 12 }}>Shoe Model</div>
+            <input
+              type="text"
+              value={shoeModel}
+              onChange={(e) => setShoeModel(e.target.value)}
+              placeholder="e.g. Superblast 2"
+            />
+          </label>
+          <label>
+            <div className="muted" style={{ fontSize: 12 }}>Shoe Size</div>
+            <input
+              type="text"
+              value={shoeSize}
+              onChange={(e) => setShoeSize(e.target.value)}
+              placeholder="e.g. EU 43"
+            />
+          </label>
+          <label>
+            <div className="muted" style={{ fontSize: 12 }}>Fluid Consumed (ml)</div>
+            <input
+              type="number"
+              value={fluidMl}
+              onChange={(e) => setFluidMl(e.target.value)}
+              placeholder="e.g. 500"
+            />
+          </label>
+          <label>
+            <div className="muted" style={{ fontSize: 12 }}>Pre-Run Weight (kg)</div>
+            <input
+              type="number"
+              step="0.05"
+              value={preWeight}
+              onChange={(e) => setPreWeight(e.target.value)}
+              placeholder="e.g. 74.2"
+            />
+          </label>
+          <label>
+            <div className="muted" style={{ fontSize: 12 }}>Post-Run Weight (kg)</div>
+            <input
+              type="number"
+              step="0.05"
+              value={postWeight}
+              onChange={(e) => setPostWeight(e.target.value)}
+              placeholder="e.g. 73.1"
+            />
+          </label>
+        </div>
+
+        <div className="muted" style={{ fontSize: 13, marginTop: 10, marginBottom: 10 }}>
+          Auto Sweat Computation: Total Loss{" "}
+          <strong>{liveDeficitKg != null ? `${liveDeficitKg.toFixed(2)} kg` : "–"}</strong>
+          {" · "}Sweat Rate{" "}
+          <strong>{liveSweatRateLHr != null ? `${liveSweatRateLHr.toFixed(2)} L/hr` : "–"}</strong>
+        </div>
+
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: 10 }}>
+          <label>
+            <div className="muted" style={{ fontSize: 12 }}>Left Achilles (0–10)</div>
+            <input type="number" min={0} max={10} value={leftAchilles} onChange={(e) => setLeftAchilles(e.target.value)} />
+          </label>
+          <label>
+            <div className="muted" style={{ fontSize: 12 }}>Lumbar / Sciatica (0–10)</div>
+            <input type="number" min={0} max={10} value={lumbarSciatica} onChange={(e) => setLumbarSciatica(e.target.value)} />
+          </label>
+          <label>
+            <div className="muted" style={{ fontSize: 12 }}>Right Ankle (0–10)</div>
+            <input type="number" min={0} max={10} value={rightAnkle} onChange={(e) => setRightAnkle(e.target.value)} />
+          </label>
+          <label>
+            <div className="muted" style={{ fontSize: 12 }}>Calves / Soleus (0–10)</div>
+            <input type="number" min={0} max={10} value={calvesSoleus} onChange={(e) => setCalvesSoleus(e.target.value)} />
+          </label>
+        </div>
+
+        <div style={{ marginTop: 12, display: "flex", justifyContent: "flex-end" }}>
+          <button className="primary" disabled={savingContext} onClick={() => void handleSavePostRunContext()}>
+            {savingContext ? "Saving…" : "Save Post-Run Context"}
+          </button>
+        </div>
+      </div>
     </>
   );
 }

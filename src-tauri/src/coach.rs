@@ -315,6 +315,31 @@ pub fn gemini_tool_declarations() -> Value {
             "name": "get_lifetime_and_yearly_history",
             "description": "Return a two-tier training history overview: Tier 1 (lifetime totals, annual breakdown, peak 7d/28d) and Tier 2 (trailing 365-day block audit, consistency, run-to-hybrid ratio).",
             "parameters": { "type": "OBJECT", "properties": {} }
+        },
+        {
+            "name": "fetch_1hz_window",
+            "description": "Fetch raw 1 Hz second-by-second FIT telemetry rows (HR, pace, power, cadence, GCT, vertical oscillation, stride length, left stance balance %, temperature) between start_second and end_second.",
+            "parameters": {
+                "type": "OBJECT",
+                "properties": {
+                    "activity_id": { "type": "STRING" },
+                    "start_second": { "type": "NUMBER" },
+                    "end_second": { "type": "NUMBER" },
+                    "step_seconds": { "type": "INTEGER" }
+                },
+                "required": ["activity_id", "start_second", "end_second"]
+            }
+        },
+        {
+            "name": "append_training_ledger",
+            "description": "Append a structured markdown entry to ASPI_Training_Log.txt.",
+            "parameters": {
+                "type": "OBJECT",
+                "properties": {
+                    "entry_markdown": { "type": "STRING" }
+                },
+                "required": ["entry_markdown"]
+            }
         }
     ])
 }
@@ -372,6 +397,8 @@ fn tool_status_label(name: &str) -> &'static str {
         "get_lifetime_and_yearly_history" => "Auditing lifetime & 365-day training history…",
         "propose_coach_update" => "Drafting profile/plan update…",
         "query_run_slice" => "Inspecting run kilometer slice…",
+        "fetch_1hz_window" => "Fetching 1Hz second-by-second window…",
+        "append_training_ledger" => "Appending entry to ASPI_Training_Log.txt…",
         _ => "Running coach tool…",
     }
 }
@@ -420,6 +447,9 @@ pub async fn run_gemini_coach_turn(
 
         if !resp.status().is_success() {
             let code = resp.status();
+            if code.as_u16() == 429 {
+                return Err("Gemini rate limit reached (HTTP 429). Please wait a moment before trying again.".to_string());
+            }
             let text = resp.text().await.unwrap_or_default();
             return Err(format!("Gemini API error ({code}): {text}"));
         }
@@ -597,11 +627,13 @@ fn execute_tool(
                 json!({
                     "activity": act,
                     "is_hyrox": act.is_hyrox,
+                    "post_run_context": act.post_run_context,
                     "fit_track_cached": track.is_some(),
                     "splits": track.as_ref().map(|t| &t.splits),
                     "laps": track.as_ref().map(|t| &t.laps),
                     "compromised_run_audit": track.as_ref().and_then(|t| t.compromised_run_audit.as_ref()),
                     "hyrox_dissection": track.as_ref().and_then(|t| t.hyrox_dissection.as_ref()),
+                    "forensic_telemetry": track.as_ref().and_then(|t| t.forensic_telemetry.as_ref()),
                     "decoupling_pct": track.as_ref().and_then(|t| t.decoupling_pct),
                     "guardrail_audit": track.as_ref().map(|t| &t.audit),
                 })
@@ -646,6 +678,38 @@ fn execute_tool(
                 "summary": summary,
                 "compact_markdown": compact_history_markdown(&summary)
             })
+        }
+        "fetch_1hz_window" => {
+            let raw_id = args["activity_id"]
+                .as_str()
+                .map(|s| s.to_string())
+                .or_else(|| args["activity_id"].as_i64().map(|id| id.to_string()))
+                .unwrap_or_else(|| "latest".to_string());
+            let start_sec = args["start_second"].as_f64().unwrap_or(0.0);
+            let end_sec = args["end_second"].as_f64().unwrap_or(60.0);
+            let step_sec = args["step_seconds"].as_i64().unwrap_or(1).max(1) as usize;
+
+            let target_act = match raw_id.as_str() {
+                "latest" => activities.first(),
+                "latest_run" => activities.iter().find(|a| a.type_key.to_lowercase().contains("run")),
+                other => other.parse::<i64>().ok().and_then(|id| activities.iter().find(|a| a.garmin_id == id)),
+            };
+            if let Some(act) = target_act {
+                if let Some(Some(track)) = db.and_then(|d| d.get_fit_track(act.garmin_id).ok()) {
+                    fetch_1hz_window_from_track(&track, start_sec, end_sec, step_sec)
+                } else {
+                    json!({ "error": format!("No cached 1Hz .fit track found for activity_id {}", act.garmin_id) })
+                }
+            } else {
+                json!({ "error": format!("Activity '{raw_id}' not found.") })
+            }
+        }
+        "append_training_ledger" => {
+            let entry = args["entry_markdown"].as_str().unwrap_or("");
+            match append_training_ledger_entry(store, entry) {
+                Ok(lines) => json!({ "status": "appended", "file": "ASPI_Training_Log.txt", "total_lines": lines }),
+                Err(e) => json!({ "error": e }),
+            }
         }
         _ => json!({ "status": "ok", "note": "Local summary returned", "count": activities.len() }),
     }
@@ -1079,4 +1143,142 @@ pub fn build_static_system_instruction(
         "BETA COACH PERSONA DIRECTIVE: Keep all physiological, heart-rate zone, decoupling, and pace calculations 100% rigorous and accurate, while delivering dry, deadpan, slightly snarky commentary on cardiac drift, skipped recovery days, or sluggish HYROX transitions.".to_string()
     );
     sections.join("\n\n")
+}
+
+pub fn append_forensic_section(
+    packet: String,
+    activity: Option<&ActivityRecord>,
+    report: Option<&crate::forensic_extractor::ForensicTelemetryReport>,
+) -> String {
+    let mut blocks: Vec<String> = Vec::new();
+    if let Some(rep) = report {
+        let label = activity
+            .map(|a| {
+                let date = a.start_iso.chars().take(10).collect::<String>();
+                if a.name.trim().is_empty() {
+                    format!("{date} {}", a.type_key)
+                } else {
+                    format!("{date} {}", a.name.trim())
+                }
+            })
+            .unwrap_or_else(|| "Latest Tracked Run".to_string());
+        blocks.push(format!(
+            "## 1Hz Forensic Telemetry ({label})\n{}",
+            rep.to_markdown_summary()
+        ));
+    }
+    if let Some(ctx) = activity.and_then(|a| a.post_run_context.as_ref()) {
+        let mut lines = vec!["## Post-Run Context & Sweat Matrix".to_string()];
+        if !ctx.shoe_model.trim().is_empty() || !ctx.shoe_size.trim().is_empty() {
+            lines.push(format!(
+                "- **Shoe**: {} {}",
+                ctx.shoe_model.trim(),
+                ctx.shoe_size.trim()
+            ).trim().to_string());
+        }
+        if let (Some(pre), Some(post)) = (ctx.pre_run_weight_kg, ctx.post_run_weight_kg) {
+            lines.push(format!(
+                "- **Weights**: Pre {pre:.2} kg -> Post {post:.2} kg (Fluid {} ml)",
+                ctx.fluid_consumed_ml.map(|f| format!("{f:.0}")).unwrap_or_else(|| "0".to_string())
+            ));
+        }
+        if let Some(def) = ctx.net_fluid_deficit_kg {
+            lines.push(format!("- **Net Fluid Deficit**: {def:.2} kg"));
+        }
+        if let Some(rate) = ctx.net_sweat_rate_l_hr {
+            lines.push(format!("- **Net Sweat Rate**: {rate:.2} L/hr"));
+        }
+        let o = &ctx.orthopedic;
+        if o.left_achilles > 0 || o.lumbar_sciatica > 0 || o.right_ankle > 0 || o.calves_soleus > 0 {
+            lines.push(format!(
+                "- **Orthopedic Check-In**: L.Achilles {}/10 · Lumbar/Sciatica {}/10 · R.Ankle {}/10 · Calves/Soleus {}/10",
+                o.left_achilles, o.lumbar_sciatica, o.right_ankle, o.calves_soleus
+            ));
+        }
+        if lines.len() > 1 {
+            blocks.push(lines.join("\n"));
+        }
+    }
+    if blocks.is_empty() {
+        return packet;
+    }
+    let extra = blocks.join("\n\n");
+    if let Some(idx) = packet.find("\n\n## Coaching Request") {
+        let (head, tail) = packet.split_at(idx);
+        format!("{head}\n\n{extra}{tail}")
+    } else {
+        format!("{packet}\n\n{extra}")
+    }
+}
+
+pub fn fetch_1hz_window_from_track(
+    track: &FitTrackAnalysis,
+    start_second: f64,
+    end_second: f64,
+    step_seconds: usize,
+) -> Value {
+    let lo = start_second.min(end_second).max(0.0);
+    let hi = start_second.max(end_second).max(lo);
+    let step = step_seconds.max(1);
+    let rows: Vec<Value> = track
+        .full_points
+        .iter()
+        .filter(|p| p.timestamp_sec >= lo && p.timestamp_sec <= hi)
+        .step_by(step)
+        .take(300)
+        .map(|p| {
+            json!({
+                "second": p.timestamp_sec,
+                "distance_m": p.distance_m,
+                "speed_mps": p.speed_mps,
+                "pace_sec_per_km": p.pace_sec_per_km,
+                "hr_bpm": p.heart_rate_bpm,
+                "power_w": p.power_w,
+                "cadence_spm": p.cadence_spm,
+                "gct_ms": p.gct_ms,
+                "stance_pct": p.stance_time_pct,
+                "vert_osc_mm": p.vertical_oscillation_mm,
+                "vert_ratio_pct": p.vertical_ratio_pct,
+                "step_length_mm": p.step_length_mm,
+                "stance_balance_left_pct": p.stance_balance_left_pct,
+                "altitude_m": p.altitude_m,
+                "temp_c": p.temperature_c,
+                "respiration_brpm": p.respiration_brpm,
+                "lat": p.latitude_deg,
+                "lon": p.longitude_deg,
+                "impact_load": p.impact_load,
+            })
+        })
+        .collect();
+    json!({
+        "garmin_id": track.garmin_id,
+        "start_second": lo,
+        "end_second": hi,
+        "step_seconds": step,
+        "row_count": rows.len(),
+        "rows": rows
+    })
+}
+
+pub fn append_training_ledger_entry(
+    store: &SharedStore,
+    entry_markdown: &str,
+) -> Result<usize, String> {
+    let trimmed = entry_markdown.trim();
+    if trimmed.is_empty() {
+        return Err("Entry markdown cannot be empty.".to_string());
+    }
+    let existing = store
+        .read_text("ASPI_Training_Log.txt")
+        .map_err(|e| e.to_string())?
+        .unwrap_or_default();
+    let updated = if existing.trim().is_empty() {
+        format!("{trimmed}\n")
+    } else {
+        format!("{}\n\n{trimmed}\n", existing.trim_end())
+    };
+    store
+        .write_text_atomic("ASPI_Training_Log.txt", &updated)
+        .map_err(|e| e.to_string())?;
+    Ok(updated.lines().count())
 }

@@ -1,4 +1,5 @@
 pub mod coach;
+pub mod forensic_extractor;
 pub mod garmin;
 pub mod models;
 pub mod readiness;
@@ -195,6 +196,26 @@ async fn sync_garmin_now(state: State<'_, AppState>) -> Result<serde_json::Value
     }))
 }
 
+fn attach_latest_forensic(
+    packet: String,
+    db: &Database,
+    activities: &[ActivityRecord],
+) -> String {
+    let tracked = activities.iter().take(5).find_map(|act| {
+        db.get_fit_track(act.garmin_id)
+            .ok()
+            .flatten()
+            .map(|track| (act, track))
+    });
+    if let Some((act, track)) = tracked {
+        coach::append_forensic_section(packet, Some(act), track.forensic_telemetry.as_ref())
+    } else if let Some(act) = activities.first() {
+        coach::append_forensic_section(packet, Some(act), None)
+    } else {
+        packet
+    }
+}
+
 #[tauri::command]
 fn build_coach_packet(state: State<'_, AppState>, draft_prompt: String) -> Result<String, String> {
     let store = state.load_store()?;
@@ -205,7 +226,7 @@ fn build_coach_packet(state: State<'_, AppState>, draft_prompt: String) -> Resul
     let gear: Option<GearInventoryFile> = store.read_json("gear_inventory.json").map_err(|e| e.to_string())?;
     let readiness: Option<ReadinessState> = store.read_json("readiness_state.json").map_err(|e| e.to_string())?;
 
-    Ok(coach::CoachPacketBuilder::build_markdown(
+    let packet = coach::CoachPacketBuilder::build_markdown(
         &config,
         &activities,
         &days,
@@ -213,7 +234,8 @@ fn build_coach_packet(state: State<'_, AppState>, draft_prompt: String) -> Resul
         readiness.as_ref(),
         &draft_prompt,
         Utc::now(),
-    ))
+    );
+    Ok(attach_latest_forensic(packet, &db, &activities))
 }
 
 #[tauri::command]
@@ -274,23 +296,20 @@ fn generate_starter_coach_files(state: State<'_, AppState>) -> Result<serde_json
     Ok(serde_json::json!({ "ok": true, "days_of_history": summary.days_of_history }))
 }
 
-#[tauri::command]
-async fn get_activity_detail(
-    state: State<'_, AppState>,
+async fn load_or_fetch_fit_track(
+    store: &SharedStore,
+    db: &Database,
     activity_id: i64,
-) -> Result<ActivityDetailPayload, String> {
-    let store = state.load_store()?;
-    let db = state.open_db()?;
-    let activity = db
-        .get_activity(activity_id)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("Activity {activity_id} not found"))?;
-
-    if let Some(track) = db.get_fit_track(activity_id).map_err(|e| e.to_string())? {
-        return Ok(ActivityDetailPayload {
-            activity,
-            track: Some(track),
-        });
+) -> Result<Option<FitTrackAnalysis>, String> {
+    if let Some(mut track) = db.get_fit_track(activity_id).map_err(|e| e.to_string())? {
+        if track.forensic_telemetry.is_none() && !track.full_points.is_empty() {
+            track.forensic_telemetry = Some(forensic_extractor::extract_forensic_telemetry(
+                &track.full_points,
+                &[],
+            ));
+            let _ = db.upsert_fit_track(activity_id, &track);
+        }
+        return Ok(Some(track));
     }
 
     // Lazily fetch & decode .fit if Garmin key is available
@@ -306,7 +325,21 @@ async fn get_activity_detail(
         },
         Err(_) => None,
     };
+    Ok(track)
+}
 
+#[tauri::command]
+async fn get_activity_detail(
+    state: State<'_, AppState>,
+    activity_id: i64,
+) -> Result<ActivityDetailPayload, String> {
+    let store = state.load_store()?;
+    let db = state.open_db()?;
+    let activity = db
+        .get_activity(activity_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("Activity {activity_id} not found"))?;
+    let track = load_or_fetch_fit_track(&store, &db, activity_id).await?;
     Ok(ActivityDetailPayload { activity, track })
 }
 
@@ -350,12 +383,118 @@ async fn send_coach_message(
             &prompt,
             Utc::now(),
         );
+        let packet = attach_latest_forensic(packet, &db, &activities);
         Ok(serde_json::json!({
             "mode": "clipboard_packet",
             "packet": packet,
             "proposals": [],
         }))
     }
+}
+
+fn opt_f64(value: Option<f64>, precision: usize) -> String {
+    match value {
+        Some(v) => format!("{v:.precision$}"),
+        None => String::new(),
+    }
+}
+
+#[tauri::command]
+fn save_activity_post_run_context(
+    state: State<'_, AppState>,
+    activity_id: i64,
+    context: PostRunContext,
+) -> Result<ActivityRecord, String> {
+    let db = state.open_db()?;
+    let activity = db
+        .get_activity(activity_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("Activity {activity_id} not found"))?;
+    let dur = if activity.moving_duration_sec > 0.0 {
+        activity.moving_duration_sec
+    } else {
+        activity.duration_sec
+    };
+    let computed = context.with_computed_sweat(dur);
+    db.save_post_run_context(activity_id, &computed)
+        .map_err(|e| e.to_string())?;
+    db.get_activity(activity_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("Activity {activity_id} disappeared"))
+}
+
+#[tauri::command]
+async fn export_1hz_csv(
+    state: State<'_, AppState>,
+    activity_id: i64,
+    target_path: String,
+) -> Result<usize, String> {
+    let store = state.load_store()?;
+    let db = state.open_db()?;
+    let track = load_or_fetch_fit_track(&store, &db, activity_id)
+        .await?
+        .ok_or_else(|| format!("No 1Hz FIT track available for activity {activity_id}."))?;
+    if track.full_points.is_empty() {
+        return Err("Track contains zero 1Hz points.".to_string());
+    }
+    let mut lines = Vec::with_capacity(track.full_points.len() + 1);
+    lines.push(
+        "second,distance_m,pace_sec_per_km,speed_mps,hr_bpm,power_w,cadence_spm,gct_ms,stance_pct,vert_osc_mm,vert_ratio_pct,step_length_mm,stance_balance_left_pct,altitude_m,temp_c,respiration_brpm,lat,lon,impact_load"
+            .to_string(),
+    );
+    for p in &track.full_points {
+        lines.push(format!(
+            "{:.1},{:.2},{},{:.3},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            p.timestamp_sec,
+            p.distance_m,
+            opt_f64(p.pace_sec_per_km, 1),
+            p.speed_mps,
+            opt_f64(p.heart_rate_bpm, 1),
+            opt_f64(p.power_w, 1),
+            opt_f64(p.cadence_spm, 1),
+            opt_f64(p.gct_ms, 1),
+            opt_f64(p.stance_time_pct, 2),
+            opt_f64(p.vertical_oscillation_mm, 1),
+            opt_f64(p.vertical_ratio_pct, 2),
+            opt_f64(p.step_length_mm, 1),
+            opt_f64(p.stance_balance_left_pct, 2),
+            opt_f64(p.altitude_m, 1),
+            opt_f64(p.temperature_c, 1),
+            opt_f64(p.respiration_brpm, 1),
+            opt_f64(p.latitude_deg, 6),
+            opt_f64(p.longitude_deg, 6),
+            opt_f64(p.impact_load, 2),
+        ));
+    }
+    std::fs::write(&target_path, format!("{}\n", lines.join("\n"))).map_err(|e| e.to_string())?;
+    Ok(track.full_points.len())
+}
+
+#[tauri::command]
+fn import_training_ledger(state: State<'_, AppState>, source_path: String) -> Result<usize, String> {
+    let store = state.load_store()?;
+    let raw = std::fs::read_to_string(&source_path).map_err(|e| e.to_string())?;
+    if raw.trim().is_empty() {
+        return Err("Selected ledger file is empty.".to_string());
+    }
+    store
+        .write_text_atomic("ASPI_Training_Log.txt", &raw)
+        .map_err(|e| e.to_string())?;
+    Ok(raw.lines().count())
+}
+
+#[tauri::command]
+fn export_training_ledger(state: State<'_, AppState>, target_path: String) -> Result<usize, String> {
+    let store = state.load_store()?;
+    let raw = store
+        .read_text("ASPI_Training_Log.txt")
+        .map_err(|e| e.to_string())?
+        .unwrap_or_default();
+    if raw.trim().is_empty() {
+        return Err("Training ledger (ASPI_Training_Log.txt) is currently empty.".to_string());
+    }
+    std::fs::write(&target_path, &raw).map_err(|e| e.to_string())?;
+    Ok(raw.lines().count())
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -409,6 +548,10 @@ pub fn run() {
             apply_coach_proposal,
             generate_starter_coach_files,
             get_activity_detail,
+            save_activity_post_run_context,
+            export_1hz_csv,
+            import_training_ledger,
+            export_training_ledger,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Splits Coach");

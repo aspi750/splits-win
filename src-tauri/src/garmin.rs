@@ -223,6 +223,7 @@ impl GarminClient {
                 training_load: dto.activity_training_load,
                 shoe_name: None,
                 is_hyrox: None,
+                post_run_context: None,
             });
         }
 
@@ -345,6 +346,7 @@ impl GarminClient {
                     training_load: dto.activity_training_load,
                     shoe_name: None,
                     is_hyrox: None,
+                    post_run_context: None,
                 });
             }
             if count < PAGE_SIZE {
@@ -616,6 +618,18 @@ pub fn parse_fit_track(
         let mut hr: Option<f64> = None;
         let mut cadence: Option<f64> = None;
         let mut altitude: Option<f64> = None;
+        let mut power_w: Option<f64> = None;
+        let mut gct_ms: Option<f64> = None;
+        let mut stance_time_pct: Option<f64> = None;
+        let mut vertical_oscillation_mm: Option<f64> = None;
+        let mut vertical_ratio_pct: Option<f64> = None;
+        let mut step_length_mm: Option<f64> = None;
+        let mut stance_balance_left_pct: Option<f64> = None;
+        let mut temperature_c: Option<f64> = None;
+        let mut respiration_brpm: Option<f64> = None;
+        let mut latitude_deg: Option<f64> = None;
+        let mut longitude_deg: Option<f64> = None;
+        let mut impact_load: Option<f64> = None;
 
         for field in msg.fields() {
             match field.name() {
@@ -637,6 +651,26 @@ pub fn parse_fit_track(
                         altitude = value_as_f64(field.value());
                     }
                 }
+                "power" => power_w = value_as_f64(field.value()),
+                "stance_time" => gct_ms = value_as_f64(field.value()),
+                "stance_time_percent" => stance_time_pct = value_as_f64(field.value()),
+                "vertical_oscillation" => vertical_oscillation_mm = value_as_f64(field.value()),
+                "vertical_ratio" => vertical_ratio_pct = value_as_f64(field.value()),
+                "step_length" => step_length_mm = value_as_f64(field.value()),
+                "stance_time_balance" => stance_balance_left_pct = value_as_f64(field.value()),
+                "temperature" => temperature_c = value_as_f64(field.value()),
+                "enhanced_respiration_rate" | "respiration_rate" => {
+                    if respiration_brpm.is_none() || field.name() == "enhanced_respiration_rate" {
+                        respiration_brpm = value_as_f64(field.value());
+                    }
+                }
+                "position_lat" => {
+                    latitude_deg = value_as_f64(field.value()).map(|v| v * (180.0 / 2_147_483_648.0));
+                }
+                "position_long" => {
+                    longitude_deg = value_as_f64(field.value()).map(|v| v * (180.0 / 2_147_483_648.0));
+                }
+                "impact_load" => impact_load = value_as_f64(field.value()),
                 _ => {}
             }
         }
@@ -656,12 +690,28 @@ pub fn parse_fit_track(
             heart_rate_bpm: hr,
             cadence_spm: cadence,
             altitude_m: altitude,
+            power_w,
+            gct_ms,
+            stance_time_pct,
+            vertical_oscillation_mm,
+            vertical_ratio_pct,
+            step_length_mm,
+            stance_balance_left_pct,
+            temperature_c,
+            respiration_brpm,
+            latitude_deg,
+            longitude_deg,
+            impact_load,
         });
     }
 
     let mut analysis = analyze_fit_points(garmin_id, points, config);
     analysis.compromised_run_audit = CompromisedRunAudit::compute(&laps);
     analysis.hyrox_dissection = dissect_hyrox_laps(&laps, false);
+    analysis.forensic_telemetry = Some(crate::forensic_extractor::extract_forensic_telemetry(
+        &analysis.full_points,
+        &laps,
+    ));
     analysis.laps = laps;
     Ok(analysis)
 }
@@ -962,6 +1012,11 @@ pub fn analyze_fit_points(
         }
     }
 
+    let forensic_telemetry = Some(crate::forensic_extractor::extract_forensic_telemetry(
+        &full_points,
+        &[],
+    ));
+
     FitTrackAnalysis {
         garmin_id,
         chart_points,
@@ -970,6 +1025,7 @@ pub fn analyze_fit_points(
         laps: Vec::new(),
         compromised_run_audit: None,
         hyrox_dissection: None,
+        forensic_telemetry,
         decoupling_pct,
         audit: FitGuardrailAudit {
             pace_floor_sec_per_km: pace_floor,
