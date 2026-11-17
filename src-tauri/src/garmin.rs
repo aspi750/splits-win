@@ -1,6 +1,7 @@
 use crate::models::{
-    ActivityRecord, AthleteConfig, CompromisedRunAudit, DayRecord, FitGuardrailAudit, FitLap,
-    FitSplit, FitTrackAnalysis, FitTrackPoint, APP_SERVICE, GARMIN_ACCOUNT,
+    ActivityRecord, AthleteConfig, ClassifiedLap, CompromisedRunAudit, DayRecord,
+    FitGuardrailAudit, FitLap, FitSplit, FitTrackAnalysis, FitTrackPoint, HyroxDissection,
+    LapKind, APP_SERVICE, GARMIN_ACCOUNT,
 };
 use crate::storage::CredentialStore;
 use chrono::{Duration, Utc};
@@ -219,6 +220,7 @@ impl GarminClient {
                 cadence_spm: dto.average_running_cadence_in_steps_per_minute,
                 training_load: dto.activity_training_load,
                 shoe_name: None,
+                is_hyrox: None,
             });
         }
 
@@ -340,6 +342,7 @@ impl GarminClient {
                     cadence_spm: dto.average_running_cadence_in_steps_per_minute,
                     training_load: dto.activity_training_load,
                     shoe_name: None,
+                    is_hyrox: None,
                 });
             }
             if count < PAGE_SIZE {
@@ -656,8 +659,158 @@ pub fn parse_fit_track(
 
     let mut analysis = analyze_fit_points(garmin_id, points, config);
     analysis.compromised_run_audit = CompromisedRunAudit::compute(&laps);
+    analysis.hyrox_dissection = dissect_hyrox_laps(&laps, false);
     analysis.laps = laps;
     Ok(analysis)
+}
+
+/// Classifies `.fit` laps into `Run`, `Station`, and `Roxzone` transitions and computes
+/// clean running metrics (`clean_run_pace_sec_per_km`, `clean_aerobic_efficiency`) plus
+/// HYROX compromised-run decay (`compromised_pace_decay_sec`) and recovery duration.
+pub fn dissect_hyrox_laps(laps: &[FitLap], force_hyrox: bool) -> Option<HyroxDissection> {
+    if laps.is_empty() {
+        return None;
+    }
+
+    let mut run_splits = Vec::new();
+    let mut station_splits = Vec::new();
+    let mut roxzone_transitions = Vec::new();
+    let mut seq_kinds = Vec::new();
+
+    for (idx, lap) in laps.iter().enumerate() {
+        let moving = if lap.moving_sec > 0.0 {
+            lap.moving_sec
+        } else {
+            lap.elapsed_sec
+        };
+        if moving <= 0.0 {
+            continue;
+        }
+        let pace = if lap.distance_m > 0.0 {
+            Some(moving / (lap.distance_m / 1000.0))
+        } else {
+            None
+        };
+
+        let is_run = lap.distance_m >= 600.0 && pace.map_or(false, |p| p <= 600.0);
+        let is_roxzone = !is_run
+            && ((lap.distance_m > 0.0 && lap.distance_m < 350.0 && moving <= 75.0)
+                || (lap.distance_m < 600.0 && moving <= 60.0));
+
+        let kind = if is_run {
+            LapKind::Run
+        } else if is_roxzone {
+            LapKind::Roxzone
+        } else {
+            LapKind::Station
+        };
+
+        let classified = ClassifiedLap {
+            lap_index: idx + 1,
+            kind,
+            elapsed_sec: lap.elapsed_sec,
+            moving_sec: moving,
+            distance_m: lap.distance_m,
+            pace_sec_per_km: pace.map(|p| (p * 10.0).round() / 10.0),
+            avg_hr_bpm: lap.avg_hr_bpm,
+        };
+
+        seq_kinds.push(kind);
+        match kind {
+            LapKind::Run => run_splits.push(classified),
+            LapKind::Station => station_splits.push(classified),
+            LapKind::Roxzone => roxzone_transitions.push(classified),
+        }
+    }
+
+    let mut run_nonrun_transitions = 0usize;
+    for i in 1..seq_kinds.len() {
+        let a_run = seq_kinds[i - 1] == LapKind::Run;
+        let b_run = seq_kinds[i] == LapKind::Run;
+        if a_run != b_run {
+            run_nonrun_transitions += 1;
+        }
+    }
+
+    let non_run_count = station_splits.len() + roxzone_transitions.len();
+    let auto_detected = (run_splits.len() >= 2 && non_run_count >= 2 && run_nonrun_transitions >= 3)
+        || (run_splits.len() >= 4 && station_splits.len() >= 2);
+    let is_hyrox_sim = force_hyrox || auto_detected;
+
+    if !is_hyrox_sim {
+        return None;
+    }
+
+    let r1 = |v: f64| (v * 10.0).round() / 10.0;
+    let r3 = |v: f64| (v * 1000.0).round() / 1000.0;
+
+    let total_run_m: f64 = run_splits.iter().map(|s| s.distance_m).sum();
+    let total_run_sec: f64 = run_splits.iter().map(|s| s.moving_sec).sum();
+    let clean_run_pace_sec_per_km = if total_run_m > 0.0 && total_run_sec > 0.0 {
+        Some(r1(total_run_sec / (total_run_m / 1000.0)))
+    } else {
+        None
+    };
+
+    let run_hrs: Vec<f64> = run_splits.iter().filter_map(|s| s.avg_hr_bpm).collect();
+    let clean_aerobic_efficiency = if total_run_m > 0.0 && total_run_sec > 0.0 && !run_hrs.is_empty() {
+        let speed_m_per_min = total_run_m / (total_run_sec / 60.0);
+        let avg_hr = run_hrs.iter().sum::<f64>() / run_hrs.len() as f64;
+        if avg_hr > 0.0 {
+            Some(r3(speed_m_per_min / avg_hr))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    // Compromised pace decay: Runs 5-8 avg pace minus Run 1 pace (or second-half avg minus Run 1 when < 6 runs)
+    let compromised_pace_decay_sec = if run_splits.len() >= 2 {
+        let run1_pace = run_splits[0].pace_sec_per_km;
+        let late_slice = if run_splits.len() >= 6 {
+            &run_splits[4..run_splits.len().min(8)]
+        } else {
+            &run_splits[run_splits.len() / 2..]
+        };
+        let late_m: f64 = late_slice.iter().map(|s| s.distance_m).sum();
+        let late_s: f64 = late_slice.iter().map(|s| s.moving_sec).sum();
+        if let Some(p1) = run1_pace {
+            if late_m > 0.0 && late_s > 0.0 {
+                let late_pace = late_s / (late_m / 1000.0);
+                Some(r1(late_pace - p1))
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let station_hr_recovery_sec = if !roxzone_transitions.is_empty() {
+        let avg = roxzone_transitions.iter().map(|s| s.moving_sec).sum::<f64>()
+            / roxzone_transitions.len() as f64;
+        Some(r1(avg))
+    } else if !station_splits.is_empty() {
+        let avg = station_splits.iter().map(|s| s.moving_sec).sum::<f64>()
+            / station_splits.len() as f64;
+        Some(r1(avg))
+    } else {
+        None
+    };
+
+    Some(HyroxDissection {
+        is_hyrox_sim,
+        run_splits,
+        station_splits,
+        roxzone_transitions,
+        clean_run_pace_sec_per_km,
+        clean_aerobic_efficiency,
+        compromised_pace_decay_sec,
+        station_hr_recovery_sec,
+    })
 }
 
 pub fn analyze_fit_points(
@@ -702,6 +855,7 @@ pub fn analyze_fit_points(
         splits,
         laps: Vec::new(),
         compromised_run_audit: None,
+        hyrox_dissection: None,
         decoupling_pct,
         audit: FitGuardrailAudit {
             pace_floor_sec_per_km: pace_floor,

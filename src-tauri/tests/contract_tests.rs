@@ -1,10 +1,10 @@
 use chrono::{Duration, TimeZone, Utc};
 use splits_win_lib::coach::{
-    analyze_training_history, apply_coach_proposal, compact_history_markdown, replacing_section,
-    slice_fit_track_by_km, starter_coach_profile_markdown, starter_training_plan_markdown,
-    CoachPacketBuilder,
+    analyze_training_history, apply_coach_proposal, compact_history_markdown,
+    format_user_profile_context, replacing_section, slice_fit_track_by_km,
+    starter_coach_profile_markdown, starter_training_plan_markdown, CoachPacketBuilder,
 };
-use splits_win_lib::garmin::analyze_fit_points;
+use splits_win_lib::garmin::{analyze_fit_points, dissect_hyrox_laps};
 use splits_win_lib::models::*;
 use splits_win_lib::readiness::{ReadinessEngine, ReadinessInput};
 use splits_win_lib::scheduler::{
@@ -81,6 +81,7 @@ fn test_shared_store_and_sqlite_roundtrip() {
         cadence_spm: Some(174.0),
         training_load: Some(45.0),
         shoe_name: Some("Superblast 3".to_string()),
+        is_hyrox: None,
     })
     .unwrap();
     let acts = db.list_activities(10).unwrap();
@@ -132,6 +133,7 @@ fn test_readiness_engine_green_red_amber_and_persistence() {
             cadence_spm: Some(176.0),
             training_load: Some(40.0),
             shoe_name: Some("Superblast 3".to_string()),
+            is_hyrox: None,
         }],
         days: &[healthy_day.clone()],
         plan: None,
@@ -162,6 +164,7 @@ fn test_readiness_engine_green_red_amber_and_persistence() {
             cadence_spm: Some(176.0),
             training_load: Some(40.0),
             shoe_name: None,
+            is_hyrox: None,
         }],
         days: &[bad_day],
         plan: None,
@@ -335,6 +338,7 @@ fn test_stage2_2_hybrid_hyrox_spacing_and_compromised_run_audit() {
         cadence_spm: None,
         training_load: Some(120.0),
         shoe_name: None,
+        is_hyrox: None,
     };
 
     let mut hybrid_config = AthleteConfig::default();
@@ -411,6 +415,7 @@ fn test_stage2_2_training_history_analyzer_and_starter_templates() {
             cadence_spm: Some(174.0),
             training_load: Some(60.0),
             shoe_name: None,
+            is_hyrox: None,
         });
         if offset % 4 == 1 {
             activities.push(ActivityRecord {
@@ -427,6 +432,7 @@ fn test_stage2_2_training_history_analyzer_and_starter_templates() {
                 cadence_spm: None,
                 training_load: Some(90.0),
                 shoe_name: None,
+                is_hyrox: None,
             });
         }
     }
@@ -452,4 +458,102 @@ fn test_stage2_2_training_history_analyzer_and_starter_templates() {
     let plan = starter_training_plan_markdown(&config, &summary);
     assert!(plan.contains("## Current Phase & Baseline"));
     assert!(plan.contains("## Change History"));
+}
+
+#[test]
+fn test_stage3_1_user_profile_migration_and_hyrox_reclassification() {
+    // 1. Fresh DB defaults to runner + onboarding_completed = false
+    let db = Database::open_in_memory().unwrap();
+    let fresh = db.get_user_profile().unwrap();
+    assert_eq!(fresh.athlete_type, AthleteType::Runner);
+    assert!(!fresh.onboarding_completed);
+
+    // 2. Round-trip custom HybridBoth profile
+    let custom = UserProfile {
+        athlete_type: AthleteType::HybridBoth,
+        onboarding_completed: true,
+        runner_config: RunnerConfig {
+            primary_distance: Some("Half Marathon".to_string()),
+            hr_first_governor: true,
+            pace_floor_sec_per_km: Some(390),
+            z2_range_bpm: Some([130, 144]),
+            z3_range_bpm: Some([145, 160]),
+            lthr_bpm: Some(172),
+        },
+        hyrox_config: HyroxConfig {
+            division: Some("Open Men".to_string()),
+            watch_logging_mode: Some("lap_button".to_string()),
+            target_total_time_sec: Some(4500),
+            fresh_1km_pace_sec: Some(255),
+            compromised_1km_target_sec: Some(275),
+            weak_stations: vec!["Sled Push".to_string(), "Wall Balls".to_string()],
+        },
+    };
+    db.save_user_profile(&custom).unwrap();
+    let loaded = db.get_user_profile().unwrap();
+    assert_eq!(loaded, custom);
+
+    let ctx = format_user_profile_context(&loaded);
+    assert!(ctx.contains("hybrid_both"));
+    assert!(ctx.contains("Sled Push 152 kg"));
+    assert!(ctx.contains("Wall Balls"));
+
+    // 3. Reclassify activity as HYROX
+    let act = ActivityRecord {
+        garmin_id: 555,
+        name: "Saturday Sim".to_string(),
+        type_key: "running".to_string(),
+        start_iso: "2026-11-16T09:00:00Z".to_string(),
+        distance_m: 8000.0,
+        duration_sec: 3600.0,
+        moving_duration_sec: 3550.0,
+        elevation_gain_m: 10.0,
+        average_hr: Some(165.0),
+        max_hr: Some(182.0),
+        cadence_spm: Some(176.0),
+        training_load: Some(180.0),
+        shoe_name: None,
+        is_hyrox: None,
+    };
+    db.upsert_activity(&act).unwrap();
+    db.set_activity_hyrox(555, true).unwrap();
+    let fetched = db.get_activity(555).unwrap().unwrap();
+    assert_eq!(fetched.is_hyrox, Some(true));
+}
+
+#[test]
+fn test_stage3_1_hyrox_16_lap_dissection_and_compromised_decay() {
+    // 8 x 1000m runs alternating with 8 x 0m station laps (16 laps total)
+    // Run 1 = 250s (4:10/km), Runs 2-4 = 260s, Runs 5-8 = 280s (4:40/km) -> decay = +30.0 s/km
+    let mut laps = Vec::new();
+    for i in 1..=8 {
+        let run_sec = match i {
+            1 => 250.0,
+            2..=4 => 260.0,
+            _ => 280.0,
+        };
+        laps.push(FitLap {
+            elapsed_sec: run_sec,
+            moving_sec: run_sec,
+            distance_m: 1000.0,
+            avg_hr_bpm: Some(160.0 + i as f64),
+        });
+        laps.push(FitLap {
+            elapsed_sec: 150.0,
+            moving_sec: 150.0,
+            distance_m: 0.0,
+            avg_hr_bpm: Some(172.0),
+        });
+    }
+
+    let dissection = dissect_hyrox_laps(&laps, false).expect("16-lap HYROX sim should auto-detect");
+    assert!(dissection.is_hyrox_sim);
+    assert_eq!(dissection.run_splits.len(), 8);
+    assert_eq!(dissection.station_splits.len(), 8);
+
+    // Clean run pace: (250 + 3*260 + 4*280) / 8 = (250 + 780 + 1120) / 8 = 2150 / 8 = 268.8 s/km
+    assert_eq!(dissection.clean_run_pace_sec_per_km, Some(268.8));
+    assert!(dissection.clean_aerobic_efficiency.is_some());
+    // Compromised decay: Runs 5-8 avg (280.0) - Run 1 (250.0) = +30.0 s/km
+    assert_eq!(dissection.compromised_pace_decay_sec, Some(30.0));
 }

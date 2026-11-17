@@ -53,6 +53,7 @@ fn get_bootstrap_state(state: State<'_, AppState>) -> Result<serde_json::Value, 
     let profile_md = store.read_text("COACH_PROFILE.md").map_err(|e| e.to_string())?.unwrap_or_default();
     let plan_md = store.read_text("TRAINING_PLAN.md").map_err(|e| e.to_string())?.unwrap_or_default();
     let needs_initial_coach_setup = profile_md.trim().is_empty() || plan_md.trim().is_empty();
+    let user_profile = db.get_user_profile().unwrap_or_default();
 
     Ok(serde_json::json!({
         "has_garmin_key": has_garmin_key,
@@ -61,6 +62,7 @@ fn get_bootstrap_state(state: State<'_, AppState>) -> Result<serde_json::Value, 
         "shared_dir": store.root().display().to_string(),
         "settings": settings,
         "athlete_config": config,
+        "user_profile": user_profile,
         "readiness_state": readiness,
         "activities": activities,
         "days": days,
@@ -198,6 +200,36 @@ fn apply_coach_proposal(state: State<'_, AppState>, proposal: CoachUpdateProposa
 }
 
 #[tauri::command]
+fn save_user_profile(state: State<'_, AppState>, profile: UserProfile) -> Result<(), String> {
+    let db = state.open_db()?;
+    db.save_user_profile(&profile).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn reclassify_activity_as_hyrox(
+    state: State<'_, AppState>,
+    activity_id: i64,
+    is_hyrox: bool,
+) -> Result<ActivityDetailPayload, String> {
+    let db = state.open_db()?;
+    db.set_activity_hyrox(activity_id, is_hyrox).map_err(|e| e.to_string())?;
+    let activity = db
+        .get_activity(activity_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("Activity {activity_id} not found"))?;
+    let mut track = db.get_fit_track(activity_id).map_err(|e| e.to_string())?;
+    if let Some(ref mut t) = track {
+        t.hyrox_dissection = if is_hyrox {
+            garmin::dissect_hyrox_laps(&t.laps, true)
+        } else {
+            None
+        };
+        let _ = db.upsert_fit_track(activity_id, t);
+    }
+    Ok(ActivityDetailPayload { activity, track })
+}
+
+#[tauri::command]
 fn generate_starter_coach_files(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
     let store = state.load_store()?;
     let db = state.open_db()?;
@@ -268,7 +300,13 @@ async fn send_coach_message(
     let days = db.list_days(365).map_err(|e| e.to_string())?;
 
     if let Some(api_key) = CredentialStore::read_secret(APP_SERVICE, GEMINI_ACCOUNT) {
-        let sys = coach::build_static_system_instruction(&store, &config, &activities);
+        let user_profile = db.get_user_profile().ok();
+        let sys = coach::build_static_system_instruction(
+            &store,
+            &config,
+            &activities,
+            user_profile.as_ref(),
+        );
         let (text, proposals) =
             coach::run_gemini_coach_turn(Some(&app), &api_key, &sys, &prompt, &store, Some(&db), &activities, &days)
                 .await?;
@@ -335,6 +373,8 @@ pub fn run() {
             save_garmin_key,
             save_gemini_key,
             save_athlete_config,
+            save_user_profile,
+            reclassify_activity_as_hyrox,
             set_execution_mode,
             set_custom_shared_dir,
             recompute_readiness,

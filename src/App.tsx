@@ -590,6 +590,14 @@ export default function App() {
             detail={selectedActivity}
             onBack={() => setSelectedActivity(null)}
             onAnalyze={() => void analyzeInCoach(selectedActivity.activity)}
+            onToggleHyrox={async (isHyrox: boolean) => {
+              const updated = await invoke<ActivityDetailPayload>("reclassify_activity_as_hyrox", {
+                activityId: selectedActivity.activity.garmin_id,
+                isHyrox,
+              });
+              setSelectedActivity(updated);
+              await reload();
+            }}
           />
         )}
 
@@ -1121,15 +1129,18 @@ function ActivityDetailView({
   detail,
   onBack,
   onAnalyze,
+  onToggleHyrox,
 }: {
   detail: ActivityDetailPayload;
   onBack: () => void;
   onAnalyze: () => void;
+  onToggleHyrox: (isHyrox: boolean) => Promise<void>;
 }) {
   const a = detail.activity;
   const track = detail.track;
   const km = a.distance_m / 1000;
   const avgPace = km > 0.1 && a.moving_duration_sec > 0 ? a.moving_duration_sec / km : null;
+  const isHyroxActive = Boolean(a.is_hyrox ?? track?.hyrox_dissection?.is_hyrox_sim);
 
   return (
     <>
@@ -1138,14 +1149,54 @@ function ActivityDetailView({
           <button className="secondary" style={{ display: "flex", alignItems: "center", gap: 6 }} onClick={onBack}>
             <ArrowLeft size={14} /> Back
           </button>
-          <button className="primary" style={{ display: "flex", alignItems: "center", gap: 6 }} onClick={onAnalyze}>
-            <Sparkles size={14} /> Analyze in Coach
-          </button>
+          <div style={{ display: "flex", gap: 8 }}>
+            <button
+              className="secondary"
+              onClick={() => void onToggleHyrox(!isHyroxActive)}
+            >
+              {isHyroxActive ? "HYROX / Hybrid Sim ✓" : "Mark as HYROX / Hybrid Sim"}
+            </button>
+            <button className="primary" style={{ display: "flex", alignItems: "center", gap: 6 }} onClick={onAnalyze}>
+              <Sparkles size={14} /> Analyze in Coach
+            </button>
+          </div>
         </div>
         <h2 style={{ margin: "4px 0" }}>{a.name || a.type_key}</h2>
         <div className="muted" style={{ marginBottom: 14 }}>
           {a.start_iso.slice(0, 10)} · {a.type_key}
         </div>
+        {track?.hyrox_dissection && (
+          <div
+            style={{
+              marginBottom: 14,
+              padding: 12,
+              borderRadius: 8,
+              border: "1px solid var(--border)",
+              background: "var(--bg)",
+            }}
+          >
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
+              <strong>HYROX FIT Lap Dissector</strong>
+              <span className="pill green">
+                {track.hyrox_dissection.run_splits.length} runs · {track.hyrox_dissection.station_splits.length} stations
+                {track.hyrox_dissection.roxzone_transitions.length > 0
+                  ? ` · ${track.hyrox_dissection.roxzone_transitions.length} roxzone`
+                  : ""}
+              </span>
+            </div>
+            <div className="muted" style={{ fontSize: 13 }}>
+              Clean Run Pace: <strong>{formatPace(track.hyrox_dissection.clean_run_pace_sec_per_km)}</strong>
+              {" · "}Clean Aerobic Efficiency:{" "}
+              <strong>{track.hyrox_dissection.clean_aerobic_efficiency?.toFixed(3) ?? "–"}</strong>
+              {" · "}Compromised Decay:{" "}
+              <strong>
+                {track.hyrox_dissection.compromised_pace_decay_sec != null
+                  ? `${track.hyrox_dissection.compromised_pace_decay_sec > 0 ? "+" : ""}${track.hyrox_dissection.compromised_pace_decay_sec.toFixed(1)} s/km`
+                  : "–"}
+              </strong>
+            </div>
+          </div>
+        )}
         <div className="grid">
           <div className="card">
             <div className="muted">Distance</div>

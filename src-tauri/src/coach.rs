@@ -596,10 +596,12 @@ fn execute_tool(
                 let track = db.and_then(|d| d.get_fit_track(act.garmin_id).ok()).flatten();
                 json!({
                     "activity": act,
+                    "is_hyrox": act.is_hyrox,
                     "fit_track_cached": track.is_some(),
                     "splits": track.as_ref().map(|t| &t.splits),
                     "laps": track.as_ref().map(|t| &t.laps),
                     "compromised_run_audit": track.as_ref().and_then(|t| t.compromised_run_audit.as_ref()),
+                    "hyrox_dissection": track.as_ref().and_then(|t| t.hyrox_dissection.as_ref()),
                     "decoupling_pct": track.as_ref().and_then(|t| t.decoupling_pct),
                     "guardrail_audit": track.as_ref().map(|t| &t.audit),
                 })
@@ -991,10 +993,65 @@ pub fn first_use_setup_instructions(summary: &TrainingHistorySummary) -> String 
     }
 }
 
+pub fn format_user_profile_context(profile: &UserProfile) -> String {
+    let mut lines = vec![format!("- Athlete Discipline: {}", profile.athlete_type.as_str())];
+
+    if matches!(profile.athlete_type, AthleteType::Runner | AthleteType::HybridBoth) {
+        let r = &profile.runner_config;
+        let mut r_parts = Vec::new();
+        if let Some(ref dist) = r.primary_distance {
+            r_parts.push(format!("Primary distance: {dist}"));
+        }
+        r_parts.push(format!("HR-first governor: {}", r.hr_first_governor));
+        if let Some(pf) = r.pace_floor_sec_per_km {
+            r_parts.push(format!("Pace floor: {}/km", AthleteConfig::format_pace(pf)));
+        }
+        if let Some([lo, hi]) = r.z2_range_bpm {
+            r_parts.push(format!("Z2: {lo}-{hi} bpm"));
+        }
+        if let Some([lo, hi]) = r.z3_range_bpm {
+            r_parts.push(format!("Z3: {lo}-{hi} bpm"));
+        }
+        if let Some(lthr) = r.lthr_bpm {
+            r_parts.push(format!("LTHR: {lthr} bpm"));
+        }
+        lines.push(format!("- Runner Config: {}", r_parts.join(" · ")));
+    }
+
+    if matches!(profile.athlete_type, AthleteType::Hyrox | AthleteType::HybridBoth) {
+        let h = &profile.hyrox_config;
+        let mut h_parts = Vec::new();
+        if let Some(ref div) = h.division {
+            h_parts.push(format!("Division: {div}"));
+        }
+        h_parts.push(format!("Weights: {}", h.official_weights_summary()));
+        if let Some(ref mode) = h.watch_logging_mode {
+            h_parts.push(format!("Watch logging: {mode}"));
+        }
+        if let Some(t) = h.target_total_time_sec {
+            h_parts.push(format!("Target finish: {}", format_duration(t as f64)));
+        }
+        if let Some(fresh) = h.fresh_1km_pace_sec {
+            h_parts.push(format!("Fresh 1km: {}/km", AthleteConfig::format_pace(fresh)));
+        }
+        if let Some(comp) = h.compromised_1km_target_sec {
+            h_parts.push(format!("Compromised 1km target: {}/km", AthleteConfig::format_pace(comp)));
+        }
+        if !h.weak_stations.is_empty() {
+            h_parts.push(format!("Weak stations: {}", h.weak_stations.join(", ")));
+        }
+        lines.push(format!("- HYROX Config: {}", h_parts.join(" · ")));
+        lines.push("- HYROX Analysis Rule: Use `hyrox_dissection` (`clean_run_pace_sec_per_km`, `clean_aerobic_efficiency`, `compromised_pace_decay_sec`, `station_hr_recovery_sec`) from `get_activity_detail` so stationary station laps do not pollute running pace or aerobic efficiency.".to_string());
+    }
+
+    lines.join("\n")
+}
+
 pub fn build_static_system_instruction(
     store: &SharedStore,
     config: &AthleteConfig,
     activities: &[ActivityRecord],
+    user_profile: Option<&UserProfile>,
 ) -> String {
     let profile_md = store.read_text("COACH_PROFILE.md").ok().flatten().unwrap_or_default();
     let plan_md = store.read_text("TRAINING_PLAN.md").ok().flatten().unwrap_or_default();
@@ -1004,6 +1061,9 @@ pub fn build_static_system_instruction(
         "You are a Living Markdown training-planning coach inside Splits Coach. Use metric units (km, min/km, bpm, kg). Always use `propose_coach_update` for Markdown changes. Use `get_recent_activities`, `get_activity_detail`, `get_wellness_history`, `get_training_load_and_records`, `get_readiness_and_plan`, `get_lifetime_and_yearly_history`, and `query_run_slice` for drill-downs.".to_string(),
         format!("=== ATHLETE CONFIG ===\n{}", config.prompt_summary(None)),
     ];
+    if let Some(profile) = user_profile {
+        sections.push(format!("=== ATHLETE DISCIPLINE PROFILE ===\n{}", format_user_profile_context(profile)));
+    }
     if !profile_md.trim().is_empty() {
         sections.push(format!("=== COACH_PROFILE.md ===\n{profile_md}"));
     }

@@ -227,27 +227,106 @@ impl Database {
                 garmin_id INTEGER PRIMARY KEY,
                 track_json TEXT NOT NULL,
                 updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS user_profile (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                athlete_type TEXT NOT NULL DEFAULT 'runner',
+                onboarding_completed INTEGER NOT NULL DEFAULT 0,
+                runner_config_json TEXT NOT NULL DEFAULT '{}',
+                hyrox_config_json TEXT NOT NULL DEFAULT '{}'
             );",
+        )?;
+        let conn = self.conn.lock().unwrap();
+        // Backwards-compatible column addition on existing databases
+        let _ = conn.execute("ALTER TABLE activities ADD COLUMN is_hyrox INTEGER", []);
+
+        let has_profile: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM user_profile WHERE id = 1",
+            [],
+            |r| r.get(0),
+        )?;
+        if has_profile == 0 {
+            let act_count: i64 = conn.query_row("SELECT COUNT(*) FROM activities", [], |r| r.get(0))?;
+            let onboarding = if act_count > 0 { 1 } else { 0 };
+            conn.execute(
+                "INSERT INTO user_profile (id, athlete_type, onboarding_completed, runner_config_json, hyrox_config_json)
+                 VALUES (1, 'runner', ?1, '{}', '{}')",
+                params![onboarding],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn get_user_profile(&self) -> Result<UserProfile, StorageError> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT athlete_type, onboarding_completed, runner_config_json, hyrox_config_json
+             FROM user_profile WHERE id = 1 LIMIT 1",
+            [],
+            |r| {
+                let type_str: String = r.get(0)?;
+                let onboarded: i64 = r.get(1)?;
+                let runner_json: String = r.get(2)?;
+                let hyrox_json: String = r.get(3)?;
+                Ok(UserProfile {
+                    athlete_type: AthleteType::from_str_lossy(&type_str),
+                    onboarding_completed: onboarded != 0,
+                    runner_config: serde_json::from_str(&runner_json).unwrap_or_default(),
+                    hyrox_config: serde_json::from_str(&hyrox_json).unwrap_or_default(),
+                })
+            },
+        )
+        .map_err(StorageError::from)
+    }
+
+    pub fn save_user_profile(&self, profile: &UserProfile) -> Result<(), StorageError> {
+        let runner_json = serde_json::to_string(&profile.runner_config)?;
+        let hyrox_json = serde_json::to_string(&profile.hyrox_config)?;
+        self.conn.lock().unwrap().execute(
+            "INSERT INTO user_profile (id, athlete_type, onboarding_completed, runner_config_json, hyrox_config_json)
+             VALUES (1, ?1, ?2, ?3, ?4)
+             ON CONFLICT(id) DO UPDATE SET
+                athlete_type = excluded.athlete_type,
+                onboarding_completed = excluded.onboarding_completed,
+                runner_config_json = excluded.runner_config_json,
+                hyrox_config_json = excluded.hyrox_config_json",
+            params![
+                profile.athlete_type.as_str(),
+                if profile.onboarding_completed { 1 } else { 0 },
+                runner_json,
+                hyrox_json
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_activity_hyrox(&self, garmin_id: i64, is_hyrox: bool) -> Result<(), StorageError> {
+        self.conn.lock().unwrap().execute(
+            "UPDATE activities SET is_hyrox = ?1 WHERE garmin_id = ?2",
+            params![if is_hyrox { 1 } else { 0 }, garmin_id],
         )?;
         Ok(())
     }
 
     pub fn upsert_activity(&self, act: &ActivityRecord) -> Result<(), StorageError> {
+        let hyrox_int = act.is_hyrox.map(|b| if b { 1i64 } else { 0i64 });
         self.conn.lock().unwrap().execute(
             "INSERT INTO activities (
                 garmin_id, name, type_key, start_iso, distance_m, duration_sec, moving_duration_sec,
-                elevation_gain_m, average_hr, max_hr, cadence_spm, training_load, shoe_name
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                elevation_gain_m, average_hr, max_hr, cadence_spm, training_load, shoe_name, is_hyrox
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
             ON CONFLICT(garmin_id) DO UPDATE SET
                 name=excluded.name, type_key=excluded.type_key, start_iso=excluded.start_iso,
                 distance_m=excluded.distance_m, duration_sec=excluded.duration_sec,
                 moving_duration_sec=excluded.moving_duration_sec, elevation_gain_m=excluded.elevation_gain_m,
                 average_hr=excluded.average_hr, max_hr=excluded.max_hr, cadence_spm=excluded.cadence_spm,
-                training_load=excluded.training_load, shoe_name=excluded.shoe_name",
+                training_load=excluded.training_load, shoe_name=excluded.shoe_name,
+                is_hyrox=COALESCE(excluded.is_hyrox, activities.is_hyrox)",
             params![
                 act.garmin_id, act.name, act.type_key, act.start_iso, act.distance_m,
                 act.duration_sec, act.moving_duration_sec, act.elevation_gain_m,
-                act.average_hr, act.max_hr, act.cadence_spm, act.training_load, act.shoe_name
+                act.average_hr, act.max_hr, act.cadence_spm, act.training_load, act.shoe_name,
+                hyrox_int
             ],
         )?;
         Ok(())
@@ -257,10 +336,11 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT garmin_id, name, type_key, start_iso, distance_m, duration_sec, moving_duration_sec,
-                    elevation_gain_m, average_hr, max_hr, cadence_spm, training_load, shoe_name
+                    elevation_gain_m, average_hr, max_hr, cadence_spm, training_load, shoe_name, is_hyrox
              FROM activities ORDER BY start_iso DESC LIMIT ?1",
         )?;
         let rows = stmt.query_map(params![limit as i64], |r| {
+            let hyrox_opt: Option<i64> = r.get(13)?;
             Ok(ActivityRecord {
                 garmin_id: r.get(0)?,
                 name: r.get(1)?,
@@ -275,6 +355,7 @@ impl Database {
                 cadence_spm: r.get(10)?,
                 training_load: r.get(11)?,
                 shoe_name: r.get(12)?,
+                is_hyrox: hyrox_opt.map(|v| v != 0),
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -335,10 +416,11 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT garmin_id, name, type_key, start_iso, distance_m, duration_sec, moving_duration_sec,
-                    elevation_gain_m, average_hr, max_hr, cadence_spm, training_load, shoe_name
+                    elevation_gain_m, average_hr, max_hr, cadence_spm, training_load, shoe_name, is_hyrox
              FROM activities WHERE garmin_id = ?1 LIMIT 1",
         )?;
         let mut rows = stmt.query_map(params![garmin_id], |r| {
+            let hyrox_opt: Option<i64> = r.get(13)?;
             Ok(ActivityRecord {
                 garmin_id: r.get(0)?,
                 name: r.get(1)?,
@@ -353,6 +435,7 @@ impl Database {
                 cadence_spm: r.get(10)?,
                 training_load: r.get(11)?,
                 shoe_name: r.get(12)?,
+                is_hyrox: hyrox_opt.map(|v| v != 0),
             })
         })?;
         match rows.next() {

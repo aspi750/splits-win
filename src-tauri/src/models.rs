@@ -629,6 +629,8 @@ pub struct ActivityRecord {
     pub cadence_spm: Option<f64>,
     pub training_load: Option<f64>,
     pub shoe_name: Option<String>,
+    #[serde(default)]
+    pub is_hyrox: Option<bool>,
 }
 
 impl ActivityRecord {
@@ -817,6 +819,113 @@ impl CompromisedRunAudit {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AthleteType {
+    #[default]
+    Runner,
+    Hyrox,
+    HybridBoth,
+}
+
+impl AthleteType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            AthleteType::Runner => "runner",
+            AthleteType::Hyrox => "hyrox",
+            AthleteType::HybridBoth => "hybrid_both",
+        }
+    }
+
+    pub fn from_str_lossy(s: &str) -> Self {
+        match s {
+            "hyrox" => AthleteType::Hyrox,
+            "hybrid_both" => AthleteType::HybridBoth,
+            _ => AthleteType::Runner,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct RunnerConfig {
+    pub primary_distance: Option<String>,
+    #[serde(default)]
+    pub hr_first_governor: bool,
+    pub pace_floor_sec_per_km: Option<i32>,
+    pub z2_range_bpm: Option<[i32; 2]>,
+    pub z3_range_bpm: Option<[i32; 2]>,
+    pub lthr_bpm: Option<i32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct HyroxConfig {
+    pub division: Option<String>,
+    pub watch_logging_mode: Option<String>,
+    pub target_total_time_sec: Option<i32>,
+    pub fresh_1km_pace_sec: Option<i32>,
+    pub compromised_1km_target_sec: Option<i32>,
+    #[serde(default)]
+    pub weak_stations: Vec<String>,
+}
+
+impl HyroxConfig {
+    pub fn official_weights_summary(&self) -> &'static str {
+        match self.division.as_deref().unwrap_or("").to_lowercase().as_str() {
+            d if d.contains("pro") && d.contains("women") => {
+                "Pro Women: Sled Push 152 kg, Sled Pull 103 kg, Farmers Carry 2x24 kg, Sandbag Lunges 20 kg, Wall Balls 6 kg"
+            }
+            d if d.contains("pro") => {
+                "Pro Men: Sled Push 202 kg, Sled Pull 153 kg, Farmers Carry 2x32 kg, Sandbag Lunges 30 kg, Wall Balls 9 kg"
+            }
+            d if d.contains("women") => {
+                "Open Women: Sled Push 102 kg, Sled Pull 78 kg, Farmers Carry 2x16 kg, Sandbag Lunges 10 kg, Wall Balls 4 kg"
+            }
+            _ => {
+                "Open Men / Doubles: Sled Push 152 kg, Sled Pull 103 kg, Farmers Carry 2x24 kg, Sandbag Lunges 20 kg, Wall Balls 6 kg"
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct UserProfile {
+    pub athlete_type: AthleteType,
+    pub onboarding_completed: bool,
+    pub runner_config: RunnerConfig,
+    pub hyrox_config: HyroxConfig,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LapKind {
+    Run,
+    Station,
+    Roxzone,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ClassifiedLap {
+    pub lap_index: usize,
+    pub kind: LapKind,
+    pub elapsed_sec: f64,
+    pub moving_sec: f64,
+    pub distance_m: f64,
+    pub pace_sec_per_km: Option<f64>,
+    pub avg_hr_bpm: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HyroxDissection {
+    pub is_hyrox_sim: bool,
+    pub run_splits: Vec<ClassifiedLap>,
+    pub station_splits: Vec<ClassifiedLap>,
+    pub roxzone_transitions: Vec<ClassifiedLap>,
+    pub clean_run_pace_sec_per_km: Option<f64>,
+    pub clean_aerobic_efficiency: Option<f64>,
+    pub compromised_pace_decay_sec: Option<f64>,
+    pub station_hr_recovery_sec: Option<f64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FitTrackAnalysis {
     pub garmin_id: i64,
@@ -827,6 +936,8 @@ pub struct FitTrackAnalysis {
     pub laps: Vec<FitLap>,
     #[serde(default)]
     pub compromised_run_audit: Option<CompromisedRunAudit>,
+    #[serde(default)]
+    pub hyrox_dissection: Option<HyroxDissection>,
     pub decoupling_pct: Option<f64>,
     pub audit: FitGuardrailAudit,
 }

@@ -86,6 +86,33 @@ export interface ReadinessState {
   };
 }
 
+export type AthleteType = "runner" | "hyrox" | "hybrid_both";
+
+export interface RunnerConfig {
+  primary_distance: string | null;
+  hr_first_governor: boolean;
+  pace_floor_sec_per_km: number | null;
+  z2_range_bpm: [number, number] | null;
+  z3_range_bpm: [number, number] | null;
+  lthr_bpm: number | null;
+}
+
+export interface HyroxConfig {
+  division: string | null;
+  watch_logging_mode: string | null;
+  target_total_time_sec: number | null;
+  fresh_1km_pace_sec: number | null;
+  compromised_1km_target_sec: number | null;
+  weak_stations: string[];
+}
+
+export interface UserProfile {
+  athlete_type: AthleteType;
+  onboarding_completed: boolean;
+  runner_config: RunnerConfig;
+  hyrox_config: HyroxConfig;
+}
+
 export interface ActivityRecord {
   garmin_id: number;
   name: string;
@@ -100,6 +127,7 @@ export interface ActivityRecord {
   cadence_spm: number | null;
   training_load: number | null;
   shoe_name: string | null;
+  is_hyrox?: boolean | null;
 }
 
 export interface DayRecord {
@@ -127,6 +155,7 @@ export interface BootstrapState {
     profile_onboarded: boolean;
   };
   athlete_config: AthleteConfig;
+  user_profile?: UserProfile;
   readiness_state: ReadinessState | null;
   activities: ActivityRecord[];
   days: DayRecord[];
@@ -171,10 +200,34 @@ export interface FitGuardrailAudit {
   compliant: boolean;
 }
 
+export type LapKind = "run" | "station" | "roxzone";
+
+export interface ClassifiedLap {
+  lap_index: number;
+  kind: LapKind;
+  elapsed_sec: number;
+  moving_sec: number;
+  distance_m: number;
+  pace_sec_per_km: number | null;
+  avg_hr_bpm: number | null;
+}
+
+export interface HyroxDissection {
+  is_hyrox_sim: boolean;
+  run_splits: ClassifiedLap[];
+  station_splits: ClassifiedLap[];
+  roxzone_transitions: ClassifiedLap[];
+  clean_run_pace_sec_per_km: number | null;
+  clean_aerobic_efficiency: number | null;
+  compromised_pace_decay_sec: number | null;
+  station_hr_recovery_sec: number | null;
+}
+
 export interface FitTrackAnalysis {
   garmin_id: number;
   chart_points: FitTrackPoint[];
   splits: FitSplit[];
+  hyrox_dissection?: HyroxDissection | null;
   decoupling_pct: number | null;
   audit: FitGuardrailAudit;
 }
