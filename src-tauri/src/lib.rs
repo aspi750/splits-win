@@ -166,32 +166,71 @@ async fn sync_garmin_now(state: State<'_, AppState>) -> Result<serde_json::Value
         .await
         .map_err(|e| e.to_string())?;
 
+    let synced_weights = client
+        .sync_weights(if initial_backfill { 365 } else { 35 })
+        .await;
+
     let store = state.load_store()?;
     let acts = synced_activities.len();
     let days_count = synced_days.len();
+    let weights_count = synced_weights.len();
     for a in &synced_activities {
         let _ = db.upsert_activity(a);
     }
     for d in &synced_days {
         let _ = db.upsert_day(d);
     }
+    for w in &synced_weights {
+        let _ = db.upsert_weight_entry(w);
+    }
 
-    let config = store.load_athlete_config().map_err(|e| e.to_string())?.unwrap_or_default();
-    let activities = db.list_activities(200).map_err(|e| e.to_string())?;
+    let mut config = store.load_athlete_config().map_err(|e| e.to_string())?.unwrap_or_default();
+    let all_weights = db.list_weight_entries(400).unwrap_or_default();
+    let mut activities = db.list_activities(200).map_err(|e| e.to_string())?;
+    for a in &mut activities {
+        if let Some(start_ep) = scale_matcher::parse_activity_epoch_sec(&a.start_iso) {
+            let dur = a.moving_duration_sec.max(a.duration_sec).max(0.0);
+            let end_ep = start_ep + a.duration_sec.max(a.moving_duration_sec).max(0.0).round() as i64;
+            let current = a.post_run_context.clone().unwrap_or_default();
+            let paired = scale_matcher::pair_scale_weigh_ins(
+                start_ep,
+                end_ep,
+                dur,
+                &all_weights,
+                current.clone(),
+            );
+            if paired != current {
+                let _ = db.save_post_run_context(a.garmin_id, &paired);
+                a.post_run_context = Some(paired);
+            }
+        }
+    }
+
+    let windows = scale_matcher::activity_windows(&activities);
+    if let Some(baseline_kg) = scale_matcher::latest_baseline_weight_kg(&all_weights, &windows) {
+        if (config.specs.weight_kg.unwrap_or(0.0) - baseline_kg).abs() >= 0.05 {
+            config.specs.weight_kg = Some(baseline_kg);
+            let _ = store.save_athlete_config(&config);
+        }
+    }
+
     let days = db.list_days(60).map_err(|e| e.to_string())?;
+    let plan: Option<PlanFile> = store.read_json("plan.json").ok().flatten();
+    let gear: Option<GearInventoryFile> = store.read_json("gear_inventory.json").ok().flatten();
     let output = ReadinessEngine::evaluate(ReadinessInput {
         now: Utc::now(),
         athlete_config: &config,
         activities: &activities,
         days: &days,
-        plan: None,
-        gear_inventory: None,
+        plan: plan.as_ref(),
+        gear_inventory: gear.as_ref(),
     });
     output.persist(store.root()).map_err(|e| e.to_string())?;
 
     Ok(serde_json::json!({
         "synced_activities": acts,
         "synced_days": days_count,
+        "synced_weights": weights_count,
         "readiness_state": output.readiness_state,
     }))
 }
@@ -199,20 +238,39 @@ async fn sync_garmin_now(state: State<'_, AppState>) -> Result<serde_json::Value
 fn attach_latest_forensic(
     packet: String,
     db: &Database,
+    config: &AthleteConfig,
     activities: &[ActivityRecord],
 ) -> String {
+    let weights = db.list_weight_entries(60).unwrap_or_default();
+    let windows = scale_matcher::activity_windows(activities);
     let tracked = activities.iter().take(5).find_map(|act| {
         db.get_fit_track(act.garmin_id)
             .ok()
             .flatten()
             .map(|track| (act, track))
     });
+    let target_act = tracked.as_ref().map(|(a, _)| *a).or_else(|| activities.first());
+    let ref_epoch = target_act
+        .and_then(|a| scale_matcher::parse_activity_epoch_sec(&a.start_iso))
+        .unwrap_or_else(|| Utc::now().timestamp());
+    let resolved_weight = scale_matcher::resolve_effective_weight(
+        target_act.and_then(|a| a.post_run_context.as_ref()),
+        ref_epoch,
+        &weights,
+        &windows,
+        config.specs.weight_kg,
+    );
     if let Some((act, track)) = tracked {
-        coach::append_forensic_section(packet, Some(act), track.forensic_telemetry.as_ref())
+        coach::append_forensic_section(
+            packet,
+            Some(act),
+            track.forensic_telemetry.as_ref(),
+            resolved_weight.as_ref(),
+        )
     } else if let Some(act) = activities.first() {
-        coach::append_forensic_section(packet, Some(act), None)
+        coach::append_forensic_section(packet, Some(act), None, resolved_weight.as_ref())
     } else {
-        packet
+        coach::append_forensic_section(packet, None, None, resolved_weight.as_ref())
     }
 }
 
@@ -235,7 +293,7 @@ fn build_coach_packet(state: State<'_, AppState>, draft_prompt: String) -> Resul
         &draft_prompt,
         Utc::now(),
     );
-    Ok(attach_latest_forensic(packet, &db, &activities))
+    Ok(attach_latest_forensic(packet, &db, &config, &activities))
 }
 
 #[tauri::command]
@@ -303,12 +361,14 @@ async fn load_or_fetch_fit_track(
 ) -> Result<Option<FitTrackAnalysis>, String> {
     if let Some(mut track) = db.get_fit_track(activity_id).map_err(|e| e.to_string())? {
         if track.forensic_telemetry.is_none() && !track.full_points.is_empty() {
-            track.forensic_telemetry = Some(forensic_extractor::extract_forensic_telemetry(
+            track.forensic_telemetry = Some(forensic_extractor::extract_forensic_telemetry_with_source(
                 &track.full_points,
                 &[],
+                &track.temp_source,
             ));
             let _ = db.upsert_fit_track(activity_id, &track);
         }
+        let _ = db.set_activity_fit_temp_source(activity_id, &track.temp_source);
         return Ok(Some(track));
     }
 
@@ -319,6 +379,7 @@ async fn load_or_fetch_fit_track(
         Ok(bytes) => match garmin::parse_fit_track(activity_id, &bytes, &config) {
             Ok(parsed) => {
                 let _ = db.upsert_fit_track(activity_id, &parsed);
+                let _ = db.set_activity_fit_temp_source(activity_id, &parsed.temp_source);
                 Some(parsed)
             }
             Err(_) => None,
@@ -335,11 +396,11 @@ async fn get_activity_detail(
 ) -> Result<ActivityDetailPayload, String> {
     let store = state.load_store()?;
     let db = state.open_db()?;
+    let track = load_or_fetch_fit_track(&store, &db, activity_id).await?;
     let activity = db
         .get_activity(activity_id)
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("Activity {activity_id} not found"))?;
-    let track = load_or_fetch_fit_track(&store, &db, activity_id).await?;
     Ok(ActivityDetailPayload { activity, track })
 }
 
@@ -383,7 +444,7 @@ async fn send_coach_message(
             &prompt,
             Utc::now(),
         );
-        let packet = attach_latest_forensic(packet, &db, &activities);
+        let packet = attach_latest_forensic(packet, &db, &config, &activities);
         Ok(serde_json::json!({
             "mode": "clipboard_packet",
             "packet": packet,

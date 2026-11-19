@@ -340,6 +340,19 @@ pub fn gemini_tool_declarations() -> Value {
                 },
                 "required": ["entry_markdown"]
             }
+        },
+        {
+            "name": "update_post_run_context",
+            "description": "Update an activity's PostRunContext with confirmed intra-run fluid intake (ml) and/or external Garmin Tempe usage, recomputing provisional vs final Sweat Matrix rates.",
+            "parameters": {
+                "type": "OBJECT",
+                "properties": {
+                    "activity_id": { "type": "STRING" },
+                    "fluid_consumed_ml": { "type": "NUMBER" },
+                    "tempe_sensor_used": { "type": "BOOLEAN" }
+                },
+                "required": ["activity_id"]
+            }
         }
     ])
 }
@@ -399,6 +412,7 @@ fn tool_status_label(name: &str) -> &'static str {
         "query_run_slice" => "Inspecting run kilometer slice…",
         "fetch_1hz_window" => "Fetching 1Hz second-by-second window…",
         "append_training_ledger" => "Appending entry to ASPI_Training_Log.txt…",
+        "update_post_run_context" => "Updating post-run hydration & Tempe status…",
         _ => "Running coach tool…",
     }
 }
@@ -616,24 +630,61 @@ fn execute_tool(
             }
         }
         "get_activity_detail" => {
-            let raw_id = args["activity_id"].as_str().unwrap_or("latest");
-            let target_act = match raw_id {
-                "latest" => activities.first(),
-                "latest_run" => activities.iter().find(|a| a.type_key.to_lowercase().contains("run")),
-                other => other.parse::<i64>().ok().and_then(|id| activities.iter().find(|a| a.garmin_id == id)),
-            };
-            if let Some(act) = target_act {
+            let raw_id = args["activity_id"]
+                .as_str()
+                .map(|s| s.to_string())
+                .or_else(|| args["activity_id"].as_i64().map(|id| id.to_string()))
+                .unwrap_or_else(|| "latest".to_string());
+            if let Some(act_ref) = resolve_activity_ref(&raw_id, activities) {
+                let act = db
+                    .and_then(|d| d.get_activity(act_ref.garmin_id).ok())
+                    .flatten()
+                    .unwrap_or_else(|| act_ref.clone());
                 let track = db.and_then(|d| d.get_fit_track(act.garmin_id).ok()).flatten();
+                let ctx = act.post_run_context.as_ref();
+                let effective_temp_source = ctx
+                    .map(|c| c.effective_temp_source(track.as_ref().map(|t| t.temp_source.as_str()).or(act.fit_temp_source.as_deref())))
+                    .unwrap_or_else(|| {
+                        track
+                            .as_ref()
+                            .map(|t| t.temp_source.clone())
+                            .or_else(|| act.fit_temp_source.clone())
+                            .unwrap_or_else(default_temp_source)
+                    });
+                let weights = db.and_then(|d| d.list_weight_entries(60).ok()).unwrap_or_default();
+                let windows = scale_matcher::activity_windows(activities);
+                let cfg = store.load_athlete_config().ok().flatten().unwrap_or_default();
+                let ref_epoch = scale_matcher::parse_activity_epoch_sec(&act.start_iso)
+                    .unwrap_or_else(|| Utc::now().timestamp());
+                let resolved_weight = scale_matcher::resolve_effective_weight(
+                    ctx,
+                    ref_epoch,
+                    &weights,
+                    &windows,
+                    cfg.specs.weight_kg,
+                );
+                let mut forensic = track.as_ref().and_then(|t| t.forensic_telemetry.clone());
+                if let Some(ref mut f) = forensic {
+                    f.temp_source = effective_temp_source.clone();
+                }
+
                 json!({
                     "activity": act,
                     "is_hyrox": act.is_hyrox,
                     "post_run_context": act.post_run_context,
+                    "sweat_status": ctx.and_then(|c| c.sweat_status.as_deref()),
+                    "provisional_sweat_rate_l_hr": ctx.and_then(|c| c.provisional_sweat_rate_l_hr),
+                    "final_sweat_rate_l_hr": ctx.and_then(|c| c.final_sweat_rate_l_hr),
+                    "effective_weight_kg": resolved_weight.as_ref().map(|w| w.weight_kg),
+                    "weight_source": resolved_weight.as_ref().map(|w| w.source.as_str()),
+                    "is_weight_provisional": resolved_weight.as_ref().map(|w| w.is_provisional),
+                    "temp_source": effective_temp_source,
                     "fit_track_cached": track.is_some(),
                     "splits": track.as_ref().map(|t| &t.splits),
                     "laps": track.as_ref().map(|t| &t.laps),
                     "compromised_run_audit": track.as_ref().and_then(|t| t.compromised_run_audit.as_ref()),
                     "hyrox_dissection": track.as_ref().and_then(|t| t.hyrox_dissection.as_ref()),
-                    "forensic_telemetry": track.as_ref().and_then(|t| t.forensic_telemetry.as_ref()),
+                    "forensic_telemetry": forensic,
                     "decoupling_pct": track.as_ref().and_then(|t| t.decoupling_pct),
                     "guardrail_audit": track.as_ref().map(|t| &t.audit),
                 })
@@ -689,12 +740,7 @@ fn execute_tool(
             let end_sec = args["end_second"].as_f64().unwrap_or(60.0);
             let step_sec = args["step_seconds"].as_i64().unwrap_or(1).max(1) as usize;
 
-            let target_act = match raw_id.as_str() {
-                "latest" => activities.first(),
-                "latest_run" => activities.iter().find(|a| a.type_key.to_lowercase().contains("run")),
-                other => other.parse::<i64>().ok().and_then(|id| activities.iter().find(|a| a.garmin_id == id)),
-            };
-            if let Some(act) = target_act {
+            if let Some(act) = resolve_activity_ref(&raw_id, activities) {
                 if let Some(Some(track)) = db.and_then(|d| d.get_fit_track(act.garmin_id).ok()) {
                     fetch_1hz_window_from_track(&track, start_sec, end_sec, step_sec)
                 } else {
@@ -711,8 +757,86 @@ fn execute_tool(
                 Err(e) => json!({ "error": e }),
             }
         }
+        "update_post_run_context" => {
+            let raw_id = args["activity_id"]
+                .as_str()
+                .map(|s| s.to_string())
+                .or_else(|| args["activity_id"].as_i64().map(|id| id.to_string()))
+                .unwrap_or_else(|| "latest".to_string());
+            let fluid_ml = args.get("fluid_consumed_ml").and_then(|v| v.as_f64());
+            let tempe_used = args.get("tempe_sensor_used").and_then(|v| v.as_bool());
+            if let (Some(database), Some(act)) = (db, resolve_activity_ref(&raw_id, activities)) {
+                match apply_post_run_context_tool_update(database, act, fluid_ml, tempe_used) {
+                    Ok(v) => v,
+                    Err(e) => json!({ "error": e }),
+                }
+            } else {
+                json!({ "error": format!("Could not update post_run_context for activity '{raw_id}'.") })
+            }
+        }
         _ => json!({ "status": "ok", "note": "Local summary returned", "count": activities.len() }),
     }
+}
+
+fn resolve_activity_ref<'a>(raw_id: &str, activities: &'a [ActivityRecord]) -> Option<&'a ActivityRecord> {
+    let trimmed = raw_id.trim().to_lowercase();
+    match trimmed.as_str() {
+        "" | "latest" => activities.first(),
+        "latest_run" => activities
+            .iter()
+            .find(|a| a.type_key.to_lowercase().contains("run"))
+            .or_else(|| activities.first()),
+        other => other
+            .parse::<i64>()
+            .ok()
+            .and_then(|id| activities.iter().find(|a| a.garmin_id == id)),
+    }
+}
+
+pub fn apply_post_run_context_tool_update(
+    db: &Database,
+    activity: &ActivityRecord,
+    fluid_consumed_ml: Option<f64>,
+    tempe_sensor_used: Option<bool>,
+) -> Result<Value, String> {
+    let latest_act = db
+        .get_activity(activity.garmin_id)
+        .map_err(|e| e.to_string())?
+        .unwrap_or_else(|| activity.clone());
+    let mut ctx = latest_act.post_run_context.clone().unwrap_or_default();
+    if let Some(fluid) = fluid_consumed_ml {
+        ctx.fluid_consumed_ml = Some(fluid.max(0.0));
+        ctx.fluid_intake_confirmed = true;
+    }
+    if let Some(tempe) = tempe_sensor_used {
+        ctx.tempe_sensor_used = Some(tempe);
+    }
+    let dur = if latest_act.moving_duration_sec > 0.0 {
+        latest_act.moving_duration_sec
+    } else {
+        latest_act.duration_sec
+    };
+    let computed = ctx.with_computed_sweat(dur);
+    db.save_post_run_context(latest_act.garmin_id, &computed)
+        .map_err(|e| e.to_string())?;
+    let track = db.get_fit_track(latest_act.garmin_id).ok().flatten();
+    let eff_temp = computed.effective_temp_source(
+        track
+            .as_ref()
+            .map(|t| t.temp_source.as_str())
+            .or(latest_act.fit_temp_source.as_deref()),
+    );
+    Ok(json!({
+        "status": "updated",
+        "activity_id": latest_act.garmin_id,
+        "fluid_consumed_ml": computed.fluid_consumed_ml,
+        "fluid_intake_confirmed": computed.fluid_intake_confirmed,
+        "sweat_status": computed.sweat_status,
+        "provisional_sweat_rate_l_hr": computed.provisional_sweat_rate_l_hr,
+        "final_sweat_rate_l_hr": computed.final_sweat_rate_l_hr,
+        "tempe_sensor_used": computed.tempe_sensor_used,
+        "temp_source": eff_temp,
+    }))
 }
 
 fn parse_iso(raw: &str) -> Option<DateTime<Utc>> {
@@ -1122,7 +1246,7 @@ pub fn build_static_system_instruction(
     let needs_setup = profile_md.trim().is_empty() || plan_md.trim().is_empty();
 
     let mut sections = vec![
-        "You are a Living Markdown training-planning coach inside Splits Coach. Use metric units (km, min/km, bpm, kg). Always use `propose_coach_update` for Markdown changes. Use `get_recent_activities`, `get_activity_detail`, `get_wellness_history`, `get_training_load_and_records`, `get_readiness_and_plan`, `get_lifetime_and_yearly_history`, and `query_run_slice` for drill-downs.".to_string(),
+        "You are a Living Markdown training-planning coach inside Splits Coach. Use metric units (km, min/km, bpm, kg). Always use `propose_coach_update` for Markdown changes. Use `get_recent_activities`, `get_activity_detail`, `get_wellness_history`, `get_training_load_and_records`, `get_readiness_and_plan`, `get_lifetime_and_yearly_history`, `fetch_1hz_window`, `append_training_ledger`, `update_post_run_context`, and `query_run_slice` for drill-downs. Sweat Matrix Rule: when analyzing a run with `sweat_status == \"provisional_no_intake\"`, report the provisional sweat rate and ask if the user had any intra-run fluid intake, then call `update_post_run_context` once confirmed (`0` ml if none). Weight Fallback Rule: inspect `weight_source` — when set to `\"profile_baseline\"` or `\"latest_14d_weigh_in\"`, label derived sweat/weight metrics provisional. Hybrid Tempe Rule: when `temp_source == \"watch_internal\"` and temperature data exists, check the user's post-run message for any mention of a Garmin Tempe sensor and call `update_post_run_context(tempe_sensor_used: true)` -> `\"user_confirmed_tempe\"` if mentioned, or ask the user to confirm whether a Tempe sensor was worn before treating temperature spikes as external ambient heat rather than wrist skin warmth.".to_string(),
         format!("=== ATHLETE CONFIG ===\n{}", config.prompt_summary(None)),
     ];
     if let Some(profile) = user_profile {
@@ -1149,8 +1273,16 @@ pub fn append_forensic_section(
     packet: String,
     activity: Option<&ActivityRecord>,
     report: Option<&crate::forensic_extractor::ForensicTelemetryReport>,
+    resolved_weight: Option<&ResolvedWeight>,
 ) -> String {
     let mut blocks: Vec<String> = Vec::new();
+    if let Some(w) = resolved_weight {
+        let prov = if w.is_provisional { ", provisional" } else { "" };
+        blocks.push(format!(
+            "## Weight Source Metadata\n- **Effective Weight**: {:.1} kg (`weight_source`: {}{})",
+            w.weight_kg, w.source, prov
+        ));
+    }
     if let Some(rep) = report {
         let label = activity
             .map(|a| {
@@ -1162,9 +1294,13 @@ pub fn append_forensic_section(
                 }
             })
             .unwrap_or_else(|| "Latest Tracked Run".to_string());
+        let mut rep_clone = rep.clone();
+        if let Some(ctx) = activity.and_then(|a| a.post_run_context.as_ref()) {
+            rep_clone.temp_source = ctx.effective_temp_source(Some(&rep.temp_source));
+        }
         blocks.push(format!(
             "## 1Hz Forensic Telemetry ({label})\n{}",
-            rep.to_markdown_summary()
+            rep_clone.to_markdown_summary()
         ));
     }
     if let Some(ctx) = activity.and_then(|a| a.post_run_context.as_ref()) {
@@ -1177,17 +1313,26 @@ pub fn append_forensic_section(
             ).trim().to_string());
         }
         if let (Some(pre), Some(post)) = (ctx.pre_run_weight_kg, ctx.post_run_weight_kg) {
+            let ws = ctx.weight_source.as_deref().unwrap_or("manual");
             lines.push(format!(
-                "- **Weights**: Pre {pre:.2} kg -> Post {post:.2} kg (Fluid {} ml)",
-                ctx.fluid_consumed_ml.map(|f| format!("{f:.0}")).unwrap_or_else(|| "0".to_string())
+                "- **Weights**: Pre {pre:.2} kg -> Post {post:.2} kg (Fluid {} ml · confirmed={} · `weight_source`: {ws})",
+                ctx.fluid_consumed_ml.map(|f| format!("{f:.0}")).unwrap_or_else(|| "0".to_string()),
+                ctx.fluid_intake_confirmed
             ));
         }
-        if let Some(def) = ctx.net_fluid_deficit_kg {
-            lines.push(format!("- **Net Fluid Deficit**: {def:.2} kg"));
+        if let Some(ref status) = ctx.sweat_status {
+            lines.push(format!("- **Sweat Status**: {status}"));
         }
-        if let Some(rate) = ctx.net_sweat_rate_l_hr {
-            lines.push(format!("- **Net Sweat Rate**: {rate:.2} L/hr"));
+        if let Some(prov) = ctx.provisional_sweat_rate_l_hr {
+            lines.push(format!("- **Provisional Sweat Rate (pre - post)**: {prov:.2} L/hr"));
         }
+        if let Some(fin) = ctx.final_sweat_rate_l_hr {
+            lines.push(format!("- **Final Verified Sweat Rate**: {fin:.2} L/hr"));
+        }
+        lines.push(format!(
+            "- **Effective Temp Source**: {}",
+            ctx.effective_temp_source(activity.and_then(|a| a.fit_temp_source.as_deref()))
+        ));
         let o = &ctx.orthopedic;
         if o.left_achilles > 0 || o.lumbar_sciatica > 0 || o.right_ankle > 0 || o.calves_soleus > 0 {
             lines.push(format!(

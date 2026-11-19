@@ -234,12 +234,22 @@ impl Database {
                 onboarding_completed INTEGER NOT NULL DEFAULT 0,
                 runner_config_json TEXT NOT NULL DEFAULT '{}',
                 hyrox_config_json TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE TABLE IF NOT EXISTS weight_entries (
+                timestamp_epoch_sec INTEGER PRIMARY KEY,
+                timestamp_iso TEXT NOT NULL,
+                weight_kg REAL NOT NULL,
+                body_fat_pct REAL,
+                body_water_pct REAL,
+                muscle_mass_kg REAL,
+                source TEXT NOT NULL DEFAULT 'garmin_scale'
             );",
         )?;
         let conn = self.conn.lock().unwrap();
         // Backwards-compatible column additions on existing databases
         let _ = conn.execute("ALTER TABLE activities ADD COLUMN is_hyrox INTEGER", []);
         let _ = conn.execute("ALTER TABLE activities ADD COLUMN post_run_context_json TEXT", []);
+        let _ = conn.execute("ALTER TABLE activities ADD COLUMN fit_temp_source TEXT", []);
 
         let has_profile: i64 = conn.query_row(
             "SELECT COUNT(*) FROM user_profile WHERE id = 1",
@@ -318,6 +328,59 @@ impl Database {
         Ok(())
     }
 
+    pub fn set_activity_fit_temp_source(&self, garmin_id: i64, temp_source: &str) -> Result<(), StorageError> {
+        self.conn.lock().unwrap().execute(
+            "UPDATE activities SET fit_temp_source = ?1 WHERE garmin_id = ?2",
+            params![temp_source, garmin_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn upsert_weight_entry(&self, entry: &WeightEntry) -> Result<(), StorageError> {
+        self.conn.lock().unwrap().execute(
+            "INSERT INTO weight_entries (
+                timestamp_epoch_sec, timestamp_iso, weight_kg, body_fat_pct, body_water_pct, muscle_mass_kg, source
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            ON CONFLICT(timestamp_epoch_sec) DO UPDATE SET
+                timestamp_iso = excluded.timestamp_iso,
+                weight_kg = excluded.weight_kg,
+                body_fat_pct = COALESCE(excluded.body_fat_pct, weight_entries.body_fat_pct),
+                body_water_pct = COALESCE(excluded.body_water_pct, weight_entries.body_water_pct),
+                muscle_mass_kg = COALESCE(excluded.muscle_mass_kg, weight_entries.muscle_mass_kg),
+                source = excluded.source",
+            params![
+                entry.timestamp_epoch_sec,
+                entry.timestamp_iso,
+                entry.weight_kg,
+                entry.body_fat_pct,
+                entry.body_water_pct,
+                entry.muscle_mass_kg,
+                entry.source
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_weight_entries(&self, limit: usize) -> Result<Vec<WeightEntry>, StorageError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT timestamp_epoch_sec, timestamp_iso, weight_kg, body_fat_pct, body_water_pct, muscle_mass_kg, source
+             FROM weight_entries ORDER BY timestamp_epoch_sec DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit as i64], |r| {
+            Ok(WeightEntry {
+                timestamp_epoch_sec: r.get(0)?,
+                timestamp_iso: r.get(1)?,
+                weight_kg: r.get(2)?,
+                body_fat_pct: r.get(3)?,
+                body_water_pct: r.get(4)?,
+                muscle_mass_kg: r.get(5)?,
+                source: r.get(6)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
     pub fn upsert_activity(&self, act: &ActivityRecord) -> Result<(), StorageError> {
         let hyrox_int = act.is_hyrox.map(|b| if b { 1i64 } else { 0i64 });
         let post_run_json = act
@@ -327,8 +390,8 @@ impl Database {
         self.conn.lock().unwrap().execute(
             "INSERT INTO activities (
                 garmin_id, name, type_key, start_iso, distance_m, duration_sec, moving_duration_sec,
-                elevation_gain_m, average_hr, max_hr, cadence_spm, training_load, shoe_name, is_hyrox, post_run_context_json
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+                elevation_gain_m, average_hr, max_hr, cadence_spm, training_load, shoe_name, is_hyrox, post_run_context_json, fit_temp_source
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
             ON CONFLICT(garmin_id) DO UPDATE SET
                 name=excluded.name, type_key=excluded.type_key, start_iso=excluded.start_iso,
                 distance_m=excluded.distance_m, duration_sec=excluded.duration_sec,
@@ -336,12 +399,13 @@ impl Database {
                 average_hr=excluded.average_hr, max_hr=excluded.max_hr, cadence_spm=excluded.cadence_spm,
                 training_load=excluded.training_load, shoe_name=excluded.shoe_name,
                 is_hyrox=COALESCE(excluded.is_hyrox, activities.is_hyrox),
-                post_run_context_json=COALESCE(excluded.post_run_context_json, activities.post_run_context_json)",
+                post_run_context_json=COALESCE(excluded.post_run_context_json, activities.post_run_context_json),
+                fit_temp_source=COALESCE(excluded.fit_temp_source, activities.fit_temp_source)",
             params![
                 act.garmin_id, act.name, act.type_key, act.start_iso, act.distance_m,
                 act.duration_sec, act.moving_duration_sec, act.elevation_gain_m,
                 act.average_hr, act.max_hr, act.cadence_spm, act.training_load, act.shoe_name,
-                hyrox_int, post_run_json
+                hyrox_int, post_run_json, act.fit_temp_source
             ],
         )?;
         Ok(())
@@ -351,7 +415,7 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT garmin_id, name, type_key, start_iso, distance_m, duration_sec, moving_duration_sec,
-                    elevation_gain_m, average_hr, max_hr, cadence_spm, training_load, shoe_name, is_hyrox, post_run_context_json
+                    elevation_gain_m, average_hr, max_hr, cadence_spm, training_load, shoe_name, is_hyrox, post_run_context_json, fit_temp_source
              FROM activities ORDER BY start_iso DESC LIMIT ?1",
         )?;
         let rows = stmt.query_map(params![limit as i64], |r| {
@@ -373,6 +437,7 @@ impl Database {
                 shoe_name: r.get(12)?,
                 is_hyrox: hyrox_opt.map(|v| v != 0),
                 post_run_context: post_run_str.and_then(|s| serde_json::from_str(&s).ok()),
+                fit_temp_source: r.get(15)?,
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -433,7 +498,7 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT garmin_id, name, type_key, start_iso, distance_m, duration_sec, moving_duration_sec,
-                    elevation_gain_m, average_hr, max_hr, cadence_spm, training_load, shoe_name, is_hyrox, post_run_context_json
+                    elevation_gain_m, average_hr, max_hr, cadence_spm, training_load, shoe_name, is_hyrox, post_run_context_json, fit_temp_source
              FROM activities WHERE garmin_id = ?1 LIMIT 1",
         )?;
         let mut rows = stmt.query_map(params![garmin_id], |r| {
@@ -455,6 +520,7 @@ impl Database {
                 shoe_name: r.get(12)?,
                 is_hyrox: hyrox_opt.map(|v| v != 0),
                 post_run_context: post_run_str.and_then(|s| serde_json::from_str(&s).ok()),
+                fit_temp_source: r.get(15)?,
             })
         })?;
         match rows.next() {

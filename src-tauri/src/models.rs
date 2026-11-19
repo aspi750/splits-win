@@ -615,6 +615,10 @@ pub struct GearInventoryFile {
     pub pending: Vec<GearPendingItem>,
 }
 
+pub fn default_temp_source() -> String {
+    "watch_internal".to_string()
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct OrthopedicCheckIn {
     pub left_achilles: i32,
@@ -633,22 +637,242 @@ pub struct PostRunContext {
     pub net_fluid_deficit_kg: Option<f64>,
     pub net_sweat_rate_l_hr: Option<f64>,
     pub orthopedic: OrthopedicCheckIn,
+    #[serde(default)]
+    pub pre_weight_manually_edited: bool,
+    #[serde(default)]
+    pub post_weight_manually_edited: bool,
+    #[serde(default)]
+    pub fluid_intake_confirmed: bool,
+    #[serde(default)]
+    pub weight_source: Option<String>,
+    #[serde(default)]
+    pub sweat_status: Option<String>,
+    #[serde(default)]
+    pub provisional_sweat_rate_l_hr: Option<f64>,
+    #[serde(default)]
+    pub final_sweat_rate_l_hr: Option<f64>,
+    #[serde(default)]
+    pub tempe_sensor_used: Option<bool>,
 }
 
 impl PostRunContext {
+    pub fn effective_temp_source(&self, fit_temp_source: Option<&str>) -> String {
+        if fit_temp_source == Some("garmin_tempe_fit") {
+            return "garmin_tempe_fit".to_string();
+        }
+        if self.tempe_sensor_used == Some(true) {
+            return "user_confirmed_tempe".to_string();
+        }
+        "watch_internal".to_string()
+    }
+
     pub fn with_computed_sweat(mut self, duration_sec: f64) -> Self {
         if let (Some(pre), Some(post)) = (self.pre_run_weight_kg, self.post_run_weight_kg) {
             if pre > 0.0 && post > 0.0 {
-                let fluid_l = self.fluid_consumed_ml.unwrap_or(0.0) / 1000.0;
-                let deficit = ((pre - post + fluid_l) * 100.0).round() / 100.0;
-                self.net_fluid_deficit_kg = Some(deficit);
-                if duration_sec > 60.0 {
+                let prov_deficit = ((pre - post) * 100.0).round() / 100.0;
+                let prov_rate = if duration_sec > 60.0 {
                     let hrs = duration_sec / 3600.0;
-                    self.net_sweat_rate_l_hr = Some(((deficit / hrs) * 100.0).round() / 100.0);
+                    Some(((prov_deficit / hrs) * 100.0).round() / 100.0)
+                } else {
+                    None
+                };
+                self.provisional_sweat_rate_l_hr = prov_rate;
+
+                if self.fluid_intake_confirmed {
+                    let fluid_l = self.fluid_consumed_ml.unwrap_or(0.0) / 1000.0;
+                    let fin_deficit = ((pre - post + fluid_l) * 100.0).round() / 100.0;
+                    self.net_fluid_deficit_kg = Some(fin_deficit);
+                    if duration_sec > 60.0 {
+                        let hrs = duration_sec / 3600.0;
+                        let rate = ((fin_deficit / hrs) * 100.0).round() / 100.0;
+                        self.final_sweat_rate_l_hr = Some(rate);
+                        self.net_sweat_rate_l_hr = Some(rate);
+                    } else {
+                        self.final_sweat_rate_l_hr = None;
+                        self.net_sweat_rate_l_hr = None;
+                    }
+                    self.sweat_status = Some("final_verified".to_string());
+                } else {
+                    self.net_fluid_deficit_kg = Some(prov_deficit);
+                    self.final_sweat_rate_l_hr = None;
+                    self.net_sweat_rate_l_hr = prov_rate;
+                    self.sweat_status = Some("provisional_no_intake".to_string());
+                }
+                return self;
+            }
+        }
+        self.net_fluid_deficit_kg = None;
+        self.net_sweat_rate_l_hr = None;
+        self.provisional_sweat_rate_l_hr = None;
+        self.final_sweat_rate_l_hr = None;
+        self.sweat_status = None;
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WeightEntry {
+    pub timestamp_epoch_sec: i64,
+    pub timestamp_iso: String,
+    pub weight_kg: f64,
+    pub body_fat_pct: Option<f64>,
+    pub body_water_pct: Option<f64>,
+    pub muscle_mass_kg: Option<f64>,
+    pub source: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ResolvedWeight {
+    pub weight_kg: f64,
+    pub source: String,
+    pub is_provisional: bool,
+}
+
+pub mod scale_matcher {
+    use super::{ActivityRecord, PostRunContext, ResolvedWeight, WeightEntry};
+    use chrono::{DateTime, Local, NaiveDateTime, TimeZone, Utc};
+
+    pub fn parse_activity_epoch_sec(raw: &str) -> Option<i64> {
+        let trimmed = raw.trim();
+        if let Ok(dt) = DateTime::parse_from_rfc3339(trimmed) {
+            return Some(dt.with_timezone(&Utc).timestamp());
+        }
+        let prefix = trimmed.chars().take(19).collect::<String>();
+        for fmt in ["%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"] {
+            if let Ok(ndt) = NaiveDateTime::parse_from_str(&prefix, fmt) {
+                if let Some(local_dt) = Local.from_local_datetime(&ndt).single() {
+                    return Some(local_dt.with_timezone(&Utc).timestamp());
+                }
+                return Some(DateTime::<Utc>::from_naive_utc_and_offset(ndt, Utc).timestamp());
+            }
+        }
+        None
+    }
+
+    pub fn activity_windows(activities: &[ActivityRecord]) -> Vec<(i64, i64)> {
+        activities
+            .iter()
+            .filter_map(|a| {
+                let start = parse_activity_epoch_sec(&a.start_iso)?;
+                let dur = a.duration_sec.max(a.moving_duration_sec).max(0.0).round() as i64;
+                Some((start, start + dur))
+            })
+            .collect()
+    }
+
+    pub fn is_post_run_dehydrated(weigh_in_epoch: i64, windows: &[(i64, i64)]) -> bool {
+        windows
+            .iter()
+            .any(|&(_start, end)| weigh_in_epoch >= end - 5 * 60 && weigh_in_epoch <= end + 90 * 60)
+    }
+
+    /// Returns the newest morning / pre-run Garmin Scale weight, never updating from dehydrated post-run weigh-ins.
+    pub fn latest_baseline_weight_kg(
+        weigh_ins: &[WeightEntry],
+        windows: &[(i64, i64)],
+    ) -> Option<f64> {
+        weigh_ins
+            .iter()
+            .filter(|w| w.weight_kg > 0.0 && !is_post_run_dehydrated(w.timestamp_epoch_sec, windows))
+            .max_by_key(|w| w.timestamp_epoch_sec)
+            .map(|w| w.weight_kg)
+    }
+
+    pub fn pair_scale_weigh_ins(
+        activity_start_epoch: i64,
+        activity_end_epoch: i64,
+        duration_sec: f64,
+        weigh_ins: &[WeightEntry],
+        existing: PostRunContext,
+    ) -> PostRunContext {
+        let mut ctx = existing;
+        let pre_lo = activity_start_epoch - 120 * 60;
+        let pre_hi = activity_start_epoch + 10 * 60;
+        if !ctx.pre_weight_manually_edited {
+            if let Some(pre) = weigh_ins
+                .iter()
+                .filter(|w| {
+                    w.source == "garmin_scale"
+                        && w.weight_kg > 0.0
+                        && w.timestamp_epoch_sec >= pre_lo
+                        && w.timestamp_epoch_sec <= pre_hi
+                })
+                .min_by_key(|w| (w.timestamp_epoch_sec - activity_start_epoch).abs())
+            {
+                ctx.pre_run_weight_kg = Some(pre.weight_kg);
+                ctx.weight_source = Some("garmin_scale".to_string());
+            }
+        }
+
+        let post_lo = activity_end_epoch - 5 * 60;
+        let post_hi = activity_end_epoch + 90 * 60;
+        if !ctx.post_weight_manually_edited {
+            if let Some(post) = weigh_ins
+                .iter()
+                .filter(|w| {
+                    w.source == "garmin_scale"
+                        && w.weight_kg > 0.0
+                        && w.timestamp_epoch_sec >= post_lo
+                        && w.timestamp_epoch_sec <= post_hi
+                })
+                .min_by_key(|w| (w.timestamp_epoch_sec - activity_end_epoch).abs())
+            {
+                ctx.post_run_weight_kg = Some(post.weight_kg);
+                if ctx.weight_source.is_none() {
+                    ctx.weight_source = Some("garmin_scale".to_string());
                 }
             }
         }
-        self
+
+        ctx.with_computed_sweat(duration_sec)
+    }
+
+    pub fn resolve_effective_weight(
+        post_run: Option<&PostRunContext>,
+        ref_epoch: i64,
+        weigh_ins: &[WeightEntry],
+        windows: &[(i64, i64)],
+        profile_weight_kg: Option<f64>,
+    ) -> Option<ResolvedWeight> {
+        if let Some(ctx) = post_run {
+            if let Some(pre) = ctx.pre_run_weight_kg.filter(|&w| w > 0.0) {
+                let source = if ctx.pre_weight_manually_edited {
+                    "manual".to_string()
+                } else {
+                    ctx.weight_source.clone().unwrap_or_else(|| "manual".to_string())
+                };
+                return Some(ResolvedWeight {
+                    weight_kg: pre,
+                    source,
+                    is_provisional: false,
+                });
+            }
+        }
+        let cutoff = ref_epoch - 14 * 86_400;
+        if let Some(recent) = weigh_ins
+            .iter()
+            .filter(|w| {
+                w.weight_kg > 0.0
+                    && w.timestamp_epoch_sec >= cutoff
+                    && w.timestamp_epoch_sec <= ref_epoch
+                    && !is_post_run_dehydrated(w.timestamp_epoch_sec, windows)
+            })
+            .max_by_key(|w| w.timestamp_epoch_sec)
+        {
+            return Some(ResolvedWeight {
+                weight_kg: recent.weight_kg,
+                source: "latest_14d_weigh_in".to_string(),
+                is_provisional: true,
+            });
+        }
+        if let Some(base) = profile_weight_kg.filter(|&w| w > 0.0) {
+            return Some(ResolvedWeight {
+                weight_kg: base,
+                source: "profile_baseline".to_string(),
+                is_provisional: true,
+            });
+        }
+        None
     }
 }
 
@@ -671,6 +895,8 @@ pub struct ActivityRecord {
     pub is_hyrox: Option<bool>,
     #[serde(default)]
     pub post_run_context: Option<PostRunContext>,
+    #[serde(default)]
+    pub fit_temp_source: Option<String>,
 }
 
 impl ActivityRecord {
@@ -1004,6 +1230,8 @@ pub struct FitTrackAnalysis {
     pub hyrox_dissection: Option<HyroxDissection>,
     #[serde(default)]
     pub forensic_telemetry: Option<crate::forensic_extractor::ForensicTelemetryReport>,
+    #[serde(default = "default_temp_source")]
+    pub temp_source: String,
     pub decoupling_pct: Option<f64>,
     pub audit: FitGuardrailAudit,
 }

@@ -1323,6 +1323,22 @@ function ActivityDetailView({
   const [fluidMl, setFluidMl] = useState(
     a.post_run_context?.fluid_consumed_ml != null ? String(a.post_run_context.fluid_consumed_ml) : ""
   );
+  const [fluidIntakeConfirmed, setFluidIntakeConfirmed] = useState(
+    Boolean(a.post_run_context?.fluid_intake_confirmed)
+  );
+  const [tempeChoice, setTempeChoice] = useState<"unconfirmed" | "yes" | "no">(
+    a.post_run_context?.tempe_sensor_used === true
+      ? "yes"
+      : a.post_run_context?.tempe_sensor_used === false
+        ? "no"
+        : "unconfirmed"
+  );
+  const [initialPreWeight, setInitialPreWeight] = useState(
+    a.post_run_context?.pre_run_weight_kg != null ? String(a.post_run_context.pre_run_weight_kg) : ""
+  );
+  const [initialPostWeight, setInitialPostWeight] = useState(
+    a.post_run_context?.post_run_weight_kg != null ? String(a.post_run_context.post_run_weight_kg) : ""
+  );
   const [leftAchilles, setLeftAchilles] = useState(
     String(a.post_run_context?.orthopedic?.left_achilles ?? 0)
   );
@@ -1341,11 +1357,19 @@ function ActivityDetailView({
 
   useEffect(() => {
     const ctx = a.post_run_context;
+    const preStr = ctx?.pre_run_weight_kg != null ? String(ctx.pre_run_weight_kg) : "";
+    const postStr = ctx?.post_run_weight_kg != null ? String(ctx.post_run_weight_kg) : "";
     setShoeModel(ctx?.shoe_model || a.shoe_name || "");
     setShoeSize(ctx?.shoe_size ?? "");
-    setPreWeight(ctx?.pre_run_weight_kg != null ? String(ctx.pre_run_weight_kg) : "");
-    setPostWeight(ctx?.post_run_weight_kg != null ? String(ctx.post_run_weight_kg) : "");
+    setPreWeight(preStr);
+    setPostWeight(postStr);
+    setInitialPreWeight(preStr);
+    setInitialPostWeight(postStr);
     setFluidMl(ctx?.fluid_consumed_ml != null ? String(ctx.fluid_consumed_ml) : "");
+    setFluidIntakeConfirmed(Boolean(ctx?.fluid_intake_confirmed));
+    setTempeChoice(
+      ctx?.tempe_sensor_used === true ? "yes" : ctx?.tempe_sensor_used === false ? "no" : "unconfirmed"
+    );
     setLeftAchilles(String(ctx?.orthopedic?.left_achilles ?? 0));
     setLumbarSciatica(String(ctx?.orthopedic?.lumbar_sciatica ?? 0));
     setRightAnkle(String(ctx?.orthopedic?.right_ankle ?? 0));
@@ -1357,15 +1381,27 @@ function ActivityDetailView({
   const preNum = parseOptionalNum(preWeight);
   const postNum = parseOptionalNum(postWeight);
   const fluidNum = parseOptionalNum(fluidMl) ?? 0;
-  const liveDeficitKg =
+  const liveProvisionalLossKg =
     preNum != null && postNum != null && preNum > 0 && postNum > 0
-      ? preNum - postNum + fluidNum / 1000
+      ? preNum - postNum
+      : null;
+  const liveFinalLossKg =
+    fluidIntakeConfirmed && liveProvisionalLossKg != null
+      ? liveProvisionalLossKg + fluidNum / 1000
       : null;
   const durHours = durSec / 3600;
-  const liveSweatRateLHr =
-    liveDeficitKg != null && durSec > 60
-      ? liveDeficitKg / durHours
-      : null;
+  const liveProvisionalSweatRateLHr =
+    liveProvisionalLossKg != null && durSec > 60 ? liveProvisionalLossKg / durHours : null;
+  const liveFinalSweatRateLHr =
+    liveFinalLossKg != null && durSec > 60 ? liveFinalLossKg / durHours : null;
+
+  const baseTempSource = track?.temp_source ?? forensic?.temp_source ?? a.fit_temp_source ?? "watch_internal";
+  const effectiveTempSource =
+    baseTempSource === "garmin_tempe_fit"
+      ? "garmin_tempe_fit"
+      : tempeChoice === "yes"
+        ? "user_confirmed_tempe"
+        : "watch_internal";
 
   async function handleExport1HzCsv() {
     const datePart = a.start_iso.slice(0, 10);
@@ -1395,6 +1431,11 @@ function ActivityDetailView({
     setSavingContext(true);
     setContextNotice(null);
     try {
+      const preEdited = Boolean(a.post_run_context?.pre_weight_manually_edited) || preWeight !== initialPreWeight;
+      const postEdited = Boolean(a.post_run_context?.post_weight_manually_edited) || postWeight !== initialPostWeight;
+      const existingWs = a.post_run_context?.weight_source ?? null;
+      const nextWs = preEdited ? "manual" : existingWs ?? (preNum != null ? "manual" : null);
+      const tempeUsed = tempeChoice === "yes" ? true : tempeChoice === "no" ? false : null;
       const payload: PostRunContext = {
         shoe_model: shoeModel.trim(),
         shoe_size: shoeSize.trim(),
@@ -1403,6 +1444,11 @@ function ActivityDetailView({
         fluid_consumed_ml: parseOptionalNum(fluidMl),
         net_fluid_deficit_kg: null,
         net_sweat_rate_l_hr: null,
+        pre_weight_manually_edited: preEdited,
+        post_weight_manually_edited: postEdited,
+        fluid_intake_confirmed: fluidIntakeConfirmed,
+        weight_source: nextWs,
+        tempe_sensor_used: tempeUsed,
         orthopedic: {
           left_achilles: parseRatingOrZero(leftAchilles),
           lumbar_sciatica: parseRatingOrZero(lumbarSciatica),
@@ -1751,7 +1797,15 @@ function ActivityDetailView({
 
       <div className="card">
         <div className="card-header">
-          <h3 style={{ margin: 0 }}>Post-Run Context &amp; Sweat Matrix</h3>
+          <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+            <h3 style={{ margin: 0 }}>Post-Run Context &amp; Sweat Matrix</h3>
+            {a.post_run_context?.weight_source && (
+              <span className="pill">weight: {a.post_run_context.weight_source}</span>
+            )}
+            <span className={`pill ${effectiveTempSource === "watch_internal" ? "amber" : "green"}`}>
+              temp: {effectiveTempSource}
+            </span>
+          </div>
           {contextNotice && <span className="pill">{contextNotice}</span>}
         </div>
         <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
@@ -1778,9 +1832,24 @@ function ActivityDetailView({
             <input
               type="number"
               value={fluidMl}
-              onChange={(e) => setFluidMl(e.target.value)}
+              onChange={(e) => {
+                const v = e.target.value;
+                setFluidMl(v);
+                if (v.trim() !== "") setFluidIntakeConfirmed(true);
+              }}
               placeholder="e.g. 500"
             />
+          </label>
+          <label>
+            <div className="muted" style={{ fontSize: 12 }}>Garmin Tempe Sensor Used</div>
+            <select
+              value={tempeChoice}
+              onChange={(e) => setTempeChoice(e.target.value as "unconfirmed" | "yes" | "no")}
+            >
+              <option value="unconfirmed">Unconfirmed</option>
+              <option value="yes">Yes (Garmin Tempe)</option>
+              <option value="no">No (Watch Internal)</option>
+            </select>
           </label>
           <label>
             <div className="muted" style={{ fontSize: 12 }}>Pre-Run Weight (kg)</div>
@@ -1804,11 +1873,20 @@ function ActivityDetailView({
           </label>
         </div>
 
+        <label style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 10 }}>
+          <input
+            type="checkbox"
+            checked={fluidIntakeConfirmed}
+            onChange={(e) => setFluidIntakeConfirmed(e.target.checked)}
+          />
+          <span style={{ fontSize: 13 }}>Confirm Intra-Run Fluid Intake (upgrades Sweat Matrix to Final Verified)</span>
+        </label>
+
         <div className="muted" style={{ fontSize: 13, marginTop: 10, marginBottom: 10 }}>
-          Auto Sweat Computation: Total Loss{" "}
-          <strong>{liveDeficitKg != null ? `${liveDeficitKg.toFixed(2)} kg` : "–"}</strong>
-          {" · "}Sweat Rate{" "}
-          <strong>{liveSweatRateLHr != null ? `${liveSweatRateLHr.toFixed(2)} L/hr` : "–"}</strong>
+          Provisional Rate (pre - post):{" "}
+          <strong>{liveProvisionalSweatRateLHr != null ? `${liveProvisionalSweatRateLHr.toFixed(2)} L/hr` : "–"}</strong>
+          {" · "}Final Verified:{" "}
+          <strong>{liveFinalSweatRateLHr != null ? `${liveFinalSweatRateLHr.toFixed(2)} L/hr` : "Pending Intake Confirmation"}</strong>
         </div>
 
         <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: 10 }}>

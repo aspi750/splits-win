@@ -129,6 +129,14 @@ export interface PostRunContext {
   net_fluid_deficit_kg: number | null;
   net_sweat_rate_l_hr: number | null;
   orthopedic: OrthopedicCheckIn;
+  pre_weight_manually_edited?: boolean;
+  post_weight_manually_edited?: boolean;
+  fluid_intake_confirmed?: boolean;
+  weight_source?: string | null;
+  sweat_status?: string | null;
+  provisional_sweat_rate_l_hr?: number | null;
+  final_sweat_rate_l_hr?: number | null;
+  tempe_sensor_used?: boolean | null;
 }
 
 export interface ActivityRecord {
@@ -147,6 +155,7 @@ export interface ActivityRecord {
   shoe_name: string | null;
   is_hyrox?: boolean | null;
   post_run_context?: PostRunContext | null;
+  fit_temp_source?: string | null;
 }
 
 export interface DayRecord {
@@ -305,6 +314,7 @@ export interface ForensicTelemetryReport {
   velocity_bands: VelocityBandStats[];
   laps: LapForensicDistribution[];
   micro_events: ForensicMicroEvent[];
+  temp_source?: string;
 }
 
 export interface FitSplit {
@@ -354,6 +364,7 @@ export interface FitTrackAnalysis {
   splits: FitSplit[];
   hyrox_dissection?: HyroxDissection | null;
   forensic_telemetry?: ForensicTelemetryReport | null;
+  temp_source?: string;
   decoupling_pct: number | null;
   audit: FitGuardrailAudit;
 }

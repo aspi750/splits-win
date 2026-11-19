@@ -1,12 +1,13 @@
 use chrono::{Duration, TimeZone, Utc};
 use splits_win_lib::coach::{
-    analyze_training_history, append_training_ledger_entry, apply_coach_proposal,
-    compact_history_markdown, fetch_1hz_window_from_track, format_user_profile_context,
-    replacing_section, slice_fit_track_by_km, starter_coach_profile_markdown,
-    starter_training_plan_markdown, CoachPacketBuilder,
+    analyze_training_history, append_forensic_section, append_training_ledger_entry,
+    apply_coach_proposal, apply_post_run_context_tool_update, compact_history_markdown,
+    fetch_1hz_window_from_track, format_user_profile_context, replacing_section,
+    slice_fit_track_by_km, starter_coach_profile_markdown, starter_training_plan_markdown,
+    CoachPacketBuilder,
 };
 use splits_win_lib::forensic_extractor::extract_forensic_telemetry;
-use splits_win_lib::garmin::{analyze_fit_points, dissect_hyrox_laps};
+use splits_win_lib::garmin::{analyze_fit_points, dissect_hyrox_laps, parse_weight_range_json};
 use splits_win_lib::models::*;
 use splits_win_lib::readiness::{ReadinessEngine, ReadinessInput};
 use splits_win_lib::scheduler::{
@@ -120,6 +121,7 @@ fn test_shared_store_and_sqlite_roundtrip() {
         shoe_name: Some("Superblast 3".to_string()),
         is_hyrox: None,
         post_run_context: None,
+        fit_temp_source: None,
     })
     .unwrap();
     let acts = db.list_activities(10).unwrap();
@@ -173,6 +175,7 @@ fn test_readiness_engine_green_red_amber_and_persistence() {
             shoe_name: Some("Superblast 3".to_string()),
             is_hyrox: None,
             post_run_context: None,
+            fit_temp_source: None,
         }],
         days: &[healthy_day.clone()],
         plan: None,
@@ -205,6 +208,7 @@ fn test_readiness_engine_green_red_amber_and_persistence() {
             shoe_name: None,
             is_hyrox: None,
             post_run_context: None,
+            fit_temp_source: None,
         }],
         days: &[bad_day],
         plan: None,
@@ -380,6 +384,7 @@ fn test_stage2_2_hybrid_hyrox_spacing_and_compromised_run_audit() {
         shoe_name: None,
         is_hyrox: None,
         post_run_context: None,
+        fit_temp_source: None,
     };
 
     let mut hybrid_config = AthleteConfig::default();
@@ -458,6 +463,7 @@ fn test_stage2_2_training_history_analyzer_and_starter_templates() {
             shoe_name: None,
             is_hyrox: None,
             post_run_context: None,
+            fit_temp_source: None,
         });
         if offset % 4 == 1 {
             activities.push(ActivityRecord {
@@ -476,6 +482,7 @@ fn test_stage2_2_training_history_analyzer_and_starter_templates() {
                 shoe_name: None,
                 is_hyrox: None,
                 post_run_context: None,
+                fit_temp_source: None,
             });
         }
     }
@@ -558,6 +565,7 @@ fn test_stage3_1_user_profile_migration_and_hyrox_reclassification() {
         shoe_name: None,
         is_hyrox: None,
         post_run_context: None,
+        fit_temp_source: None,
     };
     db.upsert_activity(&act).unwrap();
     db.set_activity_hyrox(555, true).unwrap();
@@ -692,6 +700,7 @@ fn test_v0_2_1_sweat_matrix_1hz_window_and_ledger() {
         pre_run_weight_kg: Some(75.0),
         post_run_weight_kg: Some(74.0),
         fluid_consumed_ml: Some(500.0),
+        fluid_intake_confirmed: true,
         net_fluid_deficit_kg: None,
         net_sweat_rate_l_hr: None,
         orthopedic: OrthopedicCheckIn {
@@ -700,10 +709,12 @@ fn test_v0_2_1_sweat_matrix_1hz_window_and_ledger() {
             right_ankle: 0,
             calves_soleus: 3,
         },
+        ..Default::default()
     };
     let computed = raw_ctx.with_computed_sweat(3600.0);
     assert_eq!(computed.net_fluid_deficit_kg, Some(1.5));
     assert_eq!(computed.net_sweat_rate_l_hr, Some(1.5));
+    assert_eq!(computed.sweat_status.as_deref(), Some("final_verified"));
 
     let db = Database::open_in_memory().unwrap();
     db.upsert_activity(&ActivityRecord {
@@ -722,6 +733,7 @@ fn test_v0_2_1_sweat_matrix_1hz_window_and_ledger() {
         shoe_name: Some("Superblast 2".to_string()),
         is_hyrox: None,
         post_run_context: None,
+        fit_temp_source: None,
     })
     .unwrap();
     db.save_post_run_context(888, &computed).unwrap();
@@ -746,4 +758,156 @@ fn test_v0_2_1_sweat_matrix_1hz_window_and_ledger() {
     assert!(saved.contains("Easy 10k"));
     assert!(saved.contains("Recovery."));
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_garmin_weight_sync_scale_pairing_and_hybrid_tempe_parity() {
+    // 1. Garmin Weight JSON parsing (grams -> kg) & duplicate timestamp merging + SQLite dedup
+    let raw_json = br#"{
+      "dailyWeightSummaries": [
+        {
+          "summaryDate": "2026-11-18",
+          "allWeightMetrics": [
+            {
+              "samplePk": 1,
+              "timestampGMT": "2026-11-18T06:30:00.0",
+              "weight": 105200.0,
+              "bodyFat": 22.4,
+              "bodyWater": 56.1,
+              "muscleMass": 42100.0,
+              "sourceType": "INDEX_SCALE"
+            },
+            {
+              "samplePk": 1,
+              "timestampGMT": "2026-11-18T06:30:00.0",
+              "weight": 105200.0,
+              "sourceType": "INDEX_SCALE"
+            }
+          ]
+        }
+      ],
+      "dateWeightList": [
+        {
+          "samplePk": 2,
+          "timestampGMT": "2026-11-18T08:45:00.0",
+          "weight": 103900.0,
+          "sourceType": "INDEX_SCALE"
+        }
+      ]
+    }"#;
+    let parsed = parse_weight_range_json(raw_json);
+    assert_eq!(parsed.len(), 2);
+    assert_eq!(parsed[0].weight_kg, 103.9);
+    assert_eq!(parsed[1].weight_kg, 105.2);
+    assert_eq!(parsed[1].body_fat_pct, Some(22.4));
+    assert_eq!(parsed[1].muscle_mass_kg, Some(42.1));
+
+    let db = Database::open_in_memory().unwrap();
+    for w in &parsed {
+        db.upsert_weight_entry(w).unwrap();
+    }
+    for w in &parsed {
+        db.upsert_weight_entry(w).unwrap();
+    }
+    assert_eq!(db.list_weight_entries(10).unwrap().len(), 2);
+
+    // 2. Pre/post scale pairing + dehydrated baseline guard + two-stage Sweat Matrix
+    let act_start: i64 = 1_795_000_000;
+    let act_end: i64 = act_start + 3600;
+    let pre = WeightEntry {
+        timestamp_epoch_sec: act_start - 25 * 60,
+        timestamp_iso: "2026-11-18T06:35:00Z".to_string(),
+        weight_kg: 105.0,
+        body_fat_pct: None,
+        body_water_pct: None,
+        muscle_mass_kg: None,
+        source: "garmin_scale".to_string(),
+    };
+    let post = WeightEntry {
+        timestamp_epoch_sec: act_end + 15 * 60,
+        timestamp_iso: "2026-11-18T08:15:00Z".to_string(),
+        weight_kg: 103.8,
+        body_fat_pct: None,
+        body_water_pct: None,
+        muscle_mass_kg: None,
+        source: "garmin_scale".to_string(),
+    };
+    let paired = scale_matcher::pair_scale_weigh_ins(
+        act_start,
+        act_end,
+        3600.0,
+        &[pre.clone(), post.clone()],
+        PostRunContext::default(),
+    );
+    assert_eq!(paired.pre_run_weight_kg, Some(105.0));
+    assert_eq!(paired.post_run_weight_kg, Some(103.8));
+    assert_eq!(paired.weight_source.as_deref(), Some("garmin_scale"));
+    assert!(!paired.fluid_intake_confirmed);
+    assert_eq!(paired.sweat_status.as_deref(), Some("provisional_no_intake"));
+    assert_eq!(paired.provisional_sweat_rate_l_hr, Some(1.2));
+    assert_eq!(paired.final_sweat_rate_l_hr, None);
+
+    // Manual edit protection prevents scale overwrite on pre_run_weight_kg
+    let manual = PostRunContext {
+        pre_run_weight_kg: Some(106.0),
+        pre_weight_manually_edited: true,
+        ..Default::default()
+    };
+    let kept = scale_matcher::pair_scale_weigh_ins(
+        act_start,
+        act_end,
+        3600.0,
+        &[pre.clone(), post.clone()],
+        manual,
+    );
+    assert_eq!(kept.pre_run_weight_kg, Some(106.0));
+    assert_eq!(kept.post_run_weight_kg, Some(103.8));
+
+    // Post-run dehydrated weigh-in MUST NOT become baseline weight
+    let windows = vec![(act_start, act_end)];
+    assert_eq!(scale_matcher::latest_baseline_weight_kg(&[post.clone()], &windows), None);
+    assert_eq!(
+        scale_matcher::latest_baseline_weight_kg(&[post, pre], &windows),
+        Some(105.0)
+    );
+
+    // Fallback chain -> latest_14d_weigh_in & profile_baseline (provisional)
+    let r_profile = scale_matcher::resolve_effective_weight(
+        None,
+        act_start + 86_400,
+        &[],
+        &[],
+        Some(105.0),
+    )
+    .unwrap();
+    assert_eq!(r_profile.source, "profile_baseline");
+    assert!(r_profile.is_provisional);
+    let packet = append_forensic_section("## Header".to_string(), None, None, Some(&r_profile));
+    assert!(packet.contains("profile_baseline, provisional"));
+
+    // 3. Coach tool update_post_run_context & effective temp_source
+    let act = ActivityRecord {
+        garmin_id: 505,
+        name: "Temp & Sweat Tool Test".to_string(),
+        type_key: "running".to_string(),
+        start_iso: "2026-11-18T07:00:00Z".to_string(),
+        distance_m: 10_000.0,
+        duration_sec: 3600.0,
+        moving_duration_sec: 3600.0,
+        elevation_gain_m: 20.0,
+        average_hr: Some(138.0),
+        max_hr: Some(146.0),
+        cadence_spm: Some(174.0),
+        training_load: Some(60.0),
+        shoe_name: None,
+        is_hyrox: None,
+        post_run_context: Some(paired),
+        fit_temp_source: Some("watch_internal".to_string()),
+    };
+    db.upsert_activity(&act).unwrap();
+    let tool_res =
+        apply_post_run_context_tool_update(&db, &act, Some(300.0), Some(true)).unwrap();
+    assert_eq!(tool_res["sweat_status"].as_str(), Some("final_verified"));
+    assert_eq!(tool_res["final_sweat_rate_l_hr"].as_f64(), Some(1.5));
+    assert_eq!(tool_res["temp_source"].as_str(), Some("user_confirmed_tempe"));
 }

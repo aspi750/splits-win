@@ -100,6 +100,8 @@ pub struct ForensicTelemetryReport {
     pub velocity_bands: Vec<VelocityBandStats>,
     pub laps: Vec<LapForensicDistribution>,
     pub micro_events: Vec<ForensicMicroEvent>,
+    #[serde(default = "crate::models::default_temp_source")]
+    pub temp_source: String,
 }
 
 fn r1(v: f64) -> f64 {
@@ -128,6 +130,14 @@ pub fn extract_forensic_telemetry(
     points: &[FitTrackPoint],
     laps: &[FitLap],
 ) -> ForensicTelemetryReport {
+    extract_forensic_telemetry_with_source(points, laps, "watch_internal")
+}
+
+pub fn extract_forensic_telemetry_with_source(
+    points: &[FitTrackPoint],
+    laps: &[FitLap],
+    temp_source: &str,
+) -> ForensicTelemetryReport {
     if points.is_empty() {
         return ForensicTelemetryReport {
             sample_count: 0,
@@ -155,6 +165,7 @@ pub fn extract_forensic_telemetry(
             velocity_bands: Vec::new(),
             laps: Vec::new(),
             micro_events: Vec::new(),
+            temp_source: temp_source.to_string(),
         };
     }
 
@@ -595,15 +606,19 @@ pub fn extract_forensic_telemetry(
         velocity_bands,
         laps: lap_rows,
         micro_events,
+        temp_source: temp_source.to_string(),
     }
 }
 
 impl ForensicTelemetryReport {
     pub fn to_markdown_summary(&self) -> String {
-        let mut lines = vec![format!(
-            "- **1Hz Samples**: {} | **Walk vs Run**: {:.0}s ({} seg) / {:.0}s ({} seg)",
-            self.sample_count, self.walk_seconds, self.walk_segments, self.run_seconds, self.run_segments
-        )];
+        let mut lines = vec![
+            format!(
+                "- **1Hz Samples**: {} | **Walk vs Run**: {:.0}s ({} seg) / {:.0}s ({} seg)",
+                self.sample_count, self.walk_seconds, self.walk_segments, self.run_seconds, self.run_segments
+            ),
+            format!("- **Temperature Source**: {}", self.temp_source),
+        ];
         if let Some(pw) = self.pw_hr_decoupling_pct {
             lines.push(format!("- **Pw:Hr Decoupling (Active Run)**: {pw:.2}%"));
         }

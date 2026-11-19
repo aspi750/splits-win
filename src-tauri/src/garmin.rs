@@ -1,10 +1,11 @@
 use crate::models::{
-    ActivityRecord, AthleteConfig, ClassifiedLap, CompromisedRunAudit, DayRecord,
-    FitBaselineProbe, FitGuardrailAudit, FitLap, FitSplit, FitTrackAnalysis, FitTrackPoint,
-    HyroxDissection, LapKind, APP_SERVICE, GARMIN_ACCOUNT, GARMIN_KEYRING_SERVICE,
+    default_temp_source, ActivityRecord, AthleteConfig, ClassifiedLap, CompromisedRunAudit,
+    DayRecord, FitBaselineProbe, FitGuardrailAudit, FitLap, FitSplit, FitTrackAnalysis,
+    FitTrackPoint, HyroxDissection, LapKind, WeightEntry, APP_SERVICE, GARMIN_ACCOUNT,
+    GARMIN_KEYRING_SERVICE,
 };
 use crate::storage::CredentialStore;
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, Local, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use reqwest::Client;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -224,6 +225,7 @@ impl GarminClient {
                 shoe_name: None,
                 is_hyrox: None,
                 post_run_context: None,
+                fit_temp_source: None,
             });
         }
 
@@ -347,6 +349,7 @@ impl GarminClient {
                     shoe_name: None,
                     is_hyrox: None,
                     post_run_context: None,
+                    fit_temp_source: None,
                 });
             }
             if count < PAGE_SIZE {
@@ -435,6 +438,155 @@ impl GarminClient {
         let days: Vec<DayRecord> = days_map.into_values().collect();
         Ok((activities, days))
     }
+
+    pub async fn sync_weights(&self, days_back: i64) -> Vec<WeightEntry> {
+        let now = Utc::now();
+        let mut by_epoch: HashMap<i64, WeightEntry> = HashMap::new();
+        let mut chunk_end = now;
+        let earliest = now - Duration::days(days_back.max(1));
+
+        while chunk_end > earliest {
+            let chunk_start = (chunk_end - Duration::days(35)).max(earliest);
+            let s_str = chunk_start.format("%Y-%m-%d").to_string();
+            let e_str = chunk_end.format("%Y-%m-%d").to_string();
+            let path = format!("/weight-service/weight/range/{s_str}/{e_str}");
+            if let Ok(bytes) = self
+                .get_bytes(&path, &[("includeAll", "true")], "application/json")
+                .await
+            {
+                for entry in parse_weight_range_json(&bytes) {
+                    by_epoch.insert(entry.timestamp_epoch_sec, entry);
+                }
+            }
+            chunk_end = chunk_start - Duration::days(1);
+        }
+
+        let mut out: Vec<WeightEntry> = by_epoch.into_values().collect();
+        out.sort_by(|a, b| b.timestamp_epoch_sec.cmp(&a.timestamp_epoch_sec));
+        out
+    }
+}
+
+fn parse_weight_timestamp_epoch(metric: &serde_json::Value) -> Option<i64> {
+    if let Some(ts) = metric.get("timestampGMT") {
+        if let Some(n) = ts.as_f64().filter(|&v| v > 0.0) {
+            return Some(if n > 10_000_000_000.0 {
+                (n / 1000.0).round() as i64
+            } else {
+                n.round() as i64
+            });
+        }
+        if let Some(s) = ts.as_str() {
+            let trimmed = s.trim();
+            if let Ok(dt) = DateTime::parse_from_rfc3339(trimmed) {
+                return Some(dt.with_timezone(&Utc).timestamp());
+            }
+            let prefix: String = trimmed.chars().take(19).collect();
+            for fmt in ["%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S"] {
+                if let Ok(ndt) = NaiveDateTime::parse_from_str(&prefix, fmt) {
+                    return Some(DateTime::<Utc>::from_naive_utc_and_offset(ndt, Utc).timestamp());
+                }
+            }
+        }
+    }
+    if let Some(n) = metric.get("date").and_then(|v| v.as_f64()).filter(|&v| v > 0.0) {
+        return Some(if n > 10_000_000_000.0 {
+            (n / 1000.0).round() as i64
+        } else {
+            n.round() as i64
+        });
+    }
+    if let Some(cal) = metric.get("calendarDate").and_then(|v| v.as_str()) {
+        if let Ok(nd) = NaiveDate::parse_from_str(cal.trim(), "%Y-%m-%d") {
+            if let Some(ndt) = nd.and_hms_opt(7, 0, 0) {
+                if let Some(local_dt) = Local.from_local_datetime(&ndt).single() {
+                    return Some(local_dt.with_timezone(&Utc).timestamp());
+                }
+                return Some(DateTime::<Utc>::from_naive_utc_and_offset(ndt, Utc).timestamp());
+            }
+        }
+    }
+    None
+}
+
+fn normalize_mass_kg(raw: Option<f64>) -> Option<f64> {
+    let v = raw.filter(|&x| x > 0.0)?;
+    let kg = if v > 500.0 { v / 1000.0 } else { v };
+    Some((kg * 100.0).round() / 100.0)
+}
+
+pub fn parse_weight_range_json(bytes: &[u8]) -> Vec<WeightEntry> {
+    let Ok(val) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+        return Vec::new();
+    };
+    let mut raw_metrics = Vec::new();
+    if let Some(summaries) = val.get("dailyWeightSummaries").and_then(|v| v.as_array()) {
+        for s in summaries {
+            if let Some(all) = s.get("allWeightMetrics").and_then(|v| v.as_array()) {
+                if !all.is_empty() {
+                    raw_metrics.extend(all.iter().cloned());
+                    continue;
+                }
+            }
+            if let Some(latest) = s.get("latestWeight") {
+                if !latest.is_null() {
+                    raw_metrics.push(latest.clone());
+                }
+            }
+        }
+    }
+    if let Some(list) = val.get("dateWeightList").and_then(|v| v.as_array()) {
+        raw_metrics.extend(list.iter().cloned());
+    }
+
+    let mut by_epoch: HashMap<i64, WeightEntry> = HashMap::new();
+    for m in raw_metrics {
+        let Some(weight_kg) = normalize_mass_kg(m.get("weight").and_then(|v| v.as_f64())) else {
+            continue;
+        };
+        let Some(epoch) = parse_weight_timestamp_epoch(&m) else {
+            continue;
+        };
+        let iso = DateTime::<Utc>::from_timestamp(epoch, 0)
+            .map(|d| d.to_rfc3339())
+            .unwrap_or_else(|| epoch.to_string());
+        let is_manual = m
+            .get("sourceType")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_uppercase().contains("MANUAL"))
+            .unwrap_or(false);
+        let prev = by_epoch.get(&epoch);
+        let merged_source = if is_manual {
+            prev.map(|p| p.source.clone()).unwrap_or_else(|| "manual".to_string())
+        } else {
+            "garmin_scale".to_string()
+        };
+        by_epoch.insert(
+            epoch,
+            WeightEntry {
+                timestamp_epoch_sec: epoch,
+                timestamp_iso: iso,
+                weight_kg,
+                body_fat_pct: m
+                    .get("bodyFat")
+                    .and_then(|v| v.as_f64())
+                    .map(|v| (v * 10.0).round() / 10.0)
+                    .or_else(|| prev.and_then(|p| p.body_fat_pct)),
+                body_water_pct: m
+                    .get("bodyWater")
+                    .and_then(|v| v.as_f64())
+                    .map(|v| (v * 10.0).round() / 10.0)
+                    .or_else(|| prev.and_then(|p| p.body_water_pct)),
+                muscle_mass_kg: normalize_mass_kg(m.get("muscleMass").and_then(|v| v.as_f64()))
+                    .or_else(|| prev.and_then(|p| p.muscle_mass_kg)),
+                source: merged_source,
+            },
+        );
+    }
+
+    let mut entries: Vec<WeightEntry> = by_epoch.into_values().collect();
+    entries.sort_by(|a, b| b.timestamp_epoch_sec.cmp(&a.timestamp_epoch_sec));
+    entries
 }
 
 fn empty_day(date: &str) -> DayRecord {
@@ -574,6 +726,53 @@ fn value_as_f64(val: &fitparser::Value) -> Option<f64> {
     }
 }
 
+fn is_external_tempe_device_info(msg: &fitparser::FitDataRecord) -> bool {
+    let mut is_local = false;
+    let mut has_env_type = false;
+    let mut has_tempe_product = false;
+
+    for field in msg.fields() {
+        let name = field.name();
+        let val = field.value();
+        match name {
+            "source_type" => {
+                if let fitparser::Value::String(s) = val {
+                    if s.eq_ignore_ascii_case("local") {
+                        is_local = true;
+                    }
+                } else if value_as_f64(val) == Some(5.0) {
+                    is_local = true;
+                }
+            }
+            "device_type" | "antplus_device_type" | "ble_device_type" => {
+                if let fitparser::Value::String(s) = val {
+                    let lower = s.to_lowercase();
+                    if lower.contains("env_sensor")
+                        || lower.contains("environment_sensor")
+                        || lower == "tempe"
+                    {
+                        has_env_type = true;
+                    }
+                } else if value_as_f64(val) == Some(25.0) {
+                    has_env_type = true;
+                }
+            }
+            "garmin_product" | "product" => {
+                if let fitparser::Value::String(s) = val {
+                    if s.eq_ignore_ascii_case("tempe") {
+                        has_tempe_product = true;
+                    }
+                } else if value_as_f64(val) == Some(1570.0) {
+                    has_tempe_product = true;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    (has_env_type && !is_local) || has_tempe_product
+}
+
 pub fn parse_fit_track(
     garmin_id: i64,
     bytes: &[u8],
@@ -583,8 +782,15 @@ pub fn parse_fit_track(
     let mut points = Vec::new();
     let mut laps = Vec::new();
     let mut base_ts: Option<f64> = None;
+    let mut temp_source = default_temp_source();
 
     for msg in records {
+        if msg.kind() == fitparser::profile::MesgNum::DeviceInfo {
+            if is_external_tempe_device_info(&msg) {
+                temp_source = "garmin_tempe_fit".to_string();
+            }
+            continue;
+        }
         if msg.kind() == fitparser::profile::MesgNum::Lap {
             let mut elapsed_sec = 0.0;
             let mut moving_sec = 0.0;
@@ -708,9 +914,11 @@ pub fn parse_fit_track(
     let mut analysis = analyze_fit_points(garmin_id, points, config);
     analysis.compromised_run_audit = CompromisedRunAudit::compute(&laps);
     analysis.hyrox_dissection = dissect_hyrox_laps(&laps, false);
-    analysis.forensic_telemetry = Some(crate::forensic_extractor::extract_forensic_telemetry(
+    analysis.temp_source = temp_source.clone();
+    analysis.forensic_telemetry = Some(crate::forensic_extractor::extract_forensic_telemetry_with_source(
         &analysis.full_points,
         &laps,
+        &temp_source,
     ));
     analysis.laps = laps;
     Ok(analysis)
@@ -1026,6 +1234,7 @@ pub fn analyze_fit_points(
         compromised_run_audit: None,
         hyrox_dissection: None,
         forensic_telemetry,
+        temp_source: default_temp_source(),
         decoupling_pct,
         audit: FitGuardrailAudit {
             pace_floor_sec_per_km: pace_floor,
