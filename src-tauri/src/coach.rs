@@ -168,6 +168,13 @@ impl CoachPacketBuilder {
                 lines.push(format!("| {date_str} | {title} | {dist_str} | {dur_str} | {pace_str} | {hr_str} | – | {shoe_str} |"));
             }
             sections.push(lines.join("\n"));
+
+            let notes_lines: Vec<String> = recent_acts_for_notes(activities);
+            if !notes_lines.is_empty() {
+                let mut block = vec!["## Garmin Connect Activity Notes".to_string()];
+                block.extend(notes_lines);
+                sections.push(block.join("\n"));
+            }
         }
 
         // 4. Active Shoe Rotation
@@ -199,6 +206,94 @@ impl CoachPacketBuilder {
     }
 }
 
+fn recent_acts_for_notes(activities: &[ActivityRecord]) -> Vec<String> {
+    let mut recent: Vec<&ActivityRecord> = activities
+        .iter()
+        .filter(|a| a.normalized_notes().is_some())
+        .collect();
+    recent.sort_by(|a, b| b.start_iso.cmp(&a.start_iso));
+    recent
+        .into_iter()
+        .take(5)
+        .filter_map(|act| {
+            let notes = act.normalized_notes()?;
+            let date_str = act.start_iso.chars().take(10).collect::<String>();
+            let title = if act.name.trim().is_empty() {
+                act.type_key.as_str()
+            } else {
+                act.name.trim()
+            };
+            Some(format!("- **{date_str} ({title})**: {notes}"))
+        })
+        .collect()
+}
+
+pub fn base64_encode(input: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(((input.len() + 2) / 3) * 4);
+    for chunk in input.chunks(3) {
+        let b0 = chunk[0] as usize;
+        let b1 = *chunk.get(1).unwrap_or(&0) as usize;
+        let b2 = *chunk.get(2).unwrap_or(&0) as usize;
+        let triple = (b0 << 16) | (b1 << 8) | b2;
+        out.push(TABLE[(triple >> 18) & 0x3F] as char);
+        out.push(TABLE[(triple >> 12) & 0x3F] as char);
+        out.push(if chunk.len() > 1 { TABLE[(triple >> 6) & 0x3F] as char } else { '=' });
+        out.push(if chunk.len() > 2 { TABLE[triple & 0x3F] as char } else { '=' });
+    }
+    out
+}
+
+pub fn consolidate_proposals(proposals: Vec<CoachUpdateProposal>) -> Vec<CoachUpdateProposal> {
+    let mut order: Vec<String> = Vec::new();
+    let mut grouped: std::collections::HashMap<String, CoachUpdateProposal> =
+        std::collections::HashMap::new();
+
+    for prop in proposals {
+        let key = prop.target_file.clone();
+        if let Some(existing) = grouped.get_mut(&key) {
+            let r_new = prop.reason.trim();
+            if !r_new.is_empty()
+                && !existing
+                    .reason
+                    .split(" · ")
+                    .any(|part| part.trim() == r_new)
+            {
+                if existing.reason.trim().is_empty() {
+                    existing.reason = r_new.to_string();
+                } else {
+                    existing.reason = format!("{} · {}", existing.reason.trim(), r_new);
+                }
+            }
+            let next_md = prop.updated_section_markdown.trim();
+            if !next_md.is_empty() && !existing.updated_section_markdown.contains(next_md) {
+                if existing.updated_section_markdown.trim().is_empty() {
+                    existing.updated_section_markdown = next_md.to_string();
+                } else {
+                    existing.updated_section_markdown = format!(
+                        "{}\n\n{next_md}",
+                        existing.updated_section_markdown.trim_end()
+                    );
+                }
+            }
+            existing.diff_preview = existing.updated_section_markdown.clone();
+            if existing.expires_on.is_none() {
+                existing.expires_on = prop.expires_on;
+            }
+            if prop.plan_json.is_some() {
+                existing.plan_json = prop.plan_json;
+            }
+        } else {
+            order.push(key.clone());
+            let mut normalized = prop;
+            normalized.diff_preview = normalized.updated_section_markdown.clone();
+            grouped.insert(key, normalized);
+        }
+    }
+
+    order.into_iter().filter_map(|k| grouped.remove(&k)).collect()
+}
+
 pub fn resolve_coach_engine_mode() -> CoachEngineMode {
     if CredentialStore::read_secret(APP_SERVICE, GEMINI_ACCOUNT).is_some() {
         CoachEngineMode::GeminiApi
@@ -207,8 +302,7 @@ pub fn resolve_coach_engine_mode() -> CoachEngineMode {
     }
 }
 
-pub fn replacing_section(markdown: &str, section_markdown: &str) -> String {
-    let trimmed = section_markdown.trim();
+fn replace_single_section(markdown: &str, trimmed: &str) -> String {
     let Some(heading_line) = trimmed.lines().find(|l| l.starts_with("## ")) else {
         return if markdown.is_empty() {
             format!("{trimmed}\n")
@@ -238,18 +332,56 @@ pub fn replacing_section(markdown: &str, section_markdown: &str) -> String {
     }
 }
 
+pub fn replacing_section(markdown: &str, section_markdown: &str) -> String {
+    let trimmed = section_markdown.trim();
+    if trimmed.is_empty() {
+        return if markdown.is_empty() {
+            String::new()
+        } else {
+            format!("{}\n", markdown.trim_end())
+        };
+    }
+
+    if trimmed.starts_with("# ") {
+        return format!("{trimmed}\n");
+    }
+
+    let lines: Vec<&str> = trimmed.lines().collect();
+    let heading_indices: Vec<usize> = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, l)| if l.starts_with("## ") { Some(idx) } else { None })
+        .collect();
+
+    if heading_indices.len() <= 1 {
+        return replace_single_section(markdown, trimmed);
+    }
+
+    let mut current = markdown.to_string();
+    for (pos, &start) in heading_indices.iter().enumerate() {
+        let end = heading_indices
+            .get(pos + 1)
+            .copied()
+            .unwrap_or(lines.len());
+        let chunk = lines[start..end].join("\n");
+        current = replace_single_section(&current, chunk.trim());
+    }
+    current
+}
+
 pub fn gemini_tool_declarations() -> Value {
     json!([
         {
             "name": "propose_coach_update",
-            "description": "Propose a reversible Markdown section update to COACH_PROFILE.md or TRAINING_PLAN.md.",
+            "description": "Propose a reversible consolidated Markdown update to COACH_PROFILE.md or TRAINING_PLAN.md (with optional plan_json for TRAINING_PLAN.md).",
             "parameters": {
                 "type": "OBJECT",
                 "properties": {
                     "target_file": { "type": "STRING" },
                     "reason": { "type": "STRING" },
                     "updated_section_markdown": { "type": "STRING" },
-                    "expires_on": { "type": "STRING" }
+                    "expires_on": { "type": "STRING" },
+                    "plan_json": { "type": "OBJECT" }
                 },
                 "required": ["target_file", "reason", "updated_section_markdown"]
             }
@@ -369,6 +501,13 @@ pub fn apply_coach_proposal(store: &SharedStore, proposal: &CoachUpdateProposal)
     store
         .write_text_atomic(&proposal.target_file, &updated)
         .map_err(|e| e.to_string())?;
+    if proposal.target_file == "TRAINING_PLAN.md" {
+        if let Some(ref plan) = proposal.plan_json {
+            store
+                .write_json_atomic("plan.json", plan)
+                .map_err(|e| e.to_string())?;
+        }
+    }
     Ok(())
 }
 
@@ -426,15 +565,61 @@ pub async fn run_gemini_coach_turn(
     db: Option<&Database>,
     activities: &[ActivityRecord],
     days: &[DayRecord],
+    model_settings: &ModelSettings,
+    intake_files: &[IntakeQueuedFile],
 ) -> Result<(String, Vec<CoachUpdateProposal>), String> {
+    let resolved = resolve_model(ModelScope::Coach, model_settings);
     let client = Client::new();
     let endpoint = format!(
-        "https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL_ID}:streamGenerateContent?alt=sse&key={api_key}"
+        "https://generativelanguage.googleapis.com/v1beta/models/{}:streamGenerateContent?alt=sse&key={api_key}",
+        resolved.model_id
     );
+
+    let mut initial_parts: Vec<Value> = vec![json!({ "text": user_prompt })];
+    for f in intake_files {
+        let rel = f.relative_path.trim().trim_start_matches(['/', '\\']);
+        if rel.is_empty() || rel.contains("..") {
+            continue;
+        }
+        let full_path = store.root().join(rel);
+        if !full_path.exists() {
+            continue;
+        }
+        let lower_name = f.file_name.to_lowercase();
+        if lower_name.ends_with(".pdf") || f.mime_type == "application/pdf" {
+            if let Ok(bytes) = std::fs::read(&full_path) {
+                if bytes.len() <= 15 * 1024 * 1024 {
+                    initial_parts.push(json!({
+                        "inlineData": {
+                            "mimeType": "application/pdf",
+                            "data": base64_encode(&bytes)
+                        }
+                    }));
+                } else {
+                    initial_parts.push(json!({
+                        "text": format!("Note: Uploaded PDF '{}' exceeds 15 MB inline limit.", f.file_name)
+                    }));
+                }
+            }
+        } else if lower_name.ends_with(".fit") {
+            let summary = match crate::garmin::summarize_fit_file_for_intake(&full_path) {
+                Ok(s) => s,
+                Err(e) => format!("Failed to parse {}: {e}", f.file_name),
+            };
+            initial_parts.push(json!({
+                "text": format!("=== Uploaded Garmin FIT Intake ({}) ===\n{summary}", f.file_name)
+            }));
+        } else if let Ok(raw) = std::fs::read_to_string(&full_path) {
+            let snippet: String = raw.chars().take(16_000).collect();
+            initial_parts.push(json!({
+                "text": format!("=== Uploaded Intake Notes ({}) ===\n{snippet}", f.file_name)
+            }));
+        }
+    }
 
     let mut contents = vec![json!({
         "role": "user",
-        "parts": [{ "text": user_prompt }]
+        "parts": initial_parts
     })];
     let mut proposals = Vec::new();
     let mut final_text = String::new();
@@ -447,7 +632,7 @@ pub async fn run_gemini_coach_turn(
             "generationConfig": {
                 "temperature": 0.4,
                 "maxOutputTokens": 8192,
-                "thinkingConfig": { "thinkingLevel": "MEDIUM" }
+                "thinkingConfig": { "thinkingLevel": resolved.thinking_level.as_str() }
             }
         });
 
@@ -541,8 +726,8 @@ pub async fn run_gemini_coach_turn(
                 if let Some(usage) = obj.get("usageMetadata") {
                     usage_entry = Some(CoachUsageEntry {
                         timestamp: Utc::now().to_rfc3339(),
-                        profile: "CHAT".to_string(),
-                        model: GEMINI_MODEL_ID.to_string(),
+                        profile: "COACH".to_string(),
+                        model: resolved.model_id.clone(),
                         prompt_tokens: usage["promptTokenCount"].as_i64().unwrap_or(0) as i32,
                         candidates_tokens: usage["candidatesTokenCount"].as_i64().unwrap_or(0) as i32,
                         thoughts_tokens: usage["thoughtsTokenCount"].as_i64().unwrap_or(0) as i32,
@@ -589,7 +774,74 @@ pub async fn run_gemini_coach_turn(
         contents.push(json!({ "role": "user", "parts": response_parts }));
     }
 
-    Ok((final_text, proposals))
+    let consolidated = consolidate_proposals(proposals);
+    Ok((final_text, consolidated))
+}
+
+pub fn build_activity_detail_tool_payload(
+    act: &ActivityRecord,
+    store: &SharedStore,
+    db: Option<&Database>,
+    activities: &[ActivityRecord],
+) -> Value {
+    let track = db.and_then(|d| d.get_fit_track(act.garmin_id).ok()).flatten();
+    let notes = act.normalized_notes().map(str::to_string);
+    let mut ctx_owned = act.post_run_context.clone();
+    if let Some(ref n) = notes {
+        let c = ctx_owned.get_or_insert_with(PostRunContext::default);
+        if c.garmin_notes.as_deref().map(str::trim).filter(|s| !s.is_empty()).is_none() {
+            c.garmin_notes = Some(n.clone());
+        }
+    }
+    let ctx = ctx_owned.as_ref();
+    let effective_temp_source = ctx
+        .map(|c| c.effective_temp_source(track.as_ref().map(|t| t.temp_source.as_str()).or(act.fit_temp_source.as_deref())))
+        .unwrap_or_else(|| {
+            track
+                .as_ref()
+                .map(|t| t.temp_source.clone())
+                .or_else(|| act.fit_temp_source.clone())
+                .unwrap_or_else(default_temp_source)
+        });
+    let weights = db.and_then(|d| d.list_weight_entries(60).ok()).unwrap_or_default();
+    let windows = scale_matcher::activity_windows(activities);
+    let cfg = store.load_athlete_config().ok().flatten().unwrap_or_default();
+    let ref_epoch = scale_matcher::parse_activity_epoch_sec(&act.start_iso)
+        .unwrap_or_else(|| Utc::now().timestamp());
+    let resolved_weight = scale_matcher::resolve_effective_weight(
+        ctx,
+        ref_epoch,
+        &weights,
+        &windows,
+        cfg.specs.weight_kg,
+    );
+    let mut forensic = track.as_ref().and_then(|t| t.forensic_telemetry.clone());
+    if let Some(ref mut f) = forensic {
+        f.temp_source = effective_temp_source.clone();
+        f.garmin_notes = notes.clone();
+    }
+
+    json!({
+        "activity": act,
+        "garmin_notes": notes,
+        "is_hyrox": act.is_hyrox,
+        "post_run_context": ctx_owned,
+        "sweat_status": ctx.and_then(|c| c.sweat_status.as_deref()),
+        "provisional_sweat_rate_l_hr": ctx.and_then(|c| c.provisional_sweat_rate_l_hr),
+        "final_sweat_rate_l_hr": ctx.and_then(|c| c.final_sweat_rate_l_hr),
+        "effective_weight_kg": resolved_weight.as_ref().map(|w| w.weight_kg),
+        "weight_source": resolved_weight.as_ref().map(|w| w.source.as_str()),
+        "is_weight_provisional": resolved_weight.as_ref().map(|w| w.is_provisional),
+        "temp_source": effective_temp_source,
+        "fit_track_cached": track.is_some(),
+        "splits": track.as_ref().map(|t| &t.splits),
+        "laps": track.as_ref().map(|t| &t.laps),
+        "compromised_run_audit": track.as_ref().and_then(|t| t.compromised_run_audit.as_ref()),
+        "hyrox_dissection": track.as_ref().and_then(|t| t.hyrox_dissection.as_ref()),
+        "forensic_telemetry": forensic,
+        "decoupling_pct": track.as_ref().and_then(|t| t.decoupling_pct),
+        "guardrail_audit": track.as_ref().map(|t| &t.audit),
+    })
 }
 
 fn execute_tool(
@@ -607,6 +859,10 @@ fn execute_tool(
             let reason = args["reason"].as_str().unwrap_or("Coach update").to_string();
             let section = args["updated_section_markdown"].as_str().unwrap_or("").to_string();
             let expires = args["expires_on"].as_str().map(|s| s.to_string());
+            let plan_json: Option<PlanFile> = args
+                .get("plan_json")
+                .filter(|v| !v.is_null())
+                .and_then(|v| serde_json::from_value(v.clone()).ok());
             let id = uuid::Uuid::new_v4().to_string();
             proposals.push(CoachUpdateProposal {
                 id: id.clone(),
@@ -616,6 +872,7 @@ fn execute_tool(
                 expires_on: expires,
                 diff_preview: section,
                 status: "pending_user_approval".to_string(),
+                plan_json,
             });
             json!({ "status": "pending_user_approval", "proposal_id": id, "target_file": target })
         }
@@ -640,54 +897,7 @@ fn execute_tool(
                     .and_then(|d| d.get_activity(act_ref.garmin_id).ok())
                     .flatten()
                     .unwrap_or_else(|| act_ref.clone());
-                let track = db.and_then(|d| d.get_fit_track(act.garmin_id).ok()).flatten();
-                let ctx = act.post_run_context.as_ref();
-                let effective_temp_source = ctx
-                    .map(|c| c.effective_temp_source(track.as_ref().map(|t| t.temp_source.as_str()).or(act.fit_temp_source.as_deref())))
-                    .unwrap_or_else(|| {
-                        track
-                            .as_ref()
-                            .map(|t| t.temp_source.clone())
-                            .or_else(|| act.fit_temp_source.clone())
-                            .unwrap_or_else(default_temp_source)
-                    });
-                let weights = db.and_then(|d| d.list_weight_entries(60).ok()).unwrap_or_default();
-                let windows = scale_matcher::activity_windows(activities);
-                let cfg = store.load_athlete_config().ok().flatten().unwrap_or_default();
-                let ref_epoch = scale_matcher::parse_activity_epoch_sec(&act.start_iso)
-                    .unwrap_or_else(|| Utc::now().timestamp());
-                let resolved_weight = scale_matcher::resolve_effective_weight(
-                    ctx,
-                    ref_epoch,
-                    &weights,
-                    &windows,
-                    cfg.specs.weight_kg,
-                );
-                let mut forensic = track.as_ref().and_then(|t| t.forensic_telemetry.clone());
-                if let Some(ref mut f) = forensic {
-                    f.temp_source = effective_temp_source.clone();
-                }
-
-                json!({
-                    "activity": act,
-                    "is_hyrox": act.is_hyrox,
-                    "post_run_context": act.post_run_context,
-                    "sweat_status": ctx.and_then(|c| c.sweat_status.as_deref()),
-                    "provisional_sweat_rate_l_hr": ctx.and_then(|c| c.provisional_sweat_rate_l_hr),
-                    "final_sweat_rate_l_hr": ctx.and_then(|c| c.final_sweat_rate_l_hr),
-                    "effective_weight_kg": resolved_weight.as_ref().map(|w| w.weight_kg),
-                    "weight_source": resolved_weight.as_ref().map(|w| w.source.as_str()),
-                    "is_weight_provisional": resolved_weight.as_ref().map(|w| w.is_provisional),
-                    "temp_source": effective_temp_source,
-                    "fit_track_cached": track.is_some(),
-                    "splits": track.as_ref().map(|t| &t.splits),
-                    "laps": track.as_ref().map(|t| &t.laps),
-                    "compromised_run_audit": track.as_ref().and_then(|t| t.compromised_run_audit.as_ref()),
-                    "hyrox_dissection": track.as_ref().and_then(|t| t.hyrox_dissection.as_ref()),
-                    "forensic_telemetry": forensic,
-                    "decoupling_pct": track.as_ref().and_then(|t| t.decoupling_pct),
-                    "guardrail_audit": track.as_ref().map(|t| &t.audit),
-                })
+                build_activity_detail_tool_payload(&act, store, db, activities)
             } else {
                 json!({ "error": format!("Activity '{raw_id}' not found in synced store.") })
             }
@@ -1140,9 +1350,17 @@ pub fn starter_coach_profile_markdown(config: &AthleteConfig, summary: &Training
         .map_or("- **Min spacing**: 36 hours".to_string(), |v| {
             format!("- **Min spacing**: {v} hours between high-strain sessions")
         });
+    let target_line = config
+        .objective
+        .target_time_description
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|t| format!("\n- **Goal Time**: {t}"))
+        .unwrap_or_default();
 
     format!(
-        "# COACH PROFILE\n\n## Athlete Identity\n- **Athlete**: {display_name}\n- **Units**: Metric (km, min/km, bpm, kg)\n- **Objective**: {}\n\n## Lab Data & Heart Rate Zones\n{vt1_line}\n\n## Medical & Biomechanical Guardrails\n{rest_line}\n\n## AVAILABILITY & CONTEXT\n| key | value | valid_from | valid_until | source | last_confirmed |\n| --- | --- | --- | --- | --- | --- |\n| training_days | {} days/week | {today} | open | athlete_config | {today} |\n\n## Change History\n- `{today}`: Seeded starter COACH_PROFILE.md from AthleteConfig and {} days of history.\n",
+        "# COACH PROFILE\n\n## Athlete Identity\n- **Athlete**: {display_name}\n- **Units**: Metric (km, min/km, bpm, kg)\n- **Objective**: {}{target_line}\n\n## Lab Data & Heart Rate Zones\n{vt1_line}\n\n## Medical & Biomechanical Guardrails\n{rest_line}\n\n## AVAILABILITY & CONTEXT\n| key | value | valid_from | valid_until | source | last_confirmed |\n| --- | --- | --- | --- | --- | --- |\n| training_days | {} days/week | {today} | open | athlete_config | {today} |\n\n## Change History\n- `{today}`: Seeded starter COACH_PROFILE.md from AthleteConfig and {} days of history.\n",
         config.objective.goal_type.display_name(),
         config.availability.available_days.len(),
         summary.days_of_history
@@ -1163,11 +1381,103 @@ pub fn starter_training_plan_markdown(config: &AthleteConfig, summary: &Training
         Some(rn) => format!("- **Target Event**: {rn}"),
         None => "- **Target Event**: Open / Base progression".to_string(),
     };
+    let goal_time_line = match config
+        .objective
+        .target_time_description
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(t) => format!("\n- **Goal Time**: {t}"),
+        None => String::new(),
+    };
 
     format!(
-        "# TRAINING PLAN\n\n## Current Phase & Baseline\n- **Objective**: {}\n{baseline}\n\n## Mesocycle & Block Structure\n- **Block Rhythm**: 3 build weeks followed by 1 deload week.\n\n## Race Calendar & Targets\n{race_line}\n\n## Change History\n- `{today}`: Seeded starter TRAINING_PLAN.md from synced history.\n",
+        "# TRAINING PLAN\n\n## Current Phase & Baseline\n- **Objective**: {}\n{baseline}\n\n## Mesocycle & Block Structure\n- **Block Rhythm**: 3 build weeks followed by 1 deload week.\n\n## Race Calendar & Targets\n{race_line}{goal_time_line}\n\n## Change History\n- `{today}`: Seeded starter TRAINING_PLAN.md from synced history.\n",
         config.objective.goal_type.display_name()
     )
+}
+
+pub fn starter_plan_file(config: &AthleteConfig, summary: &TrainingHistorySummary) -> PlanFile {
+    let today = Local::now().date_naive();
+    let from = today.format("%Y-%m-%d").to_string();
+    let to = (today + Duration::days(6)).format("%Y-%m-%d").to_string();
+    let base_weekly = if summary.trailing.avg_weekly_km > 5.0 {
+        summary.trailing.avg_weekly_km.round()
+    } else {
+        15.0
+    };
+    PlanFile {
+        version: 1,
+        revision: 1,
+        updated_at: Utc::now().to_rfc3339(),
+        updated_by: "splits_coach".to_string(),
+        covers: PlanDateRange { from, to },
+        status: PlanStatus::Valid,
+        envelope: PlanEnvelope {
+            max_weekly_km: base_weekly,
+            max_single_run_km: (base_weekly * 0.35).clamp(5.0, 21.0),
+            mesocycle_phase: "base".to_string(),
+            min_hours_between_runs: config
+                .medical
+                .min_rest_hours_between_runs
+                .unwrap_or(24)
+                .max(12) as f64,
+            walk_hr_cap_bpm: config.specs.vt1_ceiling_bpm,
+        },
+        sessions: Vec::new(),
+    }
+}
+
+pub fn auto_calibrate_thresholds_from_history(
+    config: &mut AthleteConfig,
+    user_profile: &mut UserProfile,
+    activities: &[ActivityRecord],
+    days: &[DayRecord],
+    now: DateTime<Utc>,
+) -> bool {
+    let mut changed = false;
+
+    if config.specs.resting_hr_baseline.is_none() {
+        let rhr_samples: Vec<(DateTime<Utc>, Option<i32>)> = days
+            .iter()
+            .filter_map(|d| {
+                NaiveDate::parse_from_str(&d.date, "%Y-%m-%d")
+                    .ok()
+                    .and_then(|nd| nd.and_hms_opt(12, 0, 0))
+                    .map(|ndt| (DateTime::<Utc>::from_naive_utc_and_offset(ndt, Utc), d.resting_hr))
+            })
+            .collect();
+        if let Some(cal_rhr) = AthleteConfig::calibrated_resting_hr(&rhr_samples, now) {
+            config.specs.resting_hr_baseline = Some(cal_rhr);
+            changed = true;
+        }
+    }
+
+    if config.specs.max_hr.is_none() {
+        if let Some(observed_max) = activities
+            .iter()
+            .filter_map(|a| a.max_hr)
+            .filter(|&h| (130.0..=230.0).contains(&h))
+            .fold(None::<f64>, |acc, h| Some(acc.map_or(h, |m| m.max(h))))
+        {
+            config.specs.max_hr = Some(observed_max.round() as i32);
+            changed = true;
+        }
+    }
+
+    if let Some(max_hr) = config.specs.max_hr.filter(|&m| m > 100) {
+        if user_profile.runner_config.lthr_bpm.is_none() {
+            user_profile.runner_config.lthr_bpm = Some((max_hr as f64 * 0.89).round() as i32);
+            changed = true;
+        }
+        if config.specs.vt1_ceiling_bpm.is_none() {
+            config.specs.vt1_ceiling_bpm = Some((max_hr as f64 * 0.78).round() as i32);
+            changed = true;
+        }
+    }
+
+    changed
 }
 
 pub fn first_use_setup_instructions(summary: &TrainingHistorySummary) -> String {
@@ -1240,13 +1550,14 @@ pub fn build_static_system_instruction(
     config: &AthleteConfig,
     activities: &[ActivityRecord],
     user_profile: Option<&UserProfile>,
+    first_use_state: Option<&FirstUseFlowState>,
 ) -> String {
     let profile_md = store.read_text("COACH_PROFILE.md").ok().flatten().unwrap_or_default();
     let plan_md = store.read_text("TRAINING_PLAN.md").ok().flatten().unwrap_or_default();
     let needs_setup = profile_md.trim().is_empty() || plan_md.trim().is_empty();
 
     let mut sections = vec![
-        "You are a Living Markdown training-planning coach inside Splits Coach. Use metric units (km, min/km, bpm, kg). Always use `propose_coach_update` for Markdown changes. Use `get_recent_activities`, `get_activity_detail`, `get_wellness_history`, `get_training_load_and_records`, `get_readiness_and_plan`, `get_lifetime_and_yearly_history`, `fetch_1hz_window`, `append_training_ledger`, `update_post_run_context`, and `query_run_slice` for drill-downs. Sweat Matrix Rule: when analyzing a run with `sweat_status == \"provisional_no_intake\"`, report the provisional sweat rate and ask if the user had any intra-run fluid intake, then call `update_post_run_context` once confirmed (`0` ml if none). Weight Fallback Rule: inspect `weight_source` — when set to `\"profile_baseline\"` or `\"latest_14d_weigh_in\"`, label derived sweat/weight metrics provisional. Hybrid Tempe Rule: when `temp_source == \"watch_internal\"` and temperature data exists, check the user's post-run message for any mention of a Garmin Tempe sensor and call `update_post_run_context(tempe_sensor_used: true)` -> `\"user_confirmed_tempe\"` if mentioned, or ask the user to confirm whether a Tempe sensor was worn before treating temperature spikes as external ambient heat rather than wrist skin warmth.".to_string(),
+        "You are a Living Markdown training-planning coach inside Splits Coach. Use metric units (km, min/km, bpm, kg). Always use `propose_coach_update` for Markdown changes, and CONSOLIDATE all sections for a given target file (`COACH_PROFILE.md` or `TRAINING_PLAN.md`) into ONE single `propose_coach_update` call per file rather than emitting separate proposals for individual sections. Use `get_recent_activities`, `get_activity_detail`, `get_wellness_history`, `get_training_load_and_records`, `get_readiness_and_plan`, `get_lifetime_and_yearly_history`, `fetch_1hz_window`, `append_training_ledger`, `update_post_run_context`, and `query_run_slice` for drill-downs. Inspect `garmin_notes` on activities when present. Sweat Matrix Rule: when analyzing a run with `sweat_status == \"provisional_no_intake\"`, report the provisional sweat rate and ask if the user had any intra-run fluid intake, then call `update_post_run_context` once confirmed (`0` ml if none). Weight Fallback Rule: inspect `weight_source` — when set to `\"profile_baseline\"` or `\"latest_14d_weigh_in\"`, label derived sweat/weight metrics provisional. Hybrid Tempe Rule: when `temp_source == \"watch_internal\"` and temperature data exists, check the user's post-run message for any mention of a Garmin Tempe sensor and call `update_post_run_context(tempe_sensor_used: true)` -> `\"user_confirmed_tempe\"` if mentioned, or ask the user to confirm whether a Tempe sensor was worn before treating temperature spikes as external ambient heat rather than wrist skin warmth.".to_string(),
         format!("=== ATHLETE CONFIG ===\n{}", config.prompt_summary(None)),
     ];
     if let Some(profile) = user_profile {
@@ -1258,7 +1569,33 @@ pub fn build_static_system_instruction(
     if !plan_md.trim().is_empty() {
         sections.push(format!("=== TRAINING_PLAN.md ===\n{plan_md}"));
     }
-    if needs_setup {
+
+    if let Some(fu) = first_use_state.filter(|s| s.stage.is_guided()) {
+        let guardrail_note = "During initial profile setup, discuss and clarify `HR-First Governor` (`enforceEasyHRCeiling`), `Hard Pace Floor` (`minPaceSecPerKm`), easy HR ceiling, and minimum rest hours conversationally with the athlete. Never fabricate a goal time or target pace if `targetTimeDescription` is blank/unset.";
+        match fu.stage {
+            FirstUseStage::Intake | FirstUseStage::ProfileApproval => {
+                sections.push(format!(
+                    "GUIDED STAGE (Profile Synthesis): {guardrail_note} Synthesize ATHLETE CONFIG and any attached intake files (lab stress test PDF, Garmin stress .FIT, notes) into ONE consolidated `COACH_PROFILE.md` proposal via a single `propose_coach_update` call. Do NOT propose `TRAINING_PLAN.md` yet — training block design waits until after Garmin history sync."
+                ));
+            }
+            FirstUseStage::HistorySync => {
+                sections.push(
+                    "GUIDED STAGE (History Sync): Initial profile is approved. Full Garmin history download and TrainingHistoryAnalyzer audit run next before creating TRAINING_PLAN.md.".to_string(),
+                );
+            }
+            FirstUseStage::PlanApproval => {
+                let hist_block = fu
+                    .history_summary_markdown
+                    .as_deref()
+                    .map(|m| format!("\n\nSynced Training History Summary:\n{m}"))
+                    .unwrap_or_default();
+                sections.push(format!(
+                    "GUIDED STAGE (Plan Approval): Call `get_lifetime_and_yearly_history` if needed, confirm the athlete's preferred mesocycle block structure, and emit ONE consolidated `TRAINING_PLAN.md` proposal via a single `propose_coach_update` call (including structured `plan_json`). Never fabricate a target time or pace when none is configured.{hist_block}"
+                ));
+            }
+            FirstUseStage::Active => {}
+        }
+    } else if needs_setup {
         let summary = analyze_training_history(activities, config, Utc::now());
         sections.push(first_use_setup_instructions(&summary));
     }
@@ -1298,6 +1635,9 @@ pub fn append_forensic_section(
         if let Some(ctx) = activity.and_then(|a| a.post_run_context.as_ref()) {
             rep_clone.temp_source = ctx.effective_temp_source(Some(&rep.temp_source));
         }
+        if rep_clone.garmin_notes.is_none() {
+            rep_clone.garmin_notes = activity.and_then(|a| a.normalized_notes().map(str::to_string));
+        }
         blocks.push(format!(
             "## 1Hz Forensic Telemetry ({label})\n{}",
             rep_clone.to_markdown_summary()
@@ -1333,6 +1673,9 @@ pub fn append_forensic_section(
             "- **Effective Temp Source**: {}",
             ctx.effective_temp_source(activity.and_then(|a| a.fit_temp_source.as_deref()))
         ));
+        if let Some(notes) = activity.and_then(|a| a.normalized_notes()) {
+            lines.push(format!("- **Garmin Connect Notes**: {notes}"));
+        }
         let o = &ctx.orthopedic;
         if o.left_achilles > 0 || o.lumbar_sciatica > 0 || o.right_ankle > 0 || o.calves_soleus > 0 {
             lines.push(format!(
@@ -1343,6 +1686,8 @@ pub fn append_forensic_section(
         if lines.len() > 1 {
             blocks.push(lines.join("\n"));
         }
+    } else if let Some(notes) = activity.and_then(|a| a.normalized_notes()) {
+        blocks.push(format!("## Post-Run Context & Notes\n- **Garmin Connect Notes**: {notes}"));
     }
     if blocks.is_empty() {
         return packet;

@@ -7,6 +7,166 @@ pub const GARMIN_KEYRING_SERVICE: &str = "splits-coach-garmin-api-key";
 pub const GARMIN_ACCOUNT: &str = "garmin-personal-api-key";
 pub const GEMINI_ACCOUNT: &str = "gemini_api_key";
 pub const UISERVER_ACCOUNT: &str = "uiserver-auth-token";
+pub const DEFAULT_GEMINI_MODEL_ID: &str = "gemini-4-hydrogen";
+pub const DEFAULT_GEMINI_THINKING_LEVEL: &str = "MEDIUM";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelScope {
+    Background,
+    Coach,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ThinkingLevel {
+    Low,
+    #[default]
+    Medium,
+    High,
+}
+
+impl ThinkingLevel {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ThinkingLevel::Low => "LOW",
+            ThinkingLevel::Medium => "MEDIUM",
+            ThinkingLevel::High => "HIGH",
+        }
+    }
+
+    pub fn from_str_lossy(raw: &str) -> Option<Self> {
+        match raw.trim().to_uppercase().as_str() {
+            "LOW" => Some(ThinkingLevel::Low),
+            "MEDIUM" => Some(ThinkingLevel::Medium),
+            "HIGH" => Some(ThinkingLevel::High),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelSettings {
+    pub global_model_id: String,
+    pub global_thinking_level: ThinkingLevel,
+    pub coach_model_override_id: Option<String>,
+    pub coach_thinking_override: Option<ThinkingLevel>,
+}
+
+impl Default for ModelSettings {
+    fn default() -> Self {
+        Self {
+            global_model_id: DEFAULT_GEMINI_MODEL_ID.to_string(),
+            global_thinking_level: ThinkingLevel::Medium,
+            coach_model_override_id: None,
+            coach_thinking_override: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolvedModel {
+    pub model_id: String,
+    pub thinking_level: ThinkingLevel,
+    pub is_override: bool,
+}
+
+pub fn resolve_model(scope: ModelScope, settings: &ModelSettings) -> ResolvedModel {
+    let global_id = {
+        let trimmed = settings.global_model_id.trim();
+        if trimmed.is_empty() {
+            DEFAULT_GEMINI_MODEL_ID.to_string()
+        } else {
+            trimmed.to_string()
+        }
+    };
+    match scope {
+        ModelScope::Background => ResolvedModel {
+            model_id: global_id,
+            thinking_level: settings.global_thinking_level,
+            is_override: false,
+        },
+        ModelScope::Coach => {
+            let override_id = settings
+                .coach_model_override_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+            let override_thinking = settings.coach_thinking_override;
+            let is_override = override_id.is_some() || override_thinking.is_some();
+            ResolvedModel {
+                model_id: override_id.unwrap_or(global_id),
+                thinking_level: override_thinking.unwrap_or(settings.global_thinking_level),
+                is_override,
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum FirstUseStage {
+    #[default]
+    Intake,
+    ProfileApproval,
+    HistorySync,
+    PlanApproval,
+    Active,
+}
+
+impl FirstUseStage {
+    pub fn next(&self) -> Self {
+        match self {
+            FirstUseStage::Intake => FirstUseStage::ProfileApproval,
+            FirstUseStage::ProfileApproval => FirstUseStage::HistorySync,
+            FirstUseStage::HistorySync => FirstUseStage::PlanApproval,
+            FirstUseStage::PlanApproval | FirstUseStage::Active => FirstUseStage::Active,
+        }
+    }
+
+    pub fn is_guided(&self) -> bool {
+        !matches!(self, FirstUseStage::Active)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IntakeQueuedFile {
+    pub id: String,
+    pub file_name: String,
+    pub relative_path: String,
+    pub mime_type: String,
+    pub kind: String,
+    pub added_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FirstUseFlowState {
+    pub stage: FirstUseStage,
+    #[serde(default = "default_true_flag")]
+    pub auto_calibrate_after_first_sync: bool,
+    #[serde(default)]
+    pub queued_intake_files: Vec<IntakeQueuedFile>,
+    #[serde(default)]
+    pub history_summary_markdown: Option<String>,
+    pub updated_at: String,
+}
+
+fn default_true_flag() -> bool {
+    true
+}
+
+impl Default for FirstUseFlowState {
+    fn default() -> Self {
+        Self {
+            stage: FirstUseStage::Intake,
+            auto_calibrate_after_first_sync: true,
+            queued_intake_files: Vec::new(),
+            history_summary_markdown: None,
+            updated_at: Utc::now().to_rfc3339(),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -653,6 +813,8 @@ pub struct PostRunContext {
     pub final_sweat_rate_l_hr: Option<f64>,
     #[serde(default)]
     pub tempe_sensor_used: Option<bool>,
+    #[serde(default)]
+    pub garmin_notes: Option<String>,
 }
 
 impl PostRunContext {
@@ -897,11 +1059,20 @@ pub struct ActivityRecord {
     pub post_run_context: Option<PostRunContext>,
     #[serde(default)]
     pub fit_temp_source: Option<String>,
+    #[serde(default)]
+    pub garmin_notes: Option<String>,
 }
 
 impl ActivityRecord {
     pub fn distance_km(&self) -> f64 {
         self.distance_m / 1000.0
+    }
+
+    pub fn normalized_notes(&self) -> Option<&str> {
+        self.garmin_notes
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
     }
 }
 
@@ -951,6 +1122,8 @@ pub struct CoachUpdateProposal {
     pub expires_on: Option<String>,
     pub diff_preview: String,
     pub status: String,
+    #[serde(default)]
+    pub plan_json: Option<PlanFile>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

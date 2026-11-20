@@ -226,6 +226,7 @@ impl GarminClient {
                 is_hyrox: None,
                 post_run_context: None,
                 fit_temp_source: None,
+                garmin_notes: normalize_optional_text(dto.description),
             });
         }
 
@@ -350,6 +351,7 @@ impl GarminClient {
                     is_hyrox: None,
                     post_run_context: None,
                     fit_temp_source: None,
+                    garmin_notes: normalize_optional_text(dto.description),
                 });
             }
             if count < PAGE_SIZE {
@@ -437,6 +439,87 @@ impl GarminClient {
 
         let days: Vec<DayRecord> = days_map.into_values().collect();
         Ok((activities, days))
+    }
+
+    /// Lightweight metadata-only fetch for a single activity (`/activity-service/activity/{activityId}`)
+    /// without re-downloading its `.fit` binary.
+    pub async fn fetch_activity_metadata(&self, activity_id: i64) -> Result<ActivityMetadataUpdate, GarminError> {
+        let bytes = self
+            .get_bytes(
+                &format!("/activity-service/activity/{activity_id}"),
+                &[],
+                "application/json",
+            )
+            .await?;
+        let detail: ActivityDetailDTO = serde_json::from_slice(&bytes)
+            .unwrap_or(ActivityDetailDTO {
+                activity_name: None,
+                description: None,
+                metadata_dto: None,
+                summary_dto: None,
+            });
+        let name = normalize_optional_text(
+            detail.activity_name.or_else(|| {
+                detail
+                    .summary_dto
+                    .as_ref()
+                    .and_then(|v| v.get("activityName"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+            }),
+        );
+        let notes = normalize_optional_text(
+            detail
+                .description
+                .or_else(|| {
+                    detail
+                        .metadata_dto
+                        .as_ref()
+                        .and_then(|v| v.get("description"))
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string)
+                })
+                .or_else(|| {
+                    detail
+                        .summary_dto
+                        .as_ref()
+                        .and_then(|v| v.get("description"))
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string)
+                }),
+        );
+        Ok(ActivityMetadataUpdate {
+            garmin_id: activity_id,
+            name,
+            garmin_notes: notes,
+        })
+    }
+
+    /// Metadata-only search over the rolling window (minimum 7 days) to capture notes/titles edited
+    /// in Garmin Connect after initial `.FIT` upload.
+    pub async fn fetch_recent_activity_metadata(
+        &self,
+        days_back: i64,
+    ) -> Result<Vec<ActivityMetadataUpdate>, GarminError> {
+        let start_str = (Utc::now() - Duration::days(days_back.max(7)))
+            .format("%Y-%m-%d")
+            .to_string();
+        let bytes = self
+            .get_bytes(
+                "/activitylist-service/activities/search/activities",
+                &[("start", "0"), ("limit", "100"), ("startDate", &start_str)],
+                "application/json",
+            )
+            .await?;
+        let dtos: Vec<ActivityDTO> = serde_json::from_slice(&bytes).unwrap_or_default();
+        Ok(dtos
+            .into_iter()
+            .map(|dto| ActivityMetadataUpdate {
+                garmin_id: dto.activity_id,
+                name: normalize_optional_text(dto.activity_name),
+                garmin_notes: normalize_optional_text(dto.description),
+            })
+            .collect())
     }
 
     pub async fn sync_weights(&self, days_back: i64) -> Vec<WeightEntry> {
@@ -605,11 +688,24 @@ fn empty_day(date: &str) -> DayRecord {
     }
 }
 
+fn normalize_optional_text(raw: Option<String>) -> Option<String> {
+    raw.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ActivityMetadataUpdate {
+    pub garmin_id: i64,
+    pub name: Option<String>,
+    pub garmin_notes: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ActivityDTO {
     activity_id: i64,
     activity_name: Option<String>,
+    #[serde(default)]
+    description: Option<String>,
     start_time_local: Option<String>,
     activity_type: Option<ActivityTypeDTO>,
     distance: Option<f64>,
@@ -622,6 +718,18 @@ struct ActivityDTO {
     max_hr: Option<f64>,
     average_running_cadence_in_steps_per_minute: Option<f64>,
     activity_training_load: Option<f64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ActivityDetailDTO {
+    activity_name: Option<String>,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default, rename = "metadataDTO")]
+    metadata_dto: Option<serde_json::Value>,
+    #[serde(default, rename = "summaryDTO")]
+    summary_dto: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1330,4 +1438,136 @@ pub fn compute_decoupling_pct(points: &[FitTrackPoint]) -> Option<f64> {
         return None;
     }
     Some((((ef1 - ef2) / ef1) * 100.0).rounded_1())
+}
+
+/// Extracts a concise text summary from a user-uploaded `.fit` file (e.g., Garmin Stress/Lactate test)
+/// so it can be attached to onboarding intake Coach prompts.
+pub fn summarize_fit_file_for_intake(path: &std::path::Path) -> Result<String, String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("Failed to read .fit file: {e}"))?;
+    let records = fitparser::from_bytes(&bytes).map_err(|e| format!("FIT parse error: {e}"))?;
+
+    let mut sport: Option<String> = None;
+    let mut sub_sport: Option<String> = None;
+    let mut total_dist_m: Option<f64> = None;
+    let mut total_elapsed_s: Option<f64> = None;
+    let mut avg_hr: Option<f64> = None;
+    let mut max_hr: Option<f64> = None;
+    let mut min_hr: Option<f64> = None;
+    let mut threshold_hr: Option<f64> = None;
+    let mut lactate_vals: Vec<String> = Vec::new();
+    let mut lap_lines: Vec<String> = Vec::new();
+    let mut record_hr_min: Option<f64> = None;
+    let mut record_hr_max: Option<f64> = None;
+    let mut record_count = 0usize;
+
+    for msg in records {
+        match msg.kind() {
+            fitparser::profile::MesgNum::Session => {
+                for field in msg.fields() {
+                    match field.name() {
+                        "sport" => sport = Some(format!("{:?}", field.value())),
+                        "sub_sport" => sub_sport = Some(format!("{:?}", field.value())),
+                        "total_distance" => total_dist_m = value_as_f64(field.value()),
+                        "total_elapsed_time" | "total_timer_time" => {
+                            if total_elapsed_s.is_none() || field.name() == "total_timer_time" {
+                                total_elapsed_s = value_as_f64(field.value());
+                            }
+                        }
+                        "avg_heart_rate" => avg_hr = value_as_f64(field.value()),
+                        "max_heart_rate" => max_hr = value_as_f64(field.value()),
+                        "min_heart_rate" => min_hr = value_as_f64(field.value()),
+                        "threshold_heart_rate" | "functional_threshold_heart_rate" => {
+                            threshold_hr = value_as_f64(field.value());
+                        }
+                        other if other.contains("lactate") => {
+                            lactate_vals.push(format!("{other}: {:?}", field.value()));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            fitparser::profile::MesgNum::Lap => {
+                let mut d = 0.0_f64;
+                let mut t = 0.0_f64;
+                let mut l_avg_hr: Option<f64> = None;
+                let mut l_max_hr: Option<f64> = None;
+                for field in msg.fields() {
+                    match field.name() {
+                        "total_distance" => d = value_as_f64(field.value()).unwrap_or(0.0),
+                        "total_timer_time" | "total_elapsed_time" => {
+                            if t <= 0.0 || field.name() == "total_timer_time" {
+                                t = value_as_f64(field.value()).unwrap_or(0.0);
+                            }
+                        }
+                        "avg_heart_rate" => l_avg_hr = value_as_f64(field.value()),
+                        "max_heart_rate" => l_max_hr = value_as_f64(field.value()),
+                        other if other.contains("lactate") || other.contains("threshold") => {
+                            lactate_vals.push(format!("lap#{} {other}: {:?}", lap_lines.len() + 1, field.value()));
+                        }
+                        _ => {}
+                    }
+                }
+                if lap_lines.len() < 16 && (t > 0.0 || d > 0.0 || l_avg_hr.is_some()) {
+                    lap_lines.push(format!(
+                        "  - Lap {}: {:.0}s, {:.2} km, avg HR {}, max HR {}",
+                        lap_lines.len() + 1,
+                        t,
+                        d / 1000.0,
+                        l_avg_hr.map_or("–".to_string(), |v| format!("{:.0}", v)),
+                        l_max_hr.map_or("–".to_string(), |v| format!("{:.0}", v)),
+                    ));
+                }
+            }
+            fitparser::profile::MesgNum::Record => {
+                record_count += 1;
+                for field in msg.fields() {
+                    if field.name() == "heart_rate" {
+                        if let Some(hr) = value_as_f64(field.value()).filter(|&h| h > 30.0 && h < 235.0) {
+                            record_hr_min = Some(record_hr_min.map_or(hr, |m| m.min(hr)));
+                            record_hr_max = Some(record_hr_max.map_or(hr, |m| m.max(hr)));
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let file_name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("uploaded.fit");
+    let mut out = vec![
+        format!("File: {file_name} (records: {record_count}, laps: {})", lap_lines.len()),
+        format!(
+            "Sport: {} / {}",
+            sport.as_deref().unwrap_or("unknown"),
+            sub_sport.as_deref().unwrap_or("generic")
+        ),
+    ];
+    if let Some(d) = total_dist_m {
+        out.push(format!("Distance: {:.2} km", d / 1000.0));
+    }
+    if let Some(t) = total_elapsed_s {
+        out.push(format!("Duration: {:.0} s ({:.1} min)", t, t / 60.0));
+    }
+    let eff_max = max_hr.or(record_hr_max);
+    let eff_min = min_hr.or(record_hr_min);
+    out.push(format!(
+        "HR: avg {} bpm, max {} bpm, min {} bpm",
+        avg_hr.map_or("–".to_string(), |v| format!("{v:.0}")),
+        eff_max.map_or("–".to_string(), |v| format!("{v:.0}")),
+        eff_min.map_or("–".to_string(), |v| format!("{v:.0}")),
+    ));
+    if let Some(thr) = threshold_hr {
+        out.push(format!("FIT threshold_heart_rate: {thr:.0} bpm"));
+    }
+    if !lactate_vals.is_empty() {
+        out.push(format!("Lactate/threshold fields: {}", lactate_vals.join("; ")));
+    }
+    if !lap_lines.is_empty() {
+        out.push("Lap breakdown:".to_string());
+        out.extend(lap_lines);
+    }
+    Ok(out.join("\n"))
 }

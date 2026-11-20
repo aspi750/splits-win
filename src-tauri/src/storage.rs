@@ -111,6 +111,45 @@ impl SharedStore {
         Ok(())
     }
 
+    pub fn load_first_use_state(&self) -> Result<FirstUseFlowState, StorageError> {
+        if let Some(existing) = self.read_json::<FirstUseFlowState>("state/first_use_flow.json")? {
+            return Ok(existing);
+        }
+        let has_profile = self
+            .read_text("COACH_PROFILE.md")?
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false);
+        let has_plan = self
+            .read_text("TRAINING_PLAN.md")?
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false);
+        let mut state = FirstUseFlowState::default();
+        if has_profile && has_plan {
+            state.stage = FirstUseStage::Active;
+        }
+        Ok(state)
+    }
+
+    pub fn save_first_use_state(&self, state: &FirstUseFlowState) -> Result<(), StorageError> {
+        let mut next = state.clone();
+        next.updated_at = chrono::Utc::now().to_rfc3339();
+        let target = self.root_dir.join("state/first_use_flow.json");
+        let data = serde_json::to_vec_pretty(&next)?;
+        Self::atomic_write_bytes(&target, &data)
+    }
+
+    pub fn remove_relative_file(&self, rel: &str) -> Result<(), StorageError> {
+        let trimmed = rel.trim().trim_start_matches(['/', '\\']);
+        if trimmed.is_empty() || trimmed.contains("..") {
+            return Ok(());
+        }
+        let path = self.root_dir.join(trimmed);
+        if path.exists() {
+            fs::remove_file(path)?;
+        }
+        Ok(())
+    }
+
     fn backup_if_exists(&self, target: &Path) -> Result<(), StorageError> {
         if !target.exists() {
             return Ok(());
@@ -243,6 +282,10 @@ impl Database {
                 body_water_pct REAL,
                 muscle_mass_kg REAL,
                 source TEXT NOT NULL DEFAULT 'garmin_scale'
+            );
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
             );",
         )?;
         let conn = self.conn.lock().unwrap();
@@ -250,6 +293,16 @@ impl Database {
         let _ = conn.execute("ALTER TABLE activities ADD COLUMN is_hyrox INTEGER", []);
         let _ = conn.execute("ALTER TABLE activities ADD COLUMN post_run_context_json TEXT", []);
         let _ = conn.execute("ALTER TABLE activities ADD COLUMN fit_temp_source TEXT", []);
+        let _ = conn.execute("ALTER TABLE activities ADD COLUMN garmin_notes TEXT", []);
+
+        let _ = conn.execute(
+            "INSERT OR IGNORE INTO settings (key, value) VALUES ('global_model_id', ?1)",
+            params![DEFAULT_GEMINI_MODEL_ID],
+        );
+        let _ = conn.execute(
+            "INSERT OR IGNORE INTO settings (key, value) VALUES ('global_thinking_level', ?1)",
+            params![DEFAULT_GEMINI_THINKING_LEVEL],
+        );
 
         let has_profile: i64 = conn.query_row(
             "SELECT COUNT(*) FROM user_profile WHERE id = 1",
@@ -336,6 +389,110 @@ impl Database {
         Ok(())
     }
 
+    pub fn get_setting(&self, key: &str) -> Result<Option<String>, StorageError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT value FROM settings WHERE key = ?1 LIMIT 1")?;
+        let mut rows = stmt.query_map(params![key], |r| r.get::<_, String>(0))?;
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn set_setting(&self, key: &str, value: Option<&str>) -> Result<(), StorageError> {
+        let conn = self.conn.lock().unwrap();
+        match value.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(val) => {
+                conn.execute(
+                    "INSERT INTO settings (key, value) VALUES (?1, ?2)
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    params![key, val],
+                )?;
+            }
+            None => {
+                conn.execute("DELETE FROM settings WHERE key = ?1", params![key])?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn load_model_settings(&self) -> Result<ModelSettings, StorageError> {
+        let global_model_id = self
+            .get_setting("global_model_id")?
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| DEFAULT_GEMINI_MODEL_ID.to_string());
+        let global_thinking_level = self
+            .get_setting("global_thinking_level")?
+            .and_then(|s| ThinkingLevel::from_str_lossy(&s))
+            .unwrap_or(ThinkingLevel::Medium);
+        let coach_model_override_id = self
+            .get_setting("coach_model_override_id")?
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let coach_thinking_override = self
+            .get_setting("coach_thinking_override")?
+            .and_then(|s| ThinkingLevel::from_str_lossy(&s));
+        Ok(ModelSettings {
+            global_model_id,
+            global_thinking_level,
+            coach_model_override_id,
+            coach_thinking_override,
+        })
+    }
+
+    pub fn save_global_model_settings(
+        &self,
+        model_id: &str,
+        thinking_level: ThinkingLevel,
+    ) -> Result<ModelSettings, StorageError> {
+        let trimmed = model_id.trim();
+        let resolved_id = if trimmed.is_empty() {
+            DEFAULT_GEMINI_MODEL_ID
+        } else {
+            trimmed
+        };
+        self.set_setting("global_model_id", Some(resolved_id))?;
+        self.set_setting("global_thinking_level", Some(thinking_level.as_str()))?;
+        self.load_model_settings()
+    }
+
+    pub fn save_coach_model_override(
+        &self,
+        model_id: Option<&str>,
+        thinking_level: Option<ThinkingLevel>,
+    ) -> Result<ModelSettings, StorageError> {
+        let cleaned_id = model_id.map(str::trim).filter(|s| !s.is_empty());
+        self.set_setting("coach_model_override_id", cleaned_id)?;
+        self.set_setting(
+            "coach_thinking_override",
+            thinking_level.map(|t| t.as_str()),
+        )?;
+        self.load_model_settings()
+    }
+
+    pub fn update_activity_metadata(
+        &self,
+        garmin_id: i64,
+        name: Option<&str>,
+        garmin_notes: Option<&str>,
+    ) -> Result<bool, StorageError> {
+        let cleaned_name = name.map(str::trim).filter(|s| !s.is_empty());
+        let cleaned_notes = garmin_notes.map(str::trim).filter(|s| !s.is_empty());
+        let conn = self.conn.lock().unwrap();
+        let changed = match cleaned_name {
+            Some(n) => conn.execute(
+                "UPDATE activities SET name = ?1, garmin_notes = ?2 WHERE garmin_id = ?3",
+                params![n, cleaned_notes, garmin_id],
+            )?,
+            None => conn.execute(
+                "UPDATE activities SET garmin_notes = ?1 WHERE garmin_id = ?2",
+                params![cleaned_notes, garmin_id],
+            )?,
+        };
+        Ok(changed > 0)
+    }
+
     pub fn upsert_weight_entry(&self, entry: &WeightEntry) -> Result<(), StorageError> {
         self.conn.lock().unwrap().execute(
             "INSERT INTO weight_entries (
@@ -387,11 +544,12 @@ impl Database {
             .post_run_context
             .as_ref()
             .and_then(|c| serde_json::to_string(c).ok());
+        let cleaned_notes = act.normalized_notes();
         self.conn.lock().unwrap().execute(
             "INSERT INTO activities (
                 garmin_id, name, type_key, start_iso, distance_m, duration_sec, moving_duration_sec,
-                elevation_gain_m, average_hr, max_hr, cadence_spm, training_load, shoe_name, is_hyrox, post_run_context_json, fit_temp_source
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+                elevation_gain_m, average_hr, max_hr, cadence_spm, training_load, shoe_name, is_hyrox, post_run_context_json, fit_temp_source, garmin_notes
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
             ON CONFLICT(garmin_id) DO UPDATE SET
                 name=excluded.name, type_key=excluded.type_key, start_iso=excluded.start_iso,
                 distance_m=excluded.distance_m, duration_sec=excluded.duration_sec,
@@ -400,12 +558,13 @@ impl Database {
                 training_load=excluded.training_load, shoe_name=excluded.shoe_name,
                 is_hyrox=COALESCE(excluded.is_hyrox, activities.is_hyrox),
                 post_run_context_json=COALESCE(excluded.post_run_context_json, activities.post_run_context_json),
-                fit_temp_source=COALESCE(excluded.fit_temp_source, activities.fit_temp_source)",
+                fit_temp_source=COALESCE(excluded.fit_temp_source, activities.fit_temp_source),
+                garmin_notes=COALESCE(excluded.garmin_notes, activities.garmin_notes)",
             params![
                 act.garmin_id, act.name, act.type_key, act.start_iso, act.distance_m,
                 act.duration_sec, act.moving_duration_sec, act.elevation_gain_m,
                 act.average_hr, act.max_hr, act.cadence_spm, act.training_load, act.shoe_name,
-                hyrox_int, post_run_json, act.fit_temp_source
+                hyrox_int, post_run_json, act.fit_temp_source, cleaned_notes
             ],
         )?;
         Ok(())
@@ -415,7 +574,7 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT garmin_id, name, type_key, start_iso, distance_m, duration_sec, moving_duration_sec,
-                    elevation_gain_m, average_hr, max_hr, cadence_spm, training_load, shoe_name, is_hyrox, post_run_context_json, fit_temp_source
+                    elevation_gain_m, average_hr, max_hr, cadence_spm, training_load, shoe_name, is_hyrox, post_run_context_json, fit_temp_source, garmin_notes
              FROM activities ORDER BY start_iso DESC LIMIT ?1",
         )?;
         let rows = stmt.query_map(params![limit as i64], |r| {
@@ -438,6 +597,7 @@ impl Database {
                 is_hyrox: hyrox_opt.map(|v| v != 0),
                 post_run_context: post_run_str.and_then(|s| serde_json::from_str(&s).ok()),
                 fit_temp_source: r.get(15)?,
+                garmin_notes: r.get(16)?,
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -498,7 +658,7 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT garmin_id, name, type_key, start_iso, distance_m, duration_sec, moving_duration_sec,
-                    elevation_gain_m, average_hr, max_hr, cadence_spm, training_load, shoe_name, is_hyrox, post_run_context_json, fit_temp_source
+                    elevation_gain_m, average_hr, max_hr, cadence_spm, training_load, shoe_name, is_hyrox, post_run_context_json, fit_temp_source, garmin_notes
              FROM activities WHERE garmin_id = ?1 LIMIT 1",
         )?;
         let mut rows = stmt.query_map(params![garmin_id], |r| {
@@ -521,6 +681,7 @@ impl Database {
                 is_hyrox: hyrox_opt.map(|v| v != 0),
                 post_run_context: post_run_str.and_then(|s| serde_json::from_str(&s).ok()),
                 fit_temp_source: r.get(15)?,
+                garmin_notes: r.get(16)?,
             })
         })?;
         match rows.next() {

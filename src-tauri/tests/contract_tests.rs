@@ -122,6 +122,7 @@ fn test_shared_store_and_sqlite_roundtrip() {
         is_hyrox: None,
         post_run_context: None,
         fit_temp_source: None,
+        garmin_notes: None,
     })
     .unwrap();
     let acts = db.list_activities(10).unwrap();
@@ -176,6 +177,7 @@ fn test_readiness_engine_green_red_amber_and_persistence() {
             is_hyrox: None,
             post_run_context: None,
             fit_temp_source: None,
+            garmin_notes: None,
         }],
         days: &[healthy_day.clone()],
         plan: None,
@@ -209,6 +211,7 @@ fn test_readiness_engine_green_red_amber_and_persistence() {
             is_hyrox: None,
             post_run_context: None,
             fit_temp_source: None,
+            garmin_notes: None,
         }],
         days: &[bad_day],
         plan: None,
@@ -316,6 +319,7 @@ fn test_apply_coach_proposal_and_history_backup() {
         expires_on: None,
         diff_preview: String::new(),
         status: "pending_user_approval".to_string(),
+        plan_json: None,
     };
 
     apply_coach_proposal(&store, &proposal).unwrap();
@@ -385,6 +389,7 @@ fn test_stage2_2_hybrid_hyrox_spacing_and_compromised_run_audit() {
         is_hyrox: None,
         post_run_context: None,
         fit_temp_source: None,
+        garmin_notes: None,
     };
 
     let mut hybrid_config = AthleteConfig::default();
@@ -464,6 +469,7 @@ fn test_stage2_2_training_history_analyzer_and_starter_templates() {
             is_hyrox: None,
             post_run_context: None,
             fit_temp_source: None,
+            garmin_notes: None,
         });
         if offset % 4 == 1 {
             activities.push(ActivityRecord {
@@ -483,6 +489,7 @@ fn test_stage2_2_training_history_analyzer_and_starter_templates() {
                 is_hyrox: None,
                 post_run_context: None,
                 fit_temp_source: None,
+                garmin_notes: None,
             });
         }
     }
@@ -566,6 +573,7 @@ fn test_stage3_1_user_profile_migration_and_hyrox_reclassification() {
         is_hyrox: None,
         post_run_context: None,
         fit_temp_source: None,
+        garmin_notes: None,
     };
     db.upsert_activity(&act).unwrap();
     db.set_activity_hyrox(555, true).unwrap();
@@ -734,6 +742,7 @@ fn test_v0_2_1_sweat_matrix_1hz_window_and_ledger() {
         is_hyrox: None,
         post_run_context: None,
         fit_temp_source: None,
+        garmin_notes: None,
     })
     .unwrap();
     db.save_post_run_context(888, &computed).unwrap();
@@ -903,6 +912,7 @@ fn test_garmin_weight_sync_scale_pairing_and_hybrid_tempe_parity() {
         is_hyrox: None,
         post_run_context: Some(paired),
         fit_temp_source: Some("watch_internal".to_string()),
+        garmin_notes: None,
     };
     db.upsert_activity(&act).unwrap();
     let tool_res =
@@ -910,4 +920,283 @@ fn test_garmin_weight_sync_scale_pairing_and_hybrid_tempe_parity() {
     assert_eq!(tool_res["sweat_status"].as_str(), Some("final_verified"));
     assert_eq!(tool_res["final_sweat_rate_l_hr"].as_f64(), Some(1.5));
     assert_eq!(tool_res["temp_source"].as_str(), Some("user_confirmed_tempe"));
+}
+
+#[test]
+fn test_v0_2_2_model_resolution_and_sqlite_settings() {
+    let db = Database::open_in_memory().unwrap();
+    let defaults = db.load_model_settings().unwrap();
+    assert_eq!(defaults.global_model_id, DEFAULT_GEMINI_MODEL_ID);
+    assert_eq!(defaults.global_thinking_level, ThinkingLevel::Medium);
+    assert_eq!(defaults.coach_model_override_id, None);
+    assert_eq!(defaults.coach_thinking_override, None);
+
+    // Background & Coach both follow Hydrogen Medium by default
+    let bg = resolve_model(ModelScope::Background, &defaults);
+    assert_eq!(bg.model_id, "gemini-4-hydrogen");
+    assert_eq!(bg.thinking_level, ThinkingLevel::Medium);
+    assert!(!bg.is_override);
+
+    let coach_default = resolve_model(ModelScope::Coach, &defaults);
+    assert_eq!(coach_default.model_id, "gemini-4-hydrogen");
+    assert_eq!(coach_default.thinking_level, ThinkingLevel::Medium);
+    assert!(!coach_default.is_override);
+
+    // Apply Coach override; Background MUST remain on global default
+    let with_override = db
+        .save_coach_model_override(Some("gemini-2.5-pro"), Some(ThinkingLevel::High))
+        .unwrap();
+    let coach_overridden = resolve_model(ModelScope::Coach, &with_override);
+    assert_eq!(coach_overridden.model_id, "gemini-2.5-pro");
+    assert_eq!(coach_overridden.thinking_level, ThinkingLevel::High);
+    assert!(coach_overridden.is_override);
+
+    let bg_still_global = resolve_model(ModelScope::Background, &with_override);
+    assert_eq!(bg_still_global.model_id, "gemini-4-hydrogen");
+    assert_eq!(bg_still_global.thinking_level, ThinkingLevel::Medium);
+    assert!(!bg_still_global.is_override);
+
+    // Update global defaults & clear Coach override -> both scopes converge on new global
+    db.save_global_model_settings("gemini-3.1-pro-preview", ThinkingLevel::Low)
+        .unwrap();
+    let cleared = db.save_coach_model_override(None, None).unwrap();
+    let coach_after_clear = resolve_model(ModelScope::Coach, &cleared);
+    let bg_after_update = resolve_model(ModelScope::Background, &cleared);
+    assert_eq!(coach_after_clear.model_id, "gemini-3.1-pro-preview");
+    assert_eq!(coach_after_clear.thinking_level, ThinkingLevel::Low);
+    assert!(!coach_after_clear.is_override);
+    assert_eq!(bg_after_update.model_id, "gemini-3.1-pro-preview");
+    assert_eq!(bg_after_update.thinking_level, ThinkingLevel::Low);
+}
+
+#[test]
+fn test_v0_2_2_garmin_notes_migration_metadata_refresh_and_coach_context() {
+    let dir = make_temp_dir("notes-migration");
+    let db_path = dir.join("legacy.sqlite");
+
+    // 1. Seed a legacy activities table lacking `garmin_notes`, then open via Database::open (idempotent ALTER TABLE)
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE activities (
+                garmin_id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                type_key TEXT NOT NULL,
+                start_iso TEXT NOT NULL,
+                distance_m REAL NOT NULL,
+                duration_sec REAL NOT NULL,
+                moving_duration_sec REAL NOT NULL,
+                elevation_gain_m REAL NOT NULL,
+                average_hr REAL,
+                max_hr REAL,
+                cadence_spm REAL,
+                training_load REAL,
+                shoe_name TEXT
+            );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO activities (garmin_id, name, type_key, start_iso, distance_m, duration_sec, moving_duration_sec, elevation_gain_m)
+             VALUES (7001, 'Old Run', 'running', '2026-11-18T07:00:00Z', 5000.0, 1800.0, 1800.0, 15.0)",
+            [],
+        )
+        .unwrap();
+    }
+
+    let db = Database::open(&db_path).unwrap();
+    let migrated_old = db.get_activity(7001).unwrap().unwrap();
+    assert_eq!(migrated_old.garmin_notes, None);
+
+    // 2. Late metadata edit & clear via update_activity_metadata without touching FIT tracks
+    db.update_activity_metadata(
+        7001,
+        Some("Easy Morning Shakeout"),
+        Some("Left calf tight at km 2, relaxed after 20 min."),
+    )
+    .unwrap();
+    let updated = db.get_activity(7001).unwrap().unwrap();
+    assert_eq!(updated.name, "Easy Morning Shakeout");
+    assert_eq!(
+        updated.garmin_notes.as_deref(),
+        Some("Left calf tight at km 2, relaxed after 20 min.")
+    );
+
+    // COALESCE in upsert_activity keeps existing notes when list sync omits description
+    let mut partial = updated.clone();
+    partial.garmin_notes = None;
+    db.upsert_activity(&partial).unwrap();
+    assert_eq!(
+        db.get_activity(7001).unwrap().unwrap().garmin_notes.as_deref(),
+        Some("Left calf tight at km 2, relaxed after 20 min.")
+    );
+
+    // 3. Inject non-empty garmin_notes into CoachPacketBuilder, ForensicTelemetryReport, and get_activity_detail payload
+    let store = SharedStore::new(Some(dir.join("coach"))).unwrap();
+    let points: Vec<FitTrackPoint> = (0..10)
+        .map(|s| make_fit_point(s as f64, s as f64 * 3.0, 3.0, Some(132.0), Some(174.0), Some(10.0)))
+        .collect();
+    let analysis = analyze_fit_points(7001, points, &AthleteConfig::default());
+    db.upsert_fit_track(7001, &analysis).unwrap();
+
+    let detail_json = splits_win_lib::coach::build_activity_detail_tool_payload(
+        &updated,
+        &store,
+        Some(&db),
+        std::slice::from_ref(&updated),
+    );
+    assert_eq!(
+        detail_json["garmin_notes"].as_str(),
+        Some("Left calf tight at km 2, relaxed after 20 min.")
+    );
+    assert_eq!(
+        detail_json["post_run_context"]["garmin_notes"].as_str(),
+        Some("Left calf tight at km 2, relaxed after 20 min.")
+    );
+    assert_eq!(
+        detail_json["forensic_telemetry"]["garmin_notes"].as_str(),
+        Some("Left calf tight at km 2, relaxed after 20 min.")
+    );
+
+    let packet = CoachPacketBuilder::build_markdown(
+        &AthleteConfig::default(),
+        std::slice::from_ref(&updated),
+        &[],
+        None,
+        None,
+        "How did that shakeout go?",
+        Utc.with_ymd_and_hms(2026, 11, 18, 10, 0, 0).unwrap(),
+    );
+    assert!(packet.contains("## Garmin Connect Activity Notes"));
+    assert!(packet.contains("Left calf tight at km 2, relaxed after 20 min."));
+
+    let enriched = append_forensic_section(packet, Some(&updated), Some(&analysis.forensic_telemetry.unwrap()), None);
+    assert!(enriched.contains("Garmin Connect Notes"));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_v0_2_2_optional_blank_goal_time_handling() {
+    let mut cfg = AthleteConfig::default();
+    cfg.specs.display_name = "Alex".to_string();
+    cfg.objective.goal_type = GoalType::Race;
+    cfg.objective.race_name = Some("Half Marathon".to_string());
+    cfg.objective.target_time_description = Some("   ".to_string());
+
+    let summary_prompt = cfg.prompt_summary(None);
+    assert!(summary_prompt.contains("Half Marathon"));
+    assert!(!summary_prompt.contains("target:"));
+
+    let now = Utc.with_ymd_and_hms(2026, 11, 18, 10, 0, 0).unwrap();
+    let hist = analyze_training_history(&[], &cfg, now);
+    let profile_md = starter_coach_profile_markdown(&cfg, &hist);
+    let plan_md = starter_training_plan_markdown(&cfg, &hist);
+    assert!(!profile_md.contains("Goal Time"));
+    assert!(!plan_md.contains("Goal Time"));
+    assert!(!plan_md.contains("target:"));
+
+    // Provided goal time is preserved cleanly
+    cfg.objective.target_time_description = Some("Sub 1:42".to_string());
+    let plan_with_goal = starter_training_plan_markdown(&cfg, &hist);
+    assert!(plan_with_goal.contains("Goal Time"));
+    assert!(plan_with_goal.contains("Sub 1:42"));
+}
+
+#[test]
+fn test_v0_2_2_first_use_state_machine_and_proposal_consolidation() {
+    let dir = make_temp_dir("first-use");
+    let store = SharedStore::new(Some(dir.clone())).unwrap();
+
+    // 1. Clean slate starts in Intake with auto_calibrate_after_first_sync = true
+    let initial = store.load_first_use_state().unwrap();
+    assert_eq!(initial.stage, FirstUseStage::Intake);
+    assert!(initial.auto_calibrate_after_first_sync);
+
+    // 2. Stage transitions: Intake -> ProfileApproval -> HistorySync -> PlanApproval -> Active
+    let mut flow = initial;
+    flow.stage = flow.stage.next();
+    assert_eq!(flow.stage, FirstUseStage::ProfileApproval);
+    store.save_first_use_state(&flow).unwrap();
+    assert_eq!(store.load_first_use_state().unwrap().stage, FirstUseStage::ProfileApproval);
+
+    let sys = splits_win_lib::coach::build_static_system_instruction(
+        &store,
+        &AthleteConfig::default(),
+        &[],
+        None,
+        Some(&flow),
+    );
+    assert!(sys.contains("HR-First Governor"));
+    assert!(sys.contains("Hard Pace Floor"));
+    assert!(sys.contains("ONE consolidated `COACH_PROFILE.md` proposal"));
+
+    flow.stage = flow.stage.next();
+    assert_eq!(flow.stage, FirstUseStage::HistorySync);
+    flow.stage = flow.stage.next();
+    assert_eq!(flow.stage, FirstUseStage::PlanApproval);
+    flow.stage = flow.stage.next();
+    assert_eq!(flow.stage, FirstUseStage::Active);
+    store.save_first_use_state(&flow).unwrap();
+    assert!(!store.load_first_use_state().unwrap().stage.is_guided());
+
+    // 3. Consolidate multi-section proposals into 1 card per file & apply all sections + plan.json
+    let now = Utc.with_ymd_and_hms(2026, 11, 18, 10, 0, 0).unwrap();
+    let cfg = AthleteConfig::default();
+    let summary = analyze_training_history(&[], &cfg, now);
+    let plan_obj = splits_win_lib::coach::starter_plan_file(&cfg, &summary);
+
+    let raw_proposals = vec![
+        CoachUpdateProposal {
+            id: "1".to_string(),
+            target_file: "COACH_PROFILE.md".to_string(),
+            reason: "Athlete Identity".to_string(),
+            updated_section_markdown: "## Athlete Identity\n- **Athlete**: Sam".to_string(),
+            expires_on: None,
+            diff_preview: String::new(),
+            status: "pending_user_approval".to_string(),
+            plan_json: None,
+        },
+        CoachUpdateProposal {
+            id: "2".to_string(),
+            target_file: "COACH_PROFILE.md".to_string(),
+            reason: "Guardrails".to_string(),
+            updated_section_markdown: "## Medical & Biomechanical Guardrails\n- **HR-First**: enabled".to_string(),
+            expires_on: None,
+            diff_preview: String::new(),
+            status: "pending_user_approval".to_string(),
+            plan_json: None,
+        },
+        CoachUpdateProposal {
+            id: "3".to_string(),
+            target_file: "TRAINING_PLAN.md".to_string(),
+            reason: "Block Structure".to_string(),
+            updated_section_markdown: "## Mesocycle & Block Structure\n- 3:1 build/deload".to_string(),
+            expires_on: Some("2026-12-31".to_string()),
+            diff_preview: String::new(),
+            status: "pending_user_approval".to_string(),
+            plan_json: Some(plan_obj),
+        },
+    ];
+
+    let consolidated = splits_win_lib::coach::consolidate_proposals(raw_proposals);
+    assert_eq!(consolidated.len(), 2);
+    assert_eq!(consolidated[0].target_file, "COACH_PROFILE.md");
+    assert!(consolidated[0].reason.contains("Athlete Identity"));
+    assert!(consolidated[0].reason.contains("Guardrails"));
+    assert!(consolidated[0].diff_preview.contains("## Athlete Identity"));
+    assert!(consolidated[0].diff_preview.contains("## Medical & Biomechanical Guardrails"));
+
+    apply_coach_proposal(&store, &consolidated[0]).unwrap();
+    let saved_profile = store.read_text("COACH_PROFILE.md").unwrap().unwrap();
+    assert!(saved_profile.contains("- **Athlete**: Sam"));
+    assert!(saved_profile.contains("- **HR-First**: enabled"));
+
+    apply_coach_proposal(&store, &consolidated[1]).unwrap();
+    assert!(dir.join("plan.json").exists());
+
+    // 4. Existing legacy directory without first_use_flow.json upgrades safely as Active
+    let _ = std::fs::remove_file(dir.join("state/first_use_flow.json"));
+    assert_eq!(store.load_first_use_state().unwrap().stage, FirstUseStage::Active);
+
+    let _ = std::fs::remove_dir_all(&dir);
 }

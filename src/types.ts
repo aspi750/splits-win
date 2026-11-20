@@ -1,5 +1,37 @@
 export type ExecutionMode = "self_contained" | "external_server";
 export type CoachEngineMode = "gemini_api" | "clipboard_packet";
+export type ThinkingLevel = "LOW" | "MEDIUM" | "HIGH";
+
+export interface ModelSettings {
+  global_model_id: string;
+  global_thinking_level: ThinkingLevel;
+  coach_model_override_id: string | null;
+  coach_thinking_override: ThinkingLevel | null;
+}
+
+export type FirstUseStage =
+  | "intake"
+  | "profile_approval"
+  | "history_sync"
+  | "plan_approval"
+  | "active";
+
+export interface IntakeQueuedFile {
+  id: string;
+  file_name: string;
+  relative_path: string;
+  mime_type: string;
+  kind: string;
+  added_at: string;
+}
+
+export interface FirstUseFlowState {
+  stage: FirstUseStage;
+  auto_calibrate_after_first_sync: boolean;
+  queued_intake_files: IntakeQueuedFile[];
+  history_summary_markdown: string | null;
+  updated_at: string;
+}
 export type GoalType =
   | "race"
   | "base_building"
@@ -137,6 +169,7 @@ export interface PostRunContext {
   provisional_sweat_rate_l_hr?: number | null;
   final_sweat_rate_l_hr?: number | null;
   tempe_sensor_used?: boolean | null;
+  garmin_notes?: string | null;
 }
 
 export interface ActivityRecord {
@@ -156,6 +189,7 @@ export interface ActivityRecord {
   is_hyrox?: boolean | null;
   post_run_context?: PostRunContext | null;
   fit_temp_source?: string | null;
+  garmin_notes?: string | null;
 }
 
 export interface DayRecord {
@@ -188,6 +222,8 @@ export interface BootstrapState {
   activities: ActivityRecord[];
   days: DayRecord[];
   needs_initial_coach_setup?: boolean;
+  model_settings?: ModelSettings;
+  first_use_state?: FirstUseFlowState;
 }
 
 export interface CoachUpdateProposal {
@@ -198,6 +234,7 @@ export interface CoachUpdateProposal {
   expires_on: string | null;
   diff_preview: string;
   status: string;
+  plan_json?: unknown | null;
 }
 
 export interface FitTrackPoint {
@@ -315,6 +352,7 @@ export interface ForensicTelemetryReport {
   laps: LapForensicDistribution[];
   micro_events: ForensicMicroEvent[];
   temp_source?: string;
+  garmin_notes?: string | null;
 }
 
 export interface FitSplit {

@@ -1,7 +1,14 @@
 import { useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
-import type { AthleteConfig, AthleteType, FitBaselineProbe, UserProfile } from "../types";
+import type {
+  AthleteConfig,
+  AthleteType,
+  FirstUseFlowState,
+  ModelSettings,
+  ThinkingLevel,
+  UserProfile,
+} from "../types";
 
 const HYROX_STATIONS = [
   "SkiErg",
@@ -47,6 +54,8 @@ function formatMmSs(sec: number | null | undefined): string {
 export function OnboardingWizard({
   initialConfig,
   initialProfile,
+  initialModelSettings,
+  initialFirstUseState,
   hasGarminKey,
   hasGeminiKey,
   canDismiss,
@@ -55,11 +64,13 @@ export function OnboardingWizard({
 }: {
   initialConfig: AthleteConfig;
   initialProfile: UserProfile;
+  initialModelSettings?: ModelSettings;
+  initialFirstUseState?: FirstUseFlowState;
   hasGarminKey: boolean;
   hasGeminiKey: boolean;
   canDismiss: boolean;
   onDismiss: () => void;
-  onComplete: (initialCoachPrompt: string) => Promise<void>;
+  onComplete: () => Promise<void>;
 }) {
   const [step, setStep] = useState<1 | 2 | 3 | 4>(1);
   const [busy, setBusy] = useState(false);
@@ -72,27 +83,28 @@ export function OnboardingWizard({
   const [heightCm, setHeightCm] = useState("175");
   const [sex, setSex] = useState("Unspecified");
 
-  // Step 2: Garmin BYOK & FIT Probe
+  // Step 2: Garmin BYOK, Auto-Calibrate & Optional Intake Files (.pdf / .fit)
   const [garminKey, setGarminKey] = useState("");
   const [garminVerified, setGarminVerified] = useState(hasGarminKey);
   const [garminStatus, setGarminStatus] = useState<string | null>(
     hasGarminKey ? "Garmin Personal API Key already stored in Credential Manager." : null
   );
-  const [probe, setProbe] = useState<FitBaselineProbe | null>(null);
+  const [autoCalibrate, setAutoCalibrate] = useState(
+    initialFirstUseState?.auto_calibrate_after_first_sync ?? true
+  );
+  const [queuedFiles, setQueuedFiles] = useState(
+    initialFirstUseState?.queued_intake_files ?? []
+  );
   const [maxHR, setMaxHR] = useState(initialConfig.specs.maxHR?.toString() ?? "");
   const [rhrBaseline, setRhrBaseline] = useState(initialConfig.specs.restingHRBaseline?.toString() ?? "");
   const [lthrBpm, setLthrBpm] = useState(initialProfile.runner_config.lthr_bpm?.toString() ?? "");
 
-  // Step 3: Discipline Targets & Guardrails
+  // Step 3: Discipline Targets (Goal Time optional; HR-First & Pace Floor live in Settings -> Advanced & Coach intake)
   const [primaryDistance, setPrimaryDistance] = useState(
     initialProfile.runner_config.primary_distance ?? "Half Marathon"
   );
   const [raceDate, setRaceDate] = useState(initialConfig.objective.raceDate ?? "");
   const [goalTime, setGoalTime] = useState(initialConfig.objective.targetTimeDescription ?? "");
-  const [hrFirst, setHrFirst] = useState(initialProfile.runner_config.hr_first_governor ?? true);
-  const [paceFloorMmSs, setPaceFloorMmSs] = useState(
-    formatMmSs(initialProfile.runner_config.pace_floor_sec_per_km ?? initialConfig.medical.minPaceSecPerKm)
-  );
   const [injuryNotes, setInjuryNotes] = useState(initialConfig.medical.conditionsAndNotes ?? "");
 
   const [division, setDivision] = useState(initialProfile.hyrox_config.division ?? "Men Open");
@@ -109,9 +121,14 @@ export function OnboardingWizard({
     formatMmSs(initialProfile.hyrox_config.compromised_1km_target_sec) || "4:35"
   );
 
-  // Step 4: Gemini BYOK & Model
+  // Step 4: Gemini BYOK & Global Model / Thinking Defaults
   const [geminiKey, setGeminiKey] = useState("");
-  const [geminiModel, setGeminiModel] = useState("gemini-4-hydrogen");
+  const [geminiModel, setGeminiModel] = useState(
+    initialModelSettings?.global_model_id ?? "gemini-4-hydrogen"
+  );
+  const [thinkingLevel, setThinkingLevel] = useState<ThinkingLevel>(
+    initialModelSettings?.global_thinking_level ?? "MEDIUM"
+  );
 
   function toggleWeakStation(station: string) {
     setWeakStations((prev) => {
@@ -153,17 +170,39 @@ export function OnboardingWizard({
     }
   }
 
-  async function handleProbeFitFolder() {
-    const selected = await open({ directory: true, multiple: false });
-    if (typeof selected !== "string") return;
+  async function handlePickIntakeFiles() {
+    const selected = await open({
+      multiple: true,
+      filters: [{ name: "Lab PDF or Garmin FIT", extensions: ["pdf", "fit"] }],
+    });
+    if (!selected) return;
+    const paths = Array.isArray(selected) ? selected : [selected];
+    if (paths.length === 0) return;
     setBusy(true);
     setErrorMsg(null);
     try {
-      const res = await invoke<FitBaselineProbe>("probe_fit_baseline", { folderPath: selected });
-      setProbe(res);
-      if (res.detected_max_hr && !maxHR) setMaxHR(String(res.detected_max_hr));
-      if (res.detected_rhr_baseline && !rhrBaseline) setRhrBaseline(String(res.detected_rhr_baseline));
-      if (res.estimated_lthr && !lthrBpm) setLthrBpm(String(res.estimated_lthr));
+      let latestState: FirstUseFlowState | null = null;
+      for (const p of paths) {
+        if (typeof p === "string" && p.trim()) {
+          latestState = await invoke<FirstUseFlowState>("queue_intake_file", { sourcePath: p });
+        }
+      }
+      if (latestState) {
+        setQueuedFiles(latestState.queued_intake_files);
+      }
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleRemoveIntakeFile(fileId: string) {
+    setBusy(true);
+    setErrorMsg(null);
+    try {
+      const updated = await invoke<FirstUseFlowState>("remove_intake_file", { fileId });
+      setQueuedFiles(updated.queued_intake_files);
     } catch (err) {
       setErrorMsg(err instanceof Error ? err.message : String(err));
     } finally {
@@ -178,7 +217,13 @@ export function OnboardingWizard({
       if (geminiKey.trim()) {
         await invoke("save_gemini_key", { key: geminiKey.trim() });
       }
-      const paceFloorSec = parseMmSs(paceFloorMmSs);
+      await invoke("save_global_model_settings", {
+        modelId: geminiModel,
+        thinkingLevel,
+      });
+      await invoke("set_auto_calibrate_after_sync", { enabled: autoCalibrate });
+
+      const cleanGoalTime = goalTime.trim();
       const nextConfig: AthleteConfig = {
         ...initialConfig,
         specs: {
@@ -191,16 +236,13 @@ export function OnboardingWizard({
         medical: {
           ...initialConfig.medical,
           conditionsAndNotes: injuryNotes.trim(),
-          enforceEasyHRCeiling: hrFirst,
-          enforcePaceFloor: paceFloorSec != null,
-          minPaceSecPerKm: paceFloorSec,
         },
         objective: {
           ...initialConfig.objective,
           goalType: athleteType === "runner" ? "race" : "hybrid_hyrox",
           raceName: athleteType === "hyrox" ? `HYROX (${division})` : primaryDistance,
           raceDate: raceDate.trim() || null,
-          targetTimeDescription: goalTime.trim() || null,
+          targetTimeDescription: cleanGoalTime ? cleanGoalTime : null,
           hybridProfile:
             athleteType === "hyrox" || athleteType === "hybrid_both"
               ? {
@@ -219,8 +261,8 @@ export function OnboardingWizard({
         onboarding_completed: true,
         runner_config: {
           primary_distance: primaryDistance || null,
-          hr_first_governor: hrFirst,
-          pace_floor_sec_per_km: paceFloorSec,
+          hr_first_governor: initialProfile.runner_config.hr_first_governor ?? true,
+          pace_floor_sec_per_km: initialProfile.runner_config.pace_floor_sec_per_km ?? null,
           z2_range_bpm: initialProfile.runner_config.z2_range_bpm,
           z3_range_bpm: initialProfile.runner_config.z3_range_bpm,
           lthr_bpm: lthrBpm ? Number(lthrBpm) : null,
@@ -236,14 +278,12 @@ export function OnboardingWizard({
       };
       await invoke("save_user_profile", { profile: nextProfile });
 
-      const prompt =
-        athleteType === "hyrox"
-          ? `I just completed onboarding as a ${division} HYROX athlete (biometrics: ${weightKg || "–"} kg, ${heightCm} cm, ${sex}; weak stations: ${weakStations.join(", ") || "none selected"}; model: ${geminiModel}). Review my synced history and generate my initial HYROX baseline & starter COACH_PROFILE.md / TRAINING_PLAN.md.`
-          : athleteType === "hybrid_both"
-          ? `I just completed onboarding as a Hybrid Athlete (${primaryDistance} + HYROX ${division}; weak stations: ${weakStations.join(", ") || "none selected"}). Review my synced history and generate my initial hybrid baseline & starter COACH_PROFILE.md / TRAINING_PLAN.md.`
-          : `I just completed onboarding as an Endurance Runner targeting ${primaryDistance} (HR-first: ${hrFirst ? "on" : "off"}, max HR: ${maxHR || "auto"}, LTHR: ${lthrBpm || "auto"}). Review my synced history and generate my initial baseline & starter COACH_PROFILE.md / TRAINING_PLAN.md.`;
+      // Ensure guided first-use intake starts cleanly without dumping starter templates or auto-firing PLANNING calls
+      if (!initialFirstUseState || initialFirstUseState.stage === "intake") {
+        await invoke("advance_first_use_stage", { stage: "intake" });
+      }
 
-      await onComplete(prompt);
+      await onComplete();
     } catch (err) {
       setErrorMsg(err instanceof Error ? err.message : String(err));
     } finally {
@@ -335,7 +375,7 @@ export function OnboardingWizard({
 
         {step === 2 && (
           <div>
-            <h3>Step 2 — Garmin Telemetry & Auto-Calibration (BYOK)</h3>
+            <h3>Step 2 — Telemetry & Calibration (BYOK)</h3>
             <p className="muted" style={{ fontSize: 13 }}>
               In Garmin Connect Web (<strong>Settings → Personal API Key</strong>), generate a 30/90/180/365-day key.
               Garmin displays the key only once upon creation — paste it below to store securely in Windows Credential Manager.
@@ -361,30 +401,75 @@ export function OnboardingWizard({
             )}
 
             <div style={{ borderTop: "1px solid var(--border)", paddingTop: 12, marginTop: 8 }}>
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
-                <strong>Optional: Auto-Calibrate from Local .fit Folder</strong>
-                <button className="secondary" disabled={busy} onClick={() => void handleProbeFitFolder()}>
-                  Select .fit Folder & Probe
-                </button>
-              </div>
-              {probe && (
-                <div className="muted" style={{ fontSize: 12, marginBottom: 10 }}>
-                  Scanned {probe.scanned_files} .fit file(s) · Est. weekly volume:{" "}
-                  {probe.weekly_km_est != null ? `${probe.weekly_km_est} km/wk` : "–"}
+              <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13, fontWeight: 600, marginBottom: 10 }}>
+                <input
+                  type="checkbox"
+                  style={{ width: "auto" }}
+                  checked={autoCalibrate}
+                  onChange={(e) => setAutoCalibrate(e.target.checked)}
+                />
+                Auto-calibrate HR &amp; pace thresholds after first Garmin sync
+              </label>
+
+              <div className="dropzone" style={{ marginBottom: 12 }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10 }}>
+                  <div>
+                    <strong style={{ fontSize: 13 }}>Optional Intake File: Lab Stress Test (.pdf) or Garmin Stress/Lactate Test (.fit)</strong>
+                    <div className="muted" style={{ fontSize: 12 }}>
+                      Queued privately for Coach intake — nothing is sent until you start onboarding in Coach.
+                    </div>
+                  </div>
+                  <button type="button" className="secondary" disabled={busy} onClick={() => void handlePickIntakeFiles()}>
+                    Upload .pdf / .fit
+                  </button>
                 </div>
-              )}
+                {queuedFiles.length > 0 && (
+                  <div style={{ display: "flex", flexDirection: "column", gap: 6, marginTop: 10 }}>
+                    {queuedFiles.map((f) => (
+                      <div
+                        key={f.id}
+                        style={{
+                          display: "flex",
+                          justifyContent: "space-between",
+                          alignItems: "center",
+                          padding: "6px 8px",
+                          borderRadius: 6,
+                          background: "var(--card)",
+                          border: "1px solid var(--border)",
+                          fontSize: 12,
+                        }}
+                      >
+                        <span>
+                          <strong>{f.file_name}</strong>{" "}
+                          <span className="muted">({f.kind})</span>
+                        </span>
+                        <button
+                          type="button"
+                          className="secondary"
+                          style={{ padding: "3px 8px", fontSize: 11 }}
+                          disabled={busy}
+                          onClick={() => void handleRemoveIntakeFile(f.id)}
+                        >
+                          Remove
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+
               <div className="form-row">
                 <div>
-                  <label className="muted">Max HR (bpm)</label>
-                  <input type="number" value={maxHR} onChange={(e) => setMaxHR(e.target.value)} placeholder="190" />
+                  <label className="muted">Max HR (bpm, optional)</label>
+                  <input type="number" value={maxHR} onChange={(e) => setMaxHR(e.target.value)} placeholder="Auto-calibrated if blank" />
                 </div>
                 <div>
-                  <label className="muted">Resting HR Baseline (bpm)</label>
-                  <input type="number" value={rhrBaseline} onChange={(e) => setRhrBaseline(e.target.value)} placeholder="50" />
+                  <label className="muted">Resting HR Baseline (bpm, optional)</label>
+                  <input type="number" value={rhrBaseline} onChange={(e) => setRhrBaseline(e.target.value)} placeholder="Auto-calibrated if blank" />
                 </div>
                 <div>
-                  <label className="muted">Estimated LTHR (bpm)</label>
-                  <input type="number" value={lthrBpm} onChange={(e) => setLthrBpm(e.target.value)} placeholder="170" />
+                  <label className="muted">Estimated LTHR (bpm, optional)</label>
+                  <input type="number" value={lthrBpm} onChange={(e) => setLthrBpm(e.target.value)} placeholder="Auto-calibrated if blank" />
                 </div>
               </div>
             </div>
@@ -393,7 +478,7 @@ export function OnboardingWizard({
 
         {step === 3 && (
           <div>
-            <h3>Step 3 — Discipline Targets & Guardrails</h3>
+            <h3>Step 3 — Targets &amp; Context</h3>
             {(athleteType === "runner" || athleteType === "hybrid_both") && (
               <div style={{ marginBottom: 14 }}>
                 <strong>Endurance Running Targets</strong>
@@ -406,20 +491,19 @@ export function OnboardingWizard({
                     <label className="muted">Target Race Date</label>
                     <input type="date" value={raceDate} onChange={(e) => setRaceDate(e.target.value)} />
                   </div>
-                  <div>
-                    <label className="muted">Goal Time</label>
-                    <input placeholder="e.g. Sub 1:35" value={goalTime} onChange={(e) => setGoalTime(e.target.value)} />
-                  </div>
-                  <div>
-                    <label className="muted">Hard Pace Floor (mm:ss/km)</label>
-                    <input placeholder="e.g. 6:30" value={paceFloorMmSs} onChange={(e) => setPaceFloorMmSs(e.target.value)} />
+                  <div style={{ gridColumn: "span 2" }}>
+                    <label className="muted">Goal Time (optional)</label>
+                    <input
+                      placeholder="Optional — leave blank if goal is to finish"
+                      value={goalTime}
+                      onChange={(e) => setGoalTime(e.target.value)}
+                    />
                   </div>
                 </div>
-                <label style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 8, fontSize: 13 }}>
-                  <input type="checkbox" checked={hrFirst} onChange={(e) => setHrFirst(e.target.checked)} />
-                  HR-First Governor (enforce VT1 / easy HR ceiling)
-                </label>
-                <div style={{ marginTop: 8 }}>
+                <div className="muted" style={{ fontSize: 12, marginTop: 4 }}>
+                  Advanced guardrails (HR-First Governor and Hard Pace Floor) can be discussed conversationally with your Coach or configured anytime in <strong>Settings → Advanced Guardrails</strong>.
+                </div>
+                <div style={{ marginTop: 10 }}>
                   <label className="muted">Injury / Structural Notes</label>
                   <input
                     placeholder="e.g. Left Achilles history, keep 36h between hard sessions"
@@ -491,30 +575,46 @@ export function OnboardingWizard({
 
         {step === 4 && (
           <div>
-            <h3>Step 4 — Gemini AI Key & Baseline Launch</h3>
+            <h3>Step 4 — Gemini AI Key &amp; Global Model</h3>
             <p className="muted" style={{ fontSize: 13 }}>
               {hasGeminiKey
-                ? "A Gemini API key is already saved. You can leave this blank or paste a new key to replace it."
+                ? "A Gemini API key is already saved. Leave blank to keep it or paste a new key to replace it."
                 : "Paste your Gemini API key (stored in Windows Credential Manager) to enable live streaming AI coaching."}
             </p>
+            <div style={{ marginBottom: 12 }}>
+              <label className="muted">Gemini API Key</label>
+              <input
+                type="password"
+                placeholder={hasGeminiKey ? "Saved (leave blank to keep)" : "AIza..."}
+                value={geminiKey}
+                onChange={(e) => setGeminiKey(e.target.value)}
+              />
+            </div>
             <div className="form-row">
               <div>
-                <label className="muted">Gemini API Key</label>
-                <input
-                  type="password"
-                  placeholder={hasGeminiKey ? "Saved (leave blank to keep)" : "AIza..."}
-                  value={geminiKey}
-                  onChange={(e) => setGeminiKey(e.target.value)}
-                />
+                <label className="muted">Global Default Model</label>
+                <select value={geminiModel} onChange={(e) => setGeminiModel(e.target.value)}>
+                  <option value="gemini-4-hydrogen">Hydrogen (gemini-4-hydrogen)</option>
+                  <option value="gemini-3.1-pro-preview">Gemini 3.1 Pro</option>
+                  <option value="gemini-2.5-pro">Gemini 2.5 Pro</option>
+                  <option value="gemini-2.5-flash">Gemini 2.5 Flash</option>
+                </select>
               </div>
               <div>
-                <label className="muted">Default Coach Model</label>
-                <select value={geminiModel} onChange={(e) => setGeminiModel(e.target.value)}>
-                  <option value="gemini-4-hydrogen">gemini-4-hydrogen (Recommended)</option>
-                  <option value="gemini-2.5-pro">gemini-2.5-pro</option>
+                <label className="muted">Global Thinking Level</label>
+                <select
+                  value={thinkingLevel}
+                  onChange={(e) => setThinkingLevel(e.target.value as ThinkingLevel)}
+                >
+                  <option value="LOW">Low</option>
+                  <option value="MEDIUM">Medium (Recommended)</option>
+                  <option value="HIGH">High</option>
                 </select>
               </div>
             </div>
+            <p className="muted" style={{ fontSize: 12 }}>
+              You will enter the guided Coach intake next — nothing is auto-synced or generated without your confirmation.
+            </p>
           </div>
         )}
 
@@ -536,7 +636,7 @@ export function OnboardingWizard({
             </button>
           ) : (
             <button className="primary" disabled={busy} onClick={() => void handleFinish()}>
-              {busy ? "Saving…" : "Save & Generate Initial Athlete Baseline"}
+              {busy ? "Saving…" : "Finish Setup"}
             </button>
           )}
         </div>

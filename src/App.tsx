@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { getVersion } from "@tauri-apps/api/app";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
@@ -9,14 +9,17 @@ import {
   Activity,
   ArrowLeft,
   Check,
+  ChevronDown,
   Clipboard,
   Download,
+  FileText,
   MessageSquare,
   RefreshCw,
   Settings,
   Sparkles,
   SquarePen,
   Sun,
+  Trash2,
   Upload,
 } from "lucide-react";
 import { OnboardingWizard } from "./components/OnboardingWizard";
@@ -27,9 +30,12 @@ import type {
   BootstrapState,
   CoachUpdateProposal,
   ExecutionMode,
+  FirstUseStage,
   FitTrackPoint,
   GoalType,
+  ModelSettings,
   PostRunContext,
+  ThinkingLevel,
 } from "./types";
 
 type NavTab = "today" | "activities" | "coach" | "settings";
@@ -38,6 +44,151 @@ interface ChatMessage {
   role: "user" | "assistant";
   text: string;
   proposals?: CoachUpdateProposal[];
+}
+
+const GEMINI_MODEL_OPTIONS = [
+  { id: "gemini-4-hydrogen", label: "Gemini 4 Hydrogen", short: "Hydrogen" },
+  { id: "gemini-3.1-pro-preview", label: "Gemini 3.1 Pro", short: "3.1 Pro" },
+  { id: "gemini-2.5-pro", label: "Gemini 2.5 Pro", short: "2.5 Pro" },
+  { id: "gemini-2.5-flash", label: "Gemini 2.5 Flash", short: "2.5 Flash" },
+];
+
+function shortModelName(id: string): string {
+  return GEMINI_MODEL_OPTIONS.find((m) => m.id === id)?.short ?? id;
+}
+
+function thinkingLabel(level: ThinkingLevel): string {
+  switch (level) {
+    case "LOW":
+      return "Low";
+    case "HIGH":
+      return "High";
+    default:
+      return "Medium";
+  }
+}
+
+function renderInlineMarkdown(text: string): ReactNode[] {
+  const tokens = text.split(/(\*\*[^*]+\*\*|`[^`]+`)/g);
+  return tokens.map((tok, idx) => {
+    if (tok.startsWith("**") && tok.endsWith("**") && tok.length > 4) {
+      return <strong key={idx}>{tok.slice(2, -2)}</strong>;
+    }
+    if (tok.startsWith("`") && tok.endsWith("`") && tok.length > 2) {
+      return <code key={idx}>{tok.slice(1, -1)}</code>;
+    }
+    return tok;
+  });
+}
+
+function MarkdownPreview({ markdown }: { markdown: string }) {
+  const lines = markdown.replace(/\r\n/g, "\n").split("\n");
+  const blocks: ReactNode[] = [];
+  let i = 0;
+
+  while (i < lines.length) {
+    const raw = lines[i];
+    const trimmed = raw.trim();
+
+    if (!trimmed) {
+      i += 1;
+      continue;
+    }
+
+    if (trimmed.startsWith("### ")) {
+      blocks.push(<h3 key={i}>{renderInlineMarkdown(trimmed.slice(4))}</h3>);
+      i += 1;
+      continue;
+    }
+    if (trimmed.startsWith("## ")) {
+      blocks.push(<h2 key={i}>{renderInlineMarkdown(trimmed.slice(3))}</h2>);
+      i += 1;
+      continue;
+    }
+    if (trimmed.startsWith("# ")) {
+      blocks.push(<h1 key={i}>{renderInlineMarkdown(trimmed.slice(2))}</h1>);
+      i += 1;
+      continue;
+    }
+
+    if (trimmed.startsWith("> ")) {
+      const quoteLines: string[] = [];
+      while (i < lines.length && lines[i].trim().startsWith("> ")) {
+        quoteLines.push(lines[i].trim().slice(2));
+        i += 1;
+      }
+      blocks.push(
+        <blockquote key={`q-${i}`}>
+          {quoteLines.map((ql, qi) => (
+            <p key={qi}>{renderInlineMarkdown(ql)}</p>
+          ))}
+        </blockquote>
+      );
+      continue;
+    }
+
+    if (trimmed.startsWith("- ") || trimmed.startsWith("* ")) {
+      const items: string[] = [];
+      while (i < lines.length && (lines[i].trim().startsWith("- ") || lines[i].trim().startsWith("* "))) {
+        items.push(lines[i].trim().slice(2));
+        i += 1;
+      }
+      blocks.push(
+        <ul key={`ul-${i}`}>
+          {items.map((it, ii) => (
+            <li key={ii}>{renderInlineMarkdown(it)}</li>
+          ))}
+        </ul>
+      );
+      continue;
+    }
+
+    if (trimmed.startsWith("|")) {
+      const tableLines: string[] = [];
+      while (i < lines.length && lines[i].trim().startsWith("|")) {
+        tableLines.push(lines[i].trim());
+        i += 1;
+      }
+      const parseRow = (row: string) =>
+        row
+          .replace(/^\|/, "")
+          .replace(/\|$/, "")
+          .split("|")
+          .map((c) => c.trim());
+      const rows = tableLines
+        .filter((r) => !/^\|?[\s:-]+(\|[\s:-]+)+\|?$/.test(r))
+        .map(parseRow);
+      if (rows.length > 0) {
+        const [header, ...body] = rows;
+        blocks.push(
+          <table key={`tbl-${i}`}>
+            <thead>
+              <tr>
+                {header.map((cell, ci) => (
+                  <th key={ci}>{renderInlineMarkdown(cell)}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {body.map((row, ri) => (
+                <tr key={ri}>
+                  {row.map((cell, ci) => (
+                    <td key={ci}>{renderInlineMarkdown(cell)}</td>
+                  ))}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        );
+        continue;
+      }
+    }
+
+    blocks.push(<p key={i}>{renderInlineMarkdown(trimmed)}</p>);
+    i += 1;
+  }
+
+  return <div className="md-preview">{blocks}</div>;
 }
 
 function formatPace(secPerKm: number | null | undefined): string {
@@ -64,11 +215,14 @@ export default function App() {
   const [onboardStep, setOnboardStep] = useState<1 | 2 | 3>(1);
   const [busy, setBusy] = useState(false);
   const [statusMsg, setStatusMsg] = useState<string | null>(null);
+  const [coachError, setCoachError] = useState<string | null>(null);
+  const [syncProgressMsg, setSyncProgressMsg] = useState<string | null>(null);
 
   const [chatInput, setChatInput] = useState("");
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [liveToolLabel, setLiveToolLabel] = useState<string | null>(null);
   const [copiedPacket, setCopiedPacket] = useState(false);
+  const [showModelPopover, setShowModelPopover] = useState(false);
 
   const [selectedActivity, setSelectedActivity] = useState<ActivityDetailPayload | null>(null);
   const [loadingDetail, setLoadingDetail] = useState(false);
@@ -76,8 +230,9 @@ export default function App() {
   const [draftConfig, setDraftConfig] = useState<AthleteConfig | null>(null);
   const [showOnboarding, setShowOnboarding] = useState(false);
   const [ledgerNotice, setLedgerNotice] = useState<string | null>(null);
+  const [paceFloorInput, setPaceFloorInput] = useState("");
 
-  const [appVersion, setAppVersion] = useState<string>("0.2.1");
+  const [appVersion, setAppVersion] = useState<string>("0.2.2-beta");
   const [availableUpdate, setAvailableUpdate] = useState<Update | null>(null);
   const [updateStatus, setUpdateStatus] = useState<string | null>(null);
   const [updateChecking, setUpdateChecking] = useState(false);
@@ -89,6 +244,10 @@ export default function App() {
     const data = await invoke<BootstrapState>("get_bootstrap_state");
     setState(data);
     setDraftConfig(data.athlete_config);
+    const sec = data.athlete_config.medical.minPaceSecPerKm;
+    setPaceFloorInput(
+      sec && sec > 0 ? `${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, "0")}` : ""
+    );
   }
 
   async function runUpdateCheck(silent: boolean) {
@@ -231,37 +390,18 @@ export default function App() {
       <OnboardingWizard
         initialConfig={draftConfig}
         initialProfile={defaultProfile}
+        initialModelSettings={state.model_settings}
+        initialFirstUseState={state.first_use_state}
         hasGarminKey={state.has_garmin_key}
         hasGeminiKey={state.has_gemini_key}
         canDismiss={Boolean(state.user_profile?.onboarding_completed)}
         onDismiss={() => setShowOnboarding(false)}
-        onComplete={async (initialCoachPrompt) => {
+        onComplete={async () => {
           setShowOnboarding(false);
+          setMessages([]);
+          setCoachError(null);
           await reload();
           setTab("coach");
-          setMessages([
-            { role: "user", text: initialCoachPrompt },
-            { role: "assistant", text: "" },
-          ]);
-          setBusy(true);
-          try {
-            const res = await invoke<{ mode: string; text: string; packet?: string; proposals?: CoachUpdateProposal[] }>(
-              "send_coach_message",
-              { prompt: initialCoachPrompt }
-            );
-            setMessages((prev) => {
-              const next = [...prev];
-              next[next.length - 1] = {
-                role: "assistant",
-                text: res.mode === "clipboard_packet" ? res.packet ?? "" : res.text,
-                proposals: res.proposals,
-              };
-              return next;
-            });
-          } finally {
-            setBusy(false);
-            setLiveToolLabel(null);
-          }
         }}
       />
     );
@@ -370,6 +510,32 @@ export default function App() {
   const latestRun = state.activities.find((a) => a.type_key.toLowerCase().includes("run")) ?? state.activities[0];
   const pillClass = !r ? "amber" : !r.gatekeeper.run_permitted ? "red" : r.gatekeeper.caution_flags.length > 0 ? "amber" : "green";
 
+  const modelSettings: ModelSettings = state.model_settings ?? {
+    global_model_id: "gemini-4-hydrogen",
+    global_thinking_level: "MEDIUM",
+    coach_model_override_id: null,
+    coach_thinking_override: null,
+  };
+  const firstUseState = state.first_use_state ?? {
+    stage: state.needs_initial_coach_setup ? ("intake" as FirstUseStage) : ("active" as FirstUseStage),
+    auto_calibrate_after_first_sync: true,
+    queued_intake_files: [],
+    history_summary_markdown: null,
+    updated_at: "",
+  };
+  const firstUseStage: FirstUseStage = firstUseState.stage;
+  const isGuidedFirstUse = firstUseStage !== "active";
+
+  const hasCoachOverride =
+    modelSettings.coach_model_override_id != null || modelSettings.coach_thinking_override != null;
+  const effectiveCoachModelId =
+    modelSettings.coach_model_override_id ?? modelSettings.global_model_id;
+  const effectiveCoachThinking =
+    modelSettings.coach_thinking_override ?? modelSettings.global_thinking_level;
+  const coachPillText = hasCoachOverride
+    ? `Override: ${shortModelName(effectiveCoachModelId)} ${thinkingLabel(effectiveCoachThinking)}`
+    : `Global (${shortModelName(modelSettings.global_model_id)} ${thinkingLabel(modelSettings.global_thinking_level)})`;
+
   async function handleCopyPacket() {
     const packet = await invoke<string>("build_coach_packet", { draftPrompt: chatInput });
     await navigator.clipboard.writeText(packet);
@@ -380,6 +546,7 @@ export default function App() {
   async function sendPrompt(promptText: string) {
     const trimmed = promptText.trim();
     if (!trimmed || busy) return;
+    setCoachError(null);
     setMessages((prev) => [
       ...prev,
       { role: "user", text: trimmed },
@@ -415,6 +582,17 @@ export default function App() {
         }
         return next;
       });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setCoachError(msg);
+      setMessages((prev) => {
+        const next = [...prev];
+        const idx = next.length - 1;
+        if (idx >= 0 && next[idx].role === "assistant" && !next[idx].text) {
+          next[idx] = { role: "assistant", text: `Error: ${msg}` };
+        }
+        return next;
+      });
     } finally {
       setBusy(false);
       setLiveToolLabel(null);
@@ -429,7 +607,7 @@ export default function App() {
 
   async function analyzeInCoach(activity: ActivityRecord) {
     setTab("coach");
-    const prompt = `Analyze my activity "${activity.name || activity.type_key}" on ${activity.start_iso.slice(0, 10)} (activity_id: ${activity.garmin_id}) in detail. Fetch its .fit splits and telemetry via get_activity_detail, evaluate per-km pacing, cardiac decoupling / HR drift, and interpret it against my active plan and readiness context.`;
+    const prompt = `Analyze my activity "${activity.name || activity.type_key}" on ${activity.start_iso.slice(0, 10)} (activity_id: ${activity.garmin_id}) in detail. Fetch its .fit splits and telemetry via get_activity_detail, evaluate per-km pacing, cardiac decoupling / HR drift, Garmin Connect notes if any, and interpret it against my active plan and readiness context.`;
     await sendPrompt(prompt);
   }
 
@@ -443,6 +621,89 @@ export default function App() {
     } finally {
       setLoadingDetail(false);
     }
+  }
+
+  async function handleStage1UploadFiles() {
+    const selected = await open({
+      multiple: true,
+      filters: [{ name: "Intake Docs (.pdf, .fit, .txt, .md)", extensions: ["pdf", "fit", "txt", "md"] }],
+    });
+    if (!selected) return;
+    const paths = Array.isArray(selected) ? selected : [selected];
+    setBusy(true);
+    setCoachError(null);
+    try {
+      for (const p of paths) {
+        if (typeof p === "string" && p.trim()) {
+          await invoke("queue_intake_file", { sourcePath: p });
+        }
+      }
+      await reload();
+    } catch (err) {
+      setCoachError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleRemoveQueuedFile(fileId: string) {
+    setBusy(true);
+    try {
+      await invoke("remove_intake_file", { fileId });
+      await reload();
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleContinueToProfileSynthesis() {
+    setBusy(true);
+    setCoachError(null);
+    try {
+      await invoke("advance_first_use_stage", { stage: "profile_approval" });
+      await reload();
+      const count = firstUseState.queued_intake_files.length;
+      const fileSummary =
+        count > 0
+          ? `I uploaded ${count} file(s) for intake (${firstUseState.queued_intake_files.map((f) => f.file_name).join(", ")}). `
+          : "I have no additional files to upload right now. ";
+      const prompt = `${fileSummary}Please review my onboarding profile, ask about or clarify my advanced guardrails (HR-First Governor, Hard Pace Floor, rest spacing), and prepare ONE consolidated COACH_PROFILE.md proposal for my approval.`;
+      setBusy(false);
+      await sendPrompt(prompt);
+    } catch (err) {
+      setCoachError(err instanceof Error ? err.message : String(err));
+      setBusy(false);
+    }
+  }
+
+  async function handleRunHistorySyncStage(runGarminSync: boolean) {
+    setBusy(true);
+    setCoachError(null);
+    setSyncProgressMsg(
+      runGarminSync
+        ? "Downloading Garmin lifetime activity history, 365-day wellness metrics, and auto-calibrating baselines…"
+        : "Analyzing local training history and calibrating baselines…"
+    );
+    try {
+      await invoke("complete_history_sync_stage", { runGarminSync });
+      setSyncProgressMsg(null);
+      await reload();
+    } catch (err) {
+      setSyncProgressMsg(null);
+      setCoachError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleRequestConsolidatedPlan(blockPreference: string) {
+    const trimmed = blockPreference.trim();
+    const prefText = trimmed
+      ? `My preferred block structure / scheduling constraints: ${trimmed}. `
+      : "Use a balanced progressive block structure suited to my recent history. ";
+    await sendPrompt(
+      `${prefText}Review my synced lifetime and 365-day history summary and propose ONE consolidated TRAINING_PLAN.md (with structured plan_json) for my approval.`
+    );
   }
 
   async function handleProposalDecision(msgIdx: number, propId: string, approve: boolean) {
@@ -465,6 +726,14 @@ export default function App() {
       )
     );
   }
+
+  const stageSteps: { id: FirstUseStage; label: string }[] = [
+    { id: "intake", label: "1. File Intake" },
+    { id: "profile_approval", label: "2. Profile Approval" },
+    { id: "history_sync", label: "3. History Sync" },
+    { id: "plan_approval", label: "4. Plan Approval" },
+  ];
+  const currentStageIdx = stageSteps.findIndex((s) => s.id === firstUseStage);
 
   return (
     <div className="app-shell">
@@ -642,7 +911,10 @@ export default function App() {
                 >
                   <div>
                     <strong>{a.name || a.type_key}</strong>
-                    <div className="muted">{a.start_iso.slice(0, 10)} · {a.type_key}</div>
+                    <div className="muted">
+                      {a.start_iso.slice(0, 10)} · {a.type_key}
+                      {a.garmin_notes ? " · Notes" : ""}
+                    </div>
                   </div>
                   <div style={{ textAlign: "right" }}>
                     <div>{(a.distance_m / 1000).toFixed(2)} km</div>
@@ -681,11 +953,99 @@ export default function App() {
         {tab === "coach" && (
           <div className="card">
             <div className="card-header">
-              <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
                 <strong>Living Coach</strong>
                 <span className="pill green">
                   {state.engine_mode === "gemini_api" ? "Gemini API" : "Clipboard Packet"}
                 </span>
+
+                <div className="model-pill-wrap">
+                  <button
+                    type="button"
+                    className="model-pill-btn"
+                    onClick={() => setShowModelPopover((v) => !v)}
+                  >
+                    <span>{coachPillText}</span>
+                    <ChevronDown size={13} />
+                  </button>
+                  {showModelPopover && (
+                    <div className="model-popover">
+                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+                        <strong style={{ fontSize: 13 }}>Coach Tab Model</strong>
+                        {hasCoachOverride && (
+                          <button
+                            type="button"
+                            className="secondary"
+                            style={{ padding: "3px 8px", fontSize: 11 }}
+                            onClick={async () => {
+                              await invoke("save_coach_model_override", {
+                                modelId: null,
+                                thinkingLevel: null,
+                              });
+                              await reload();
+                              setShowModelPopover(false);
+                            }}
+                          >
+                            Follow Global
+                          </button>
+                        )}
+                      </div>
+                      <label className="muted" style={{ fontSize: 12 }}>Model</label>
+                      <select
+                        style={{ marginTop: 4, marginBottom: 8 }}
+                        value={modelSettings.coach_model_override_id ?? "__global__"}
+                        onChange={async (e) => {
+                          const val = e.target.value;
+                          await invoke("save_coach_model_override", {
+                            modelId: val === "__global__" ? null : val,
+                            thinkingLevel: modelSettings.coach_thinking_override,
+                          });
+                          await reload();
+                        }}
+                      >
+                        <option value="__global__">
+                          Follow Global ({shortModelName(modelSettings.global_model_id)})
+                        </option>
+                        {GEMINI_MODEL_OPTIONS.map((opt) => (
+                          <option key={opt.id} value={opt.id}>
+                            {opt.label}
+                          </option>
+                        ))}
+                      </select>
+                      <label className="muted" style={{ fontSize: 12 }}>Thinking Level</label>
+                      <select
+                        style={{ marginTop: 4, marginBottom: 8 }}
+                        value={modelSettings.coach_thinking_override ?? "__global__"}
+                        onChange={async (e) => {
+                          const val = e.target.value;
+                          await invoke("save_coach_model_override", {
+                            modelId: modelSettings.coach_model_override_id,
+                            thinkingLevel: val === "__global__" ? null : val,
+                          });
+                          await reload();
+                        }}
+                      >
+                        <option value="__global__">
+                          Follow Global ({thinkingLabel(modelSettings.global_thinking_level)})
+                        </option>
+                        <option value="LOW">Low</option>
+                        <option value="MEDIUM">Medium</option>
+                        <option value="HIGH">High</option>
+                      </select>
+                      <div style={{ display: "flex", justifyContent: "flex-end" }}>
+                        <button
+                          type="button"
+                          className="primary"
+                          style={{ padding: "5px 10px", fontSize: 12 }}
+                          onClick={() => setShowModelPopover(false)}
+                        >
+                          Done
+                        </button>
+                      </div>
+                    </div>
+                  )}
+                </div>
+
                 {ledgerNotice && <span className="pill">{ledgerNotice}</span>}
               </div>
               <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
@@ -748,68 +1108,190 @@ export default function App() {
               </div>
             </div>
 
-            {state.needs_initial_coach_setup && (
-              <div
-                style={{
-                  marginBottom: 12,
-                  padding: 12,
-                  borderRadius: 8,
-                  border: "1px solid var(--border)",
-                  background: "var(--bg)",
-                  display: "flex",
-                  justifyContent: "space-between",
-                  alignItems: "center",
-                  gap: 12,
-                }}
-              >
-                <div>
-                  <strong>First-Use Coach Setup</strong>
-                  <div className="muted" style={{ fontSize: 12 }}>
-                    COACH_PROFILE.md or TRAINING_PLAN.md is empty. Audit your lifetime + 365-day history or generate starter templates.
+            {isGuidedFirstUse && (
+              <div style={{ marginBottom: 14 }}>
+                <div className="stage-stepper">
+                  {stageSteps.map((s, idx) => (
+                    <div
+                      key={s.id}
+                      className={`stage-step ${
+                        idx === currentStageIdx ? "active" : idx < currentStageIdx ? "done" : ""
+                      }`}
+                    >
+                      {s.label}
+                    </div>
+                  ))}
+                </div>
+
+                {firstUseStage === "intake" && (
+                  <div
+                    style={{
+                      padding: 14,
+                      borderRadius: 10,
+                      border: "1px solid var(--accent-border)",
+                      background: "var(--accent-soft-bg)",
+                    }}
+                  >
+                    <strong>Stage 1 · Optional Intake Files Before Setup</strong>
+                    <p className="muted" style={{ fontSize: 13, margin: "6px 0 10px" }}>
+                      Before we build your initial athlete profile, would you like to upload any relevant files — such as a
+                      lab stress test (<code>.pdf</code>), a Garmin stress/lactate test (<code>.fit</code>), or medical notes?
+                    </p>
+                    {firstUseState.queued_intake_files.length > 0 && (
+                      <div style={{ display: "flex", flexDirection: "column", gap: 6, marginBottom: 10 }}>
+                        {firstUseState.queued_intake_files.map((f) => (
+                          <div
+                            key={f.id}
+                            style={{
+                              display: "flex",
+                              justifyContent: "space-between",
+                              alignItems: "center",
+                              padding: "6px 10px",
+                              borderRadius: 6,
+                              background: "var(--card)",
+                              border: "1px solid var(--border)",
+                              fontSize: 12,
+                            }}
+                          >
+                            <span style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                              <FileText size={13} />
+                              <strong>{f.file_name}</strong>
+                              <span className="muted">({f.kind})</span>
+                            </span>
+                            <button
+                              type="button"
+                              className="secondary"
+                              style={{ padding: "3px 8px", fontSize: 11 }}
+                              disabled={busy}
+                              onClick={() => void handleRemoveQueuedFile(f.id)}
+                            >
+                              <Trash2 size={12} />
+                            </button>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                    <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                      <button className="secondary" disabled={busy} onClick={() => void handleStage1UploadFiles()}>
+                        <Upload size={13} style={{ marginRight: 5, verticalAlign: "middle" }} />
+                        Upload File(s)
+                      </button>
+                      <button
+                        className="primary"
+                        disabled={busy || state.engine_mode !== "gemini_api"}
+                        onClick={() => void handleContinueToProfileSynthesis()}
+                      >
+                        {firstUseState.queued_intake_files.length > 0
+                          ? `Continue with ${firstUseState.queued_intake_files.length} file(s)`
+                          : "Continue without files"}
+                      </button>
+                    </div>
                   </div>
-                </div>
-                <div style={{ display: "flex", gap: 8, flexShrink: 0 }}>
-                  <button
-                    className="secondary"
-                    disabled={busy}
-                    onClick={async () => {
-                      await invoke("generate_starter_coach_files");
-                      await reload();
+                )}
+
+                {firstUseStage === "profile_approval" && (
+                  <div
+                    style={{
+                      padding: 12,
+                      borderRadius: 10,
+                      border: "1px solid var(--accent-border)",
+                      background: "var(--accent-soft-bg)",
+                      fontSize: 13,
                     }}
                   >
-                    Generate Starter Templates Now
-                  </button>
-                  <button
-                    className="primary"
-                    disabled={busy || state.engine_mode !== "gemini_api"}
-                    onClick={async () => {
-                      const prompt =
-                        "Please review my lifetime and trailing 365-day training history, inspect my athlete config, and propose grounded starter COACH_PROFILE.md and TRAINING_PLAN.md documents via propose_coach_update.";
-                      setMessages((prev) => [...prev, { role: "user", text: prompt }, { role: "assistant", text: "" }]);
-                      setBusy(true);
-                      try {
-                        const res = await invoke<{ mode: string; text: string; proposals?: CoachUpdateProposal[] }>(
-                          "send_coach_message",
-                          { prompt }
-                        );
-                        setMessages((prev) => {
-                          const next = [...prev];
-                          next[next.length - 1] = { role: "assistant", text: res.text, proposals: res.proposals };
-                          return next;
-                        });
-                      } finally {
-                        setBusy(false);
-                        setLiveToolLabel(null);
-                      }
+                    <strong>Stage 2 · Initial Profile &amp; Guardrail Clarification</strong>
+                    <div className="muted" style={{ fontSize: 12, marginTop: 4 }}>
+                      Review your Coach&apos;s consolidated <code>COACH_PROFILE.md</code> proposal below (including HR-First Governor and Pace Floor discussion). Click{" "}
+                      <strong>Approve Initial Profile</strong> when ready to proceed to Garmin History Sync.
+                    </div>
+                  </div>
+                )}
+
+                {firstUseStage === "history_sync" && (
+                  <div
+                    style={{
+                      padding: 14,
+                      borderRadius: 10,
+                      border: "1px solid var(--accent-border)",
+                      background: "var(--accent-soft-bg)",
                     }}
                   >
-                    Review My History & Build Starter Plan
-                  </button>
-                </div>
+                    <strong>Stage 3 · Full Garmin History Sync &amp; Training Audit</strong>
+                    <p className="muted" style={{ fontSize: 13, margin: "6px 0 10px" }}>
+                      Your initial profile is approved. Sync your full Garmin history (plus 365-day wellness &amp; baseline calibration) to analyze your lifetime and yearly training blocks before generating your plan.
+                    </p>
+                    {syncProgressMsg && (
+                      <div className="pill amber" style={{ marginBottom: 10 }}>
+                        {syncProgressMsg}
+                      </div>
+                    )}
+                    <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                      <button
+                        className="primary"
+                        disabled={busy}
+                        onClick={() => void handleRunHistorySyncStage(true)}
+                      >
+                        {busy ? "Syncing History…" : "Download Garmin History & Summarize"}
+                      </button>
+                      <button
+                        className="secondary"
+                        disabled={busy}
+                        onClick={() => void handleRunHistorySyncStage(false)}
+                      >
+                        Use Existing Local History
+                      </button>
+                    </div>
+                  </div>
+                )}
+
+                {firstUseStage === "plan_approval" && (
+                  <div
+                    style={{
+                      padding: 14,
+                      borderRadius: 10,
+                      border: "1px solid var(--accent-border)",
+                      background: "var(--bg)",
+                    }}
+                  >
+                    <strong>Stage 4 · Confirm Block Structure &amp; Approve Training Plan</strong>
+                    {firstUseState.history_summary_markdown && (
+                      <div style={{ marginTop: 8, marginBottom: 10 }}>
+                        <MarkdownPreview markdown={firstUseState.history_summary_markdown} />
+                      </div>
+                    )}
+                    <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                      <button
+                        className="primary"
+                        disabled={busy || state.engine_mode !== "gemini_api"}
+                        onClick={() =>
+                          void handleRequestConsolidatedPlan("3 weeks build + 1 week deload, polarized Z2 + 1 quality session")
+                        }
+                      >
+                        Generate Consolidated Training Plan
+                      </button>
+                      <button
+                        className="secondary"
+                        disabled={busy}
+                        onClick={async () => {
+                          await invoke("advance_first_use_stage", { stage: "active" });
+                          await reload();
+                        }}
+                      >
+                        Mark Coach Active
+                      </button>
+                    </div>
+                  </div>
+                )}
               </div>
             )}
 
-            {messages.length === 0 && (
+            {coachError && (
+              <div className="pill red" style={{ marginBottom: 12, display: "block" }}>
+                {coachError}
+              </div>
+            )}
+
+            {messages.length === 0 && !isGuidedFirstUse && (
               <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 12 }}>
                 {(state.user_profile?.athlete_type === "hyrox" ||
                 state.user_profile?.athlete_type === "hybrid_both"
@@ -871,43 +1353,55 @@ export default function App() {
               {messages.map((m, i) => (
                 <div key={i} className={`bubble ${m.role}`}>
                   <div>{m.text || (busy && m.role === "assistant" ? "Thinking…" : "")}</div>
-                  {m.proposals?.map((p) => (
-                    <div
-                      key={p.id}
-                      style={{
-                        marginTop: 12,
-                        padding: 10,
-                        borderRadius: 8,
-                        border: "1px solid var(--border)",
-                        background: "var(--bg)",
-                      }}
-                    >
-                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                        <strong>
-                          {p.target_file} — {p.reason}
-                        </strong>
-                        <span className="muted">{p.status}</span>
-                      </div>
-                      {p.expires_on && <div className="muted">Expires: {p.expires_on}</div>}
-                      <pre style={{ fontSize: 12, overflowX: "auto", margin: "8px 0" }}>{p.diff_preview}</pre>
-                      {p.status === "pending_user_approval" && (
-                        <div style={{ display: "flex", gap: 8 }}>
-                          <button
-                            className="primary"
-                            onClick={() => void handleProposalDecision(i, p.id, true)}
-                          >
-                            Approve & Apply
-                          </button>
-                          <button
-                            className="secondary"
-                            onClick={() => void handleProposalDecision(i, p.id, false)}
-                          >
-                            Dismiss
-                          </button>
+                  {m.proposals?.map((p) => {
+                    const approveLabel =
+                      p.target_file === "COACH_PROFILE.md" && firstUseStage === "profile_approval"
+                        ? "Approve Initial Profile"
+                        : p.target_file === "TRAINING_PLAN.md" && firstUseStage === "plan_approval"
+                        ? "Approve Training Plan"
+                        : "Approve & Apply";
+                    return (
+                      <div key={p.id} className="proposal-card">
+                        <div className="proposal-header">
+                          <div>
+                            <div className="proposal-title">{p.target_file}</div>
+                            <div className="muted" style={{ fontSize: 12.5, marginTop: 2 }}>
+                              {p.reason}
+                            </div>
+                          </div>
+                          <span className={`pill ${p.status === "applied" ? "green" : p.status === "dismissed" ? "" : "accent"}`}>
+                            {p.status === "pending_user_approval" ? "Pending Approval" : p.status}
+                          </span>
                         </div>
-                      )}
-                    </div>
-                  ))}
+                        {p.expires_on && (
+                          <div className="muted" style={{ marginBottom: 8 }}>
+                            Expires: {p.expires_on}
+                          </div>
+                        )}
+                        <MarkdownPreview markdown={p.updated_section_markdown || p.diff_preview} />
+                        <details className="raw-diff-details">
+                          <summary>View Raw Diff</summary>
+                          <pre className="raw-diff-pre">{p.diff_preview}</pre>
+                        </details>
+                        {p.status === "pending_user_approval" && (
+                          <div style={{ display: "flex", gap: 8, marginTop: 12 }}>
+                            <button
+                              className="primary"
+                              onClick={() => void handleProposalDecision(i, p.id, true)}
+                            >
+                              {approveLabel}
+                            </button>
+                            <button
+                              className="secondary"
+                              onClick={() => void handleProposalDecision(i, p.id, false)}
+                            >
+                              Dismiss
+                            </button>
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
                 </div>
               ))}
             </div>
@@ -975,9 +1469,51 @@ export default function App() {
             </div>
 
             <div className="card">
-              <h3>Gemini API Key (Windows Credential Manager)</h3>
-              <div className="muted" style={{ marginBottom: 8 }}>
-                Status: {state.has_gemini_key ? "Saved in Credential Manager" : "Not set (Clipboard Packet mode)"}
+              <h3>AI &amp; Models</h3>
+              <p className="muted" style={{ marginTop: 0, marginBottom: 12 }}>
+                Default model &amp; thinking level for background takes and new Coach sessions (override anytime from the Coach pill).
+              </p>
+              <div className="form-row">
+                <div>
+                  <label className="muted">Global Model</label>
+                  <select
+                    value={modelSettings.global_model_id}
+                    onChange={async (e) => {
+                      await invoke("save_global_model_settings", {
+                        modelId: e.target.value,
+                        thinkingLevel: modelSettings.global_thinking_level,
+                      });
+                      await reload();
+                    }}
+                  >
+                    {GEMINI_MODEL_OPTIONS.map((opt) => (
+                      <option key={opt.id} value={opt.id}>
+                        {opt.label}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <div>
+                  <label className="muted">Global Thinking Level</label>
+                  <select
+                    value={modelSettings.global_thinking_level}
+                    onChange={async (e) => {
+                      await invoke("save_global_model_settings", {
+                        modelId: modelSettings.global_model_id,
+                        thinkingLevel: e.target.value,
+                      });
+                      await reload();
+                    }}
+                  >
+                    <option value="LOW">Low</option>
+                    <option value="MEDIUM">Medium</option>
+                    <option value="HIGH">High</option>
+                  </select>
+                </div>
+              </div>
+              <div className="muted" style={{ marginBottom: 8, marginTop: 6 }}>
+                Gemini API Key (Windows Credential Manager):{" "}
+                <strong>{state.has_gemini_key ? "Saved" : "Not set (Clipboard Packet mode)"}</strong>
               </div>
               <div style={{ display: "flex", gap: 10 }}>
                 <input
@@ -1001,7 +1537,7 @@ export default function App() {
 
             <div className="card">
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
-                <h3 style={{ margin: 0 }}>Athlete Profile & Guardrails</h3>
+                <h3 style={{ margin: 0 }}>Athlete Profile</h3>
                 <button className="secondary" onClick={() => setShowOnboarding(true)}>
                   Edit Athlete Profile / Re-run Onboarding
                 </button>
@@ -1033,6 +1569,37 @@ export default function App() {
                     <option value="return_from_injury">Return from Injury</option>
                     <option value="hybrid_hyrox">Hyrox / Hybrid Athlete</option>
                   </select>
+                </div>
+              </div>
+              <div className="form-row">
+                <div>
+                  <label className="muted">Goal Time (optional)</label>
+                  <input
+                    placeholder="Optional — leave blank if goal is to finish"
+                    value={draftConfig.objective.targetTimeDescription ?? ""}
+                    onChange={(e) =>
+                      setDraftConfig({
+                        ...draftConfig,
+                        objective: {
+                          ...draftConfig.objective,
+                          targetTimeDescription: e.target.value.trim() ? e.target.value : null,
+                        },
+                      })
+                    }
+                  />
+                </div>
+                <div>
+                  <label className="muted">VT1 Ceiling (bpm)</label>
+                  <input
+                    type="number"
+                    value={draftConfig.specs.vt1CeilingBPM ?? ""}
+                    onChange={(e) =>
+                      setDraftConfig({
+                        ...draftConfig,
+                        specs: { ...draftConfig.specs, vt1CeilingBPM: e.target.value ? Number(e.target.value) : null },
+                      })
+                    }
+                  />
                 </div>
               </div>
               {draftConfig.objective.goalType === "hybrid_hyrox" && (
@@ -1104,42 +1671,115 @@ export default function App() {
                   </div>
                 </div>
               )}
-              <div className="form-row">
-                <div>
-                  <label className="muted">VT1 Ceiling (bpm)</label>
-                  <input
-                    type="number"
-                    value={draftConfig.specs.vt1CeilingBPM ?? ""}
-                    onChange={(e) =>
-                      setDraftConfig({
-                        ...draftConfig,
-                        specs: { ...draftConfig.specs, vt1CeilingBPM: e.target.value ? Number(e.target.value) : null },
-                      })
-                    }
-                  />
-                </div>
-                <div>
-                  <label className="muted">Min Rest Between Runs (h)</label>
-                  <input
-                    type="number"
-                    value={draftConfig.medical.minRestHoursBetweenRuns ?? ""}
-                    onChange={(e) =>
-                      setDraftConfig({
-                        ...draftConfig,
-                        medical: {
-                          ...draftConfig.medical,
-                          minRestHoursBetweenRuns: e.target.value ? Number(e.target.value) : null,
-                        },
-                      })
-                    }
-                  />
+
+              <div style={{ borderTop: "1px solid var(--border)", paddingTop: 12, marginTop: 12 }}>
+                <h4 style={{ margin: "0 0 8px" }}>Advanced · Pace &amp; HR Guardrails</h4>
+                <div className="form-row">
+                  <div>
+                    <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13, marginBottom: 6 }}>
+                      <input
+                        type="checkbox"
+                        style={{ width: "auto" }}
+                        checked={draftConfig.medical.enforceEasyHRCeiling}
+                        onChange={(e) =>
+                          setDraftConfig({
+                            ...draftConfig,
+                            medical: { ...draftConfig.medical, enforceEasyHRCeiling: e.target.checked },
+                          })
+                        }
+                      />
+                      HR-First Governor (enforce Easy HR ceiling)
+                    </label>
+                    <input
+                      type="number"
+                      placeholder="Easy HR Ceiling (bpm)"
+                      value={draftConfig.medical.easyHRCeilingBPM ?? ""}
+                      onChange={(e) =>
+                        setDraftConfig({
+                          ...draftConfig,
+                          medical: {
+                            ...draftConfig.medical,
+                            easyHRCeilingBPM: e.target.value ? Number(e.target.value) : null,
+                          },
+                        })
+                      }
+                    />
+                  </div>
+                  <div>
+                    <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13, marginBottom: 6 }}>
+                      <input
+                        type="checkbox"
+                        style={{ width: "auto" }}
+                        checked={draftConfig.medical.enforcePaceFloor}
+                        onChange={(e) =>
+                          setDraftConfig({
+                            ...draftConfig,
+                            medical: { ...draftConfig.medical, enforcePaceFloor: e.target.checked },
+                          })
+                        }
+                      />
+                      Hard Pace Floor (mm:ss/km)
+                    </label>
+                    <input
+                      placeholder="e.g. 6:30"
+                      value={paceFloorInput}
+                      onChange={(e) => setPaceFloorInput(e.target.value)}
+                    />
+                  </div>
+                  <div>
+                    <label className="muted">Min Rest Between Runs (h)</label>
+                    <input
+                      type="number"
+                      value={draftConfig.medical.minRestHoursBetweenRuns ?? ""}
+                      onChange={(e) =>
+                        setDraftConfig({
+                          ...draftConfig,
+                          medical: {
+                            ...draftConfig.medical,
+                            minRestHoursBetweenRuns: e.target.value ? Number(e.target.value) : null,
+                          },
+                        })
+                      }
+                    />
+                  </div>
                 </div>
               </div>
+
               <button
                 className="primary"
                 onClick={async () => {
-                  await invoke("save_athlete_config", { config: draftConfig });
-                  setStatusMsg("Profile saved.");
+                  const parts = paceFloorInput.trim().split(":");
+                  let parsedPaceSec: number | null = draftConfig.medical.minPaceSecPerKm;
+                  if (!paceFloorInput.trim()) {
+                    parsedPaceSec = null;
+                  } else if (parts.length === 2) {
+                    const m = Number(parts[0]);
+                    const s = Number(parts[1]);
+                    if (Number.isFinite(m) && Number.isFinite(s) && m >= 0 && s >= 0 && s < 60) {
+                      parsedPaceSec = Math.round(m * 60 + s);
+                    }
+                  }
+                  const updatedConfig: AthleteConfig = {
+                    ...draftConfig,
+                    medical: {
+                      ...draftConfig.medical,
+                      minPaceSecPerKm: parsedPaceSec,
+                    },
+                  };
+                  await invoke("save_athlete_config", { config: updatedConfig });
+                  if (state.user_profile) {
+                    await invoke("save_user_profile", {
+                      profile: {
+                        ...state.user_profile,
+                        runner_config: {
+                          ...state.user_profile.runner_config,
+                          hr_first_governor: updatedConfig.medical.enforceEasyHRCeiling,
+                          pace_floor_sec_per_km: parsedPaceSec,
+                        },
+                      },
+                    });
+                  }
+                  setStatusMsg("Profile & guardrails saved.");
                   await reload();
                 }}
               >
@@ -1352,7 +1992,9 @@ function ActivityDetailView({
     String(a.post_run_context?.orthopedic?.calves_soleus ?? 0)
   );
   const [savingContext, setSavingContext] = useState(false);
+  const [refreshingMeta, setRefreshingMeta] = useState(false);
   const [contextNotice, setContextNotice] = useState<string | null>(null);
+  const [metaNotice, setMetaNotice] = useState<string | null>(null);
   const [csvNotice, setCsvNotice] = useState<string | null>(null);
 
   useEffect(() => {
@@ -1375,8 +2017,25 @@ function ActivityDetailView({
     setRightAnkle(String(ctx?.orthopedic?.right_ankle ?? 0));
     setCalvesSoleus(String(ctx?.orthopedic?.calves_soleus ?? 0));
     setContextNotice(null);
+    setMetaNotice(null);
     setCsvNotice(null);
   }, [a.garmin_id]);
+
+  async function handleRefreshMetadata() {
+    setRefreshingMeta(true);
+    setMetaNotice(null);
+    try {
+      const updated = await invoke<ActivityRecord>("refresh_activity_metadata", {
+        activityId: a.garmin_id,
+      });
+      await onActivityUpdated(updated);
+      setMetaNotice("Metadata refreshed from Garmin Connect");
+    } catch (err) {
+      setMetaNotice(`Refresh failed: ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      setRefreshingMeta(false);
+    }
+  }
 
   const preNum = parseOptionalNum(preWeight);
   const postNum = parseOptionalNum(postWeight);
@@ -1490,6 +2149,15 @@ function ActivityDetailView({
           </button>
           <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
             {csvNotice && <span className="pill">{csvNotice}</span>}
+            {metaNotice && <span className="pill green">{metaNotice}</span>}
+            <button
+              className="secondary"
+              style={{ display: "flex", alignItems: "center", gap: 6 }}
+              disabled={refreshingMeta}
+              onClick={() => void handleRefreshMetadata()}
+            >
+              <RefreshCw size={14} /> {refreshingMeta ? "Refreshing…" : "Refresh Metadata"}
+            </button>
             <button
               className="secondary"
               style={{ display: "flex", alignItems: "center", gap: 6 }}
@@ -1512,6 +2180,24 @@ function ActivityDetailView({
         <div className="muted" style={{ marginBottom: 14 }}>
           {a.start_iso.slice(0, 10)} · {a.type_key}
         </div>
+        {a.garmin_notes && a.garmin_notes.trim().length > 0 && (
+          <div
+            style={{
+              marginBottom: 14,
+              padding: "10px 12px",
+              borderRadius: 8,
+              border: "1px solid var(--accent-border)",
+              background: "var(--accent-soft-bg)",
+            }}
+          >
+            <div style={{ fontSize: 12, fontWeight: 700, color: "var(--accent-primary)", marginBottom: 4 }}>
+              Garmin Connect Notes
+            </div>
+            <div style={{ fontSize: 13.5, lineHeight: 1.5, whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>
+              {a.garmin_notes.trim()}
+            </div>
+          </div>
+        )}
         {track?.hyrox_dissection && (
           <div
             style={{
@@ -1691,7 +2377,17 @@ function ActivityDetailView({
             </div>
             <div className="card">
               <div className="muted">Left Stance &gt; 52.8%</div>
-              <div className="metric-val">
+              <div
+                className="metric-val"
+                style={{
+                  color:
+                    forensic.left_stance_over_52_8_pct != null && forensic.left_stance_over_52_8_pct > 15
+                      ? "var(--red)"
+                      : forensic.left_stance_over_52_8_pct != null && forensic.left_stance_over_52_8_pct > 0
+                      ? "var(--amber)"
+                      : undefined,
+                }}
+              >
                 {forensic.left_stance_over_52_8_pct != null ? `${forensic.left_stance_over_52_8_pct.toFixed(1)}%` : "–"}
               </div>
             </div>
@@ -1709,7 +2405,18 @@ function ActivityDetailView({
             </div>
             <div className="card">
               <div className="muted">Zone Breaches (VT1 / VT2 / Z5)</div>
-              <div className="metric-val" style={{ fontSize: 16 }}>
+              <div
+                className="metric-val"
+                style={{
+                  fontSize: 16,
+                  color:
+                    forensic.z5_breach_seconds > 0
+                      ? "var(--red)"
+                      : forensic.vt1_breach_seconds > 0
+                      ? "var(--amber)"
+                      : undefined,
+                }}
+              >
                 {Math.round(forensic.vt1_breach_seconds)}s / {Math.round(forensic.vt2_breach_seconds)}s / {Math.round(forensic.z5_breach_seconds)}s
               </div>
             </div>

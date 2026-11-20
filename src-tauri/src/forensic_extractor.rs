@@ -102,6 +102,8 @@ pub struct ForensicTelemetryReport {
     pub micro_events: Vec<ForensicMicroEvent>,
     #[serde(default = "crate::models::default_temp_source")]
     pub temp_source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub garmin_notes: Option<String>,
 }
 
 fn r1(v: f64) -> f64 {
@@ -166,6 +168,7 @@ pub fn extract_forensic_telemetry_with_source(
             laps: Vec::new(),
             micro_events: Vec::new(),
             temp_source: temp_source.to_string(),
+            garmin_notes: None,
         };
     }
 
@@ -607,6 +610,7 @@ pub fn extract_forensic_telemetry_with_source(
         laps: lap_rows,
         micro_events,
         temp_source: temp_source.to_string(),
+        garmin_notes: None,
     }
 }
 
@@ -619,6 +623,9 @@ impl ForensicTelemetryReport {
             ),
             format!("- **Temperature Source**: {}", self.temp_source),
         ];
+        if let Some(notes) = self.garmin_notes.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            lines.push(format!("- **Garmin Connect Notes**: {notes}"));
+        }
         if let Some(pw) = self.pw_hr_decoupling_pct {
             lines.push(format!("- **Pw:Hr Decoupling (Active Run)**: {pw:.2}%"));
         }
