@@ -2,13 +2,19 @@ import { useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { Eye, EyeOff } from "lucide-react";
-import type {
-  AthleteConfig,
-  AthleteType,
-  FirstUseFlowState,
-  ModelSettings,
-  ThinkingLevel,
-  UserProfile,
+import {
+  RACE_DISTANCE_PRESETS,
+  presetDefaultName,
+  presetDistanceKm,
+  presetFromDistanceKm,
+  type AthleteConfig,
+  type AthleteType,
+  type FirstUseFlowState,
+  type GoalType,
+  type ModelSettings,
+  type RaceDistancePreset,
+  type ThinkingLevel,
+  type UserProfile,
 } from "../types";
 
 const HYROX_STATIONS = [
@@ -106,8 +112,18 @@ export function OnboardingWizard({
   const [lthrBpm, setLthrBpm] = useState(initialProfile.runner_config.lthr_bpm?.toString() ?? "");
 
   // Step 3: Discipline Targets (Goal Time optional; HR-First & Pace Floor live in Settings -> Advanced & Coach intake)
+  const initialGoalType: GoalType = initialConfig.objective.goalType ?? "general_fitness";
+  const [goalType, setGoalType] = useState<GoalType>(initialGoalType);
+  const [distancePreset, setDistancePreset] = useState<RaceDistancePreset>(() =>
+    presetFromDistanceKm(initialConfig.objective.raceDistanceKm, initialGoalType !== "race")
+  );
+  const [raceDistanceKm, setRaceDistanceKm] = useState<string>(() =>
+    initialConfig.objective.raceDistanceKm && initialConfig.objective.raceDistanceKm > 0
+      ? initialConfig.objective.raceDistanceKm.toFixed(1)
+      : ""
+  );
   const [primaryDistance, setPrimaryDistance] = useState(
-    initialProfile.runner_config.primary_distance ?? "Half Marathon"
+    initialConfig.objective.raceName ?? initialProfile.runner_config.primary_distance ?? ""
   );
   const [raceDate, setRaceDate] = useState(initialConfig.objective.raceDate ?? "");
   const [goalTime, setGoalTime] = useState(initialConfig.objective.targetTimeDescription ?? "");
@@ -262,6 +278,17 @@ export function OnboardingWizard({
       const parsedWeightKg = weightKg.trim() ? Number(weightKg) : null;
       const validWeightKg = parsedWeightKg && Number.isFinite(parsedWeightKg) && parsedWeightKg > 0 ? parsedWeightKg : null;
       const cleanGoalTime = goalTime.trim();
+      const parsedDistRaw = raceDistanceKm.trim() ? Number(raceDistanceKm.replace(",", ".")) : null;
+      const resolvedDistKm =
+        parsedDistRaw && Number.isFinite(parsedDistRaw) && parsedDistRaw > 0
+          ? parsedDistRaw
+          : presetDistanceKm(distancePreset);
+      const trimmedRaceName = primaryDistance.trim();
+      const resolvedPrimaryDist =
+        trimmedRaceName ||
+        presetDefaultName(distancePreset) ||
+        (resolvedDistKm ? `${resolvedDistKm.toFixed(1)} km` : null);
+      const resolvedGoalType: GoalType = athleteType === "hyrox" ? "hybrid_hyrox" : goalType;
       const nextConfig: AthleteConfig = {
         ...initialConfig,
         specs: {
@@ -278,8 +305,9 @@ export function OnboardingWizard({
         },
         objective: {
           ...initialConfig.objective,
-          goalType: athleteType === "runner" ? "race" : "hybrid_hyrox",
-          raceName: athleteType === "hyrox" ? `HYROX (${division})` : primaryDistance,
+          goalType: resolvedGoalType,
+          raceName: athleteType === "hyrox" ? `HYROX (${division})` : trimmedRaceName || null,
+          raceDistanceKm: resolvedDistKm,
           raceDate: raceDate.trim() || null,
           targetTimeDescription: cleanGoalTime ? cleanGoalTime : null,
           hybridProfile:
@@ -306,7 +334,7 @@ export function OnboardingWizard({
         onboarding_completed: true,
         runner_config: {
           ...initialProfile.runner_config,
-          primary_distance: primaryDistance || null,
+          primary_distance: resolvedPrimaryDist,
           hr_first_governor: initialProfile.runner_config.hr_first_governor ?? true,
           pace_floor_sec_per_km: initialProfile.runner_config.pace_floor_sec_per_km ?? null,
           z2_range_bpm: initialProfile.runner_config.z2_range_bpm,
@@ -389,7 +417,17 @@ export function OnboardingWizard({
                   type="button"
                   className={athleteType === opt.id ? "primary" : "secondary"}
                   style={{ textAlign: "left", padding: 12 }}
-                  onClick={() => setAthleteType(opt.id)}
+                  onClick={() => {
+                    const prev = athleteType;
+                    setAthleteType(opt.id);
+                    if (opt.id === "hyrox") {
+                      setGoalType("hybrid_hyrox");
+                    } else if (prev === "hyrox" && goalType === "hybrid_hyrox") {
+                      setGoalType("general_fitness");
+                      setDistancePreset("none");
+                      setRaceDistanceKm("");
+                    }
+                  }}
                 >
                   <div style={{ fontWeight: 600 }}>{opt.title}</div>
                   <div style={{ fontSize: 12, opacity: 0.85, marginTop: 4 }}>{opt.desc}</div>
@@ -570,22 +608,118 @@ export function OnboardingWizard({
                 <strong>Endurance Running Targets</strong>
                 <div className="form-row" style={{ marginTop: 8 }}>
                   <div>
-                    <label className="muted">Primary Distance / Event</label>
-                    <input value={primaryDistance} onChange={(e) => setPrimaryDistance(e.target.value)} />
+                    <label className="muted">Goal Type</label>
+                    <select
+                      value={goalType}
+                      onChange={(e) => {
+                        const prevGoal = goalType;
+                        const nextGoal = e.target.value as GoalType;
+                        setGoalType(nextGoal);
+                        if (nextGoal === "couch_to_5k") {
+                          setDistancePreset("5k");
+                          setRaceDistanceKm("5.0");
+                        } else if (nextGoal === "race") {
+                          if (distancePreset === "none") {
+                            setDistancePreset("5k");
+                            setRaceDistanceKm("5.0");
+                          }
+                        } else if (prevGoal === "couch_to_5k" || prevGoal === "race") {
+                          setDistancePreset("none");
+                          setRaceDistanceKm("");
+                        }
+                      }}
+                    >
+                      <option value="general_fitness">General Fitness</option>
+                      <option value="base_building">Base Building</option>
+                      <option value="race">Target Race</option>
+                      <option value="return_from_injury">Return from Injury</option>
+                      <option value="return_to_running">Back to Running (Re-Entry)</option>
+                      <option value="couch_to_5k">Couch to 5K (C25K)</option>
+                      {athleteType === "hybrid_both" && (
+                        <option value="hybrid_hyrox">Hyrox / Hybrid Athlete</option>
+                      )}
+                    </select>
+                  </div>
+                  <div>
+                    <label className="muted">Target Distance</label>
+                    <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                      <select
+                        value={distancePreset}
+                        onChange={(e) => {
+                          const nextPreset = e.target.value as RaceDistancePreset;
+                          setDistancePreset(nextPreset);
+                          const km = presetDistanceKm(nextPreset);
+                          if (km !== null) {
+                            setRaceDistanceKm(km.toFixed(1));
+                          } else if (nextPreset === "none") {
+                            setRaceDistanceKm("");
+                          }
+                        }}
+                      >
+                        {RACE_DISTANCE_PRESETS.filter(
+                          (p) => p.id !== "none" || goalType !== "race"
+                        ).map((p) => (
+                          <option key={p.id} value={p.id}>
+                            {p.label}
+                          </option>
+                        ))}
+                      </select>
+                      {distancePreset !== "none" && (
+                        <div style={{ display: "flex", alignItems: "center", gap: 4, flexShrink: 0 }}>
+                          <input
+                            type="number"
+                            step="0.1"
+                            min="0"
+                            style={{ width: 78 }}
+                            placeholder="km"
+                            value={raceDistanceKm}
+                            onChange={(e) => {
+                              const raw = e.target.value;
+                              setRaceDistanceKm(raw);
+                              const norm = raw.replace(",", ".").trim();
+                              if (!norm) {
+                                if (distancePreset !== "custom" && goalType !== "race") {
+                                  setDistancePreset("none");
+                                }
+                              } else {
+                                const parsed = Number(norm);
+                                if (Number.isFinite(parsed) && parsed > 0) {
+                                  setDistancePreset(presetFromDistanceKm(parsed, goalType !== "race"));
+                                }
+                              }
+                            }}
+                          />
+                          <span className="muted" style={{ fontSize: 12 }}>km</span>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                  <div>
+                    <label className="muted">Race / Event Name (optional)</label>
+                    <input
+                      placeholder="Optional (e.g., City 5K)"
+                      value={primaryDistance}
+                      onChange={(e) => setPrimaryDistance(e.target.value)}
+                    />
                   </div>
                   <div>
                     <label className="muted">Target Race Date</label>
                     <input type="date" value={raceDate} onChange={(e) => setRaceDate(e.target.value)} />
                   </div>
                   <div style={{ gridColumn: "span 2" }}>
-                    <label className="muted">Goal Time (optional)</label>
+                    <label className="muted">Target Finish Time (optional)</label>
                     <input
-                      placeholder="Optional — leave blank if goal is to finish"
+                      placeholder="HH:MM:SS — leave blank if goal is to finish"
                       value={goalTime}
                       onChange={(e) => setGoalTime(e.target.value)}
                     />
                   </div>
                 </div>
+                {goalType === "couch_to_5k" && (
+                  <div style={{ color: "var(--accent-primary)", fontSize: 12, marginTop: 4 }}>
+                    C25K targets a progressive 8-9 week buildup from run-walk intervals to 5.0 km continuous running.
+                  </div>
+                )}
                 <div className="muted" style={{ fontSize: 12, marginTop: 4 }}>
                   Advanced guardrails (HR-First Governor and Hard Pace Floor) can be discussed conversationally with your Coach or configured anytime in <strong>Settings → Advanced Guardrails</strong>.
                 </div>

@@ -3,8 +3,8 @@ use splits_win_lib::coach::{
     analyze_training_history, append_forensic_section, append_training_ledger_entry,
     apply_coach_proposal, apply_post_run_context_tool_update, compact_history_markdown,
     fetch_1hz_window_from_track, format_user_profile_context, replacing_section,
-    slice_fit_track_by_km, starter_coach_profile_markdown, starter_training_plan_markdown,
-    CoachPacketBuilder,
+    slice_fit_track_by_km, starter_coach_profile_markdown, starter_plan_file,
+    starter_training_plan_markdown, CoachPacketBuilder,
 };
 use splits_win_lib::forensic_extractor::extract_forensic_telemetry;
 use splits_win_lib::garmin::{analyze_fit_points, dissect_hyrox_laps, parse_weight_range_json};
@@ -1440,4 +1440,121 @@ fn v0_2_3_1_discipline_backcompat_goal_sync_and_force_hyrox_empty_laps() {
     assert!(dissect_hyrox_laps(&[], false).is_none());
     let forced = dissect_hyrox_laps(&[], true).expect("forced hyrox on empty laps should return dissection");
     assert!(forced.is_hyrox_sim);
+}
+
+#[test]
+fn v0_2_3_2_reentry_c25k_goals_and_clean_slate_purge() {
+    // 1. ReturnToRunning & CouchTo5k GoalType serialization + display names
+    let reentry: GoalType = serde_json::from_str("\"return_to_running\"").unwrap();
+    let c25k: GoalType = serde_json::from_str("\"couch_to_5k\"").unwrap();
+    assert_eq!(reentry, GoalType::ReturnToRunning);
+    assert_eq!(c25k, GoalType::CouchTo5k);
+    assert_eq!(reentry.display_name(), "Back to Running (Re-Entry)");
+    assert_eq!(c25k.display_name(), "Couch to 5K (C25K)");
+
+    // 2. Readiness & starter plan logic for C25K and ReturnToRunning
+    let now = Utc.with_ymd_and_hms(2026, 11, 23, 8, 0, 0).unwrap();
+    let today_day = DayRecord {
+        date: "2026-11-23".to_string(),
+        resting_hr: Some(58),
+        stress_avg: Some(22),
+        body_battery_high: Some(85),
+        body_battery_latest: Some(80),
+        steps: Some(4000),
+        step_goal: Some(8000),
+        sleep_seconds: Some(28800),
+        sleep_score: Some(84),
+        hrv_last_night: Some(62),
+        hrv_status: Some("BALANCED".to_string()),
+    };
+
+    let mut c25k_cfg = AthleteConfig::default();
+    c25k_cfg.specs.resting_hr_baseline = Some(58);
+    c25k_cfg.specs.vt1_ceiling_bpm = Some(142);
+    c25k_cfg.objective.goal_type = GoalType::CouchTo5k;
+    c25k_cfg.objective.race_distance_km = Some(5.0);
+    c25k_cfg.objective.target_time_description = None;
+
+    let summary = analyze_training_history(&[], &c25k_cfg, now);
+    let plan_md = starter_training_plan_markdown(&c25k_cfg, &summary);
+    assert!(plan_md.contains("Couch to 5K (C25K)"));
+    assert!(plan_md.contains("8-9 week"));
+    assert!(plan_md.contains("5.0 km"));
+    assert!(plan_md.contains("finish goal — no target time set"));
+
+    let starter = starter_plan_file(&c25k_cfg, &summary);
+    assert_eq!(starter.envelope.mesocycle_phase, "couch_to_5k");
+    assert_eq!(starter.envelope.max_single_run_km, 5.0);
+    assert_eq!(starter.envelope.min_hours_between_runs, 48.0);
+    assert!(!starter.sessions.is_empty());
+    assert!(starter
+        .sessions
+        .iter()
+        .all(|s| s.session_type == RunTypology::RunWalkReentry));
+
+    let c25k_out = ReadinessEngine::evaluate(ReadinessInput {
+        now,
+        athlete_config: &c25k_cfg,
+        activities: &[],
+        days: std::slice::from_ref(&today_day),
+        plan: None,
+        gear_inventory: None,
+    });
+    assert_eq!(
+        c25k_out.authoritative_target.prescription.as_ref().and_then(|p| p.prescribed_title.as_deref()),
+        Some("C25K Run-Walk Progression")
+    );
+    assert_eq!(c25k_out.readiness_state.gatekeeper.remaining_weekly_budget_km, 15.0);
+    assert!(c25k_out.readiness_state.prescription_summary.distance_km <= 5.0);
+
+    let mut reentry_cfg = AthleteConfig::default();
+    reentry_cfg.specs.resting_hr_baseline = Some(56);
+    reentry_cfg.specs.vt1_ceiling_bpm = Some(140);
+    reentry_cfg.objective.goal_type = GoalType::ReturnToRunning;
+    let reentry_out = ReadinessEngine::evaluate(ReadinessInput {
+        now,
+        athlete_config: &reentry_cfg,
+        activities: &[],
+        days: &[today_day],
+        plan: None,
+        gear_inventory: None,
+    });
+    assert_eq!(
+        reentry_out.authoritative_target.prescription.as_ref().and_then(|p| p.prescribed_title.as_deref()),
+        Some("Run-Walk Re-Entry")
+    );
+    assert_eq!(reentry_out.readiness_state.gatekeeper.remaining_weekly_budget_km, 18.0);
+
+    // 3. Clean-Slate Reset purges SQLite tables, optional tables, .fit files & coach markdown/json state
+    let dir = make_temp_dir("clean-slate-0232");
+    let store = SharedStore::new(Some(dir.clone())).unwrap();
+    let db = Database::open(&dir.join("state/splits.sqlite")).unwrap();
+    let mut prof = db.get_user_profile().unwrap();
+    prof.onboarding_completed = true;
+    db.save_user_profile(&prof).unwrap();
+    db.set_setting("custom_key", Some("val")).unwrap();
+    db.save_global_model_settings("gemini-4-hydrogen", ThinkingLevel::High).unwrap();
+
+    std::fs::write(dir.join("sample.fit"), b"fitdata").unwrap();
+    std::fs::write(dir.join("COACH_PROFILE.md"), b"# Profile").unwrap();
+    std::fs::write(dir.join("TRAINING_PLAN.md"), b"# Plan").unwrap();
+    std::fs::write(dir.join("readiness_state.json"), b"{}").unwrap();
+    std::fs::write(dir.join("state/first_use_flow.json"), b"{\"stage\":\"active\"}").unwrap();
+
+    db.clean_slate_reset().unwrap();
+    store.clean_slate_files().unwrap();
+
+    let reset_prof = db.get_user_profile().unwrap();
+    assert!(!reset_prof.onboarding_completed);
+    assert_eq!(db.get_setting("custom_key").unwrap(), None);
+    assert!(!dir.join("sample.fit").exists());
+    assert!(!dir.join("COACH_PROFILE.md").exists());
+    assert!(!dir.join("TRAINING_PLAN.md").exists());
+    assert!(!dir.join("readiness_state.json").exists());
+    assert!(!dir.join("state/first_use_flow.json").exists());
+    assert!(dir.join("state").exists());
+    assert!(dir.join("history").exists());
+    assert!(dir.join("attachments").exists());
+
+    let _ = std::fs::remove_dir_all(&dir);
 }

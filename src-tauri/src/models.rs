@@ -191,6 +191,9 @@ pub enum GoalType {
     #[default]
     GeneralFitness,
     ReturnFromInjury,
+    ReturnToRunning,
+    #[serde(rename = "couch_to_5k")]
+    CouchTo5k,
     HybridHyrox,
 }
 
@@ -201,8 +204,17 @@ impl GoalType {
             GoalType::BaseBuilding => "Base Building",
             GoalType::GeneralFitness => "General Fitness",
             GoalType::ReturnFromInjury => "Return from Injury",
+            GoalType::ReturnToRunning => "Back to Running (Re-Entry)",
+            GoalType::CouchTo5k => "Couch to 5K (C25K)",
             GoalType::HybridHyrox => "Hyrox / Hybrid Athlete",
         }
+    }
+
+    pub fn is_reentry_or_starter(&self) -> bool {
+        matches!(
+            self,
+            GoalType::ReturnFromInjury | GoalType::ReturnToRunning | GoalType::CouchTo5k
+        )
     }
 }
 

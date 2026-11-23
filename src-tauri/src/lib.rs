@@ -152,11 +152,44 @@ async fn verify_gemini_key(
 #[tauri::command]
 fn clean_slate_reset(state: State<'_, AppState>) -> Result<(), String> {
     let store = state.load_store()?;
-    let db = state.open_db()?;
-    db.clean_slate_reset().map_err(|e| e.to_string())?;
+    {
+        let db = state.open_db()?;
+        db.clean_slate_reset().map_err(|e| e.to_string())?;
+    }
+    let state_dir = store.root().join("state");
+    for db_file in ["splits.sqlite", "splits.sqlite-wal", "splits.sqlite-shm"] {
+        let p = state_dir.join(db_file);
+        if p.exists() {
+            let _ = std::fs::remove_file(&p);
+        }
+    }
     store.clean_slate_files().map_err(|e| e.to_string())?;
+    let base_dir = SharedStore::default_base_dir();
+    let cred_file = base_dir.join("credentials.json");
+    if cred_file.exists() {
+        let _ = std::fs::remove_file(&cred_file);
+    }
+    for cache_dir in ["cache", "Cache", "CoachCache", "Activities", "logs"] {
+        let p = base_dir.join(cache_dir);
+        if p.exists() {
+            let _ = std::fs::remove_dir_all(&p);
+        }
+    }
+    if let Ok(entries) = std::fs::read_dir(&base_dir) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_file()
+                && p.extension()
+                    .and_then(|e| e.to_str())
+                    .map_or(false, |e| e.eq_ignore_ascii_case("fit"))
+            {
+                let _ = std::fs::remove_file(&p);
+            }
+        }
+    }
     let _ = CredentialStore::clear_all();
     *state.settings.lock().unwrap() = AppSettings::default();
+    let _ = state.open_db()?;
     Ok(())
 }
 

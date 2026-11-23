@@ -27,22 +27,26 @@ import {
   Upload,
 } from "lucide-react";
 import { OnboardingWizard } from "./components/OnboardingWizard";
-import type {
-  ActivityDetailPayload,
-  ActivityRecord,
-  AthleteConfig,
-  AthleteType,
-  BootstrapState,
-  CoachUpdateProposal,
-  ExecutionMode,
-  FirstUseStage,
-  FitTrackPoint,
-  GoalType,
-  ModelSettings,
-  PostRunContext,
-  ThinkingLevel,
-  TrainingDiscipline,
-  UserProfile,
+import {
+  RACE_DISTANCE_PRESETS,
+  presetDistanceKm,
+  presetFromDistanceKm,
+  type ActivityDetailPayload,
+  type ActivityRecord,
+  type AthleteConfig,
+  type AthleteType,
+  type BootstrapState,
+  type CoachUpdateProposal,
+  type ExecutionMode,
+  type FirstUseStage,
+  type FitTrackPoint,
+  type GoalType,
+  type ModelSettings,
+  type PostRunContext,
+  type RaceDistancePreset,
+  type ThinkingLevel,
+  type TrainingDiscipline,
+  type UserProfile,
 } from "./types";
 
 type NavTab = "today" | "activities" | "coach" | "settings";
@@ -240,6 +244,9 @@ export default function App() {
 
   const [draftConfig, setDraftConfig] = useState<AthleteConfig | null>(null);
   const [draftProfile, setDraftProfile] = useState<UserProfile | null>(null);
+  const [distancePreset, setDistancePreset] = useState<RaceDistancePreset>("none");
+  const [raceDistanceInput, setRaceDistanceInput] = useState("");
+  const [expandedDiffIds, setExpandedDiffIds] = useState<Record<string, boolean>>({});
   const [showOnboarding, setShowOnboarding] = useState(false);
   const [onboardingKey, setOnboardingKey] = useState(0);
   const [showToolsMenu, setShowToolsMenu] = useState(false);
@@ -261,7 +268,7 @@ export default function App() {
   const [confirmCleanSlate, setConfirmCleanSlate] = useState(false);
   const [cleanSlateBusy, setCleanSlateBusy] = useState(false);
 
-  const [appVersion, setAppVersion] = useState<string>("0.2.3.1-beta");
+  const [appVersion, setAppVersion] = useState<string>("0.2.3.2-beta");
   const [availableUpdate, setAvailableUpdate] = useState<Update | null>(null);
   const [updateStatus, setUpdateStatus] = useState<string | null>(null);
   const [updateChecking, setUpdateChecking] = useState(false);
@@ -311,6 +318,17 @@ export default function App() {
     setHyroxTargetTimeInput(
       loadedProfile.hyrox_config.target_total_time_sec && loadedProfile.hyrox_config.target_total_time_sec > 0
         ? formatDuration(loadedProfile.hyrox_config.target_total_time_sec)
+        : ""
+    );
+    setDistancePreset(
+      presetFromDistanceKm(
+        data.athlete_config.objective.raceDistanceKm,
+        data.athlete_config.objective.goalType !== "race"
+      )
+    );
+    setRaceDistanceInput(
+      data.athlete_config.objective.raceDistanceKm && data.athlete_config.objective.raceDistanceKm > 0
+        ? data.athlete_config.objective.raceDistanceKm.toFixed(1)
         : ""
     );
   }
@@ -666,9 +684,11 @@ export default function App() {
       const firstPending = proposals.find((p) => p.status === "pending_user_approval");
       if (firstPending) {
         requestAnimationFrame(() => {
-          document
-            .getElementById(`proposal-${firstPending.id}`)
-            ?.scrollIntoView({ behavior: "smooth", block: "start" });
+          requestAnimationFrame(() => {
+            document
+              .getElementById(`proposal-${firstPending.id}`)
+              ?.scrollIntoView({ behavior: "smooth", block: "start" });
+          });
         });
       }
     } catch (err) {
@@ -863,8 +883,9 @@ export default function App() {
       if (wasPlanApproval) {
         updated.push({
           role: "assistant",
+          anchorId: "stage-4-setup-complete",
           text:
-            "Setup complete — your profile and training block are now active.\n\n" +
+            "**Setup complete — your profile and training block are now active.**\n\n" +
             "- **Today**: Check daily readiness gatekeeper status, HR ceiling, and your prescribed session.\n" +
             "- **Activities**: Review synced Garmin runs/HYROX splits, .fit telemetry, and Garmin notes.\n" +
             "- **Coach**: Ask questions anytime or run weekly/monthly block reviews from the Tools menu.",
@@ -872,6 +893,10 @@ export default function App() {
       }
       return updated;
     });
+    if (!approve) {
+      setChatInput(`Please revise the proposed ${targetProp.target_file}: `);
+      chatInputRef.current?.focus();
+    }
     if (wasProfileApproval) {
       requestAnimationFrame(() => {
         document
@@ -882,6 +907,13 @@ export default function App() {
     if (wasPlanApproval) {
       setJustCompletedGuidedSetup(true);
       setTimeout(() => setJustCompletedGuidedSetup(false), 2000);
+      requestAnimationFrame(() => {
+        requestAnimationFrame(() => {
+          document
+            .getElementById("stage-4-setup-complete")
+            ?.scrollIntoView({ behavior: "smooth", block: "start" });
+        });
+      });
     }
   }
 
@@ -1636,7 +1668,7 @@ export default function App() {
                       </div>
                     ) : (
                       <div key={i} id={m.anchorId} className={`bubble ${m.role}`}>
-                        {m.isStage3Audit && m.text ? (
+                        {(m.isStage3Audit || m.anchorId === "stage-4-setup-complete") && m.text ? (
                           <MarkdownPreview markdown={m.text} />
                         ) : (
                           <div>{m.text || (busy && m.role === "assistant" ? "Thinking…" : "")}</div>
@@ -1677,18 +1709,42 @@ export default function App() {
                               : p.target_file === "TRAINING_PLAN.md" && firstUseStage === "plan_approval"
                               ? "Approve Training Plan"
                               : "Approve & Apply";
+                          const isPending = p.status === "pending_user_approval";
+                          const diffOpen = Boolean(expandedDiffIds[p.id]);
+                          const renderActionButtons = () =>
+                            isPending ? (
+                              <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+                                <button
+                                  type="button"
+                                  className="primary"
+                                  onClick={() => void handleProposalDecision(i, p.id, true)}
+                                >
+                                  {approveLabel}
+                                </button>
+                                <button
+                                  type="button"
+                                  className="secondary"
+                                  onClick={() => void handleProposalDecision(i, p.id, false)}
+                                >
+                                  Reject / Request Changes
+                                </button>
+                              </div>
+                            ) : null;
                           return (
                             <div key={p.id} id={`proposal-${p.id}`} className="proposal-card">
-                              <div className="proposal-header">
+                              <div className="proposal-header" style={{ flexWrap: "wrap", gap: 10 }}>
                                 <div>
-                                  <div className="proposal-title">{p.target_file}</div>
+                                  <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+                                    <div className="proposal-title">{p.target_file}</div>
+                                    <span className={`pill ${p.status === "applied" ? "green" : p.status === "dismissed" ? "" : "accent"}`}>
+                                      {isPending ? "Pending Approval" : p.status}
+                                    </span>
+                                  </div>
                                   <div className="muted" style={{ fontSize: 12.5, marginTop: 2 }}>
                                     {p.reason}
                                   </div>
                                 </div>
-                                <span className={`pill ${p.status === "applied" ? "green" : p.status === "dismissed" ? "" : "accent"}`}>
-                                  {p.status === "pending_user_approval" ? "Pending Approval" : p.status}
-                                </span>
+                                {renderActionButtons()}
                               </div>
                               {p.expires_on && (
                                 <div className="muted" style={{ marginBottom: 8 }}>
@@ -1696,26 +1752,26 @@ export default function App() {
                                 </div>
                               )}
                               <MarkdownPreview markdown={p.updated_section_markdown || p.diff_preview} />
-                              <details className="raw-diff-details">
-                                <summary>View Raw Diff</summary>
-                                <pre className="raw-diff-pre">{p.diff_preview}</pre>
-                              </details>
-                              {p.status === "pending_user_approval" && (
-                                <div style={{ display: "flex", gap: 8, marginTop: 12 }}>
+                              <div className="proposal-footer">
+                                <div className="proposal-footer-bar">
                                   <button
-                                    className="primary"
-                                    onClick={() => void handleProposalDecision(i, p.id, true)}
-                                  >
-                                    {approveLabel}
-                                  </button>
-                                  <button
+                                    type="button"
+                                    aria-expanded={diffOpen}
                                     className="secondary"
-                                    onClick={() => void handleProposalDecision(i, p.id, false)}
+                                    style={{ fontSize: 12, padding: "4px 10px" }}
+                                    onClick={() =>
+                                      setExpandedDiffIds((prev) => ({
+                                        ...prev,
+                                        [p.id]: !prev[p.id],
+                                      }))
+                                    }
                                   >
-                                    Dismiss
+                                    {diffOpen ? "▾ View Raw Diff" : "▸ View Raw Diff"}
                                   </button>
+                                  {renderActionButtons()}
                                 </div>
-                              )}
+                                {diffOpen && <pre className="raw-diff-pre">{p.diff_preview}</pre>}
+                              </div>
                             </div>
                           );
                         })}
@@ -2164,24 +2220,142 @@ export default function App() {
                       <label className="muted">Goal Type</label>
                       <select
                         value={draftConfig.objective.goalType}
-                        onChange={(e) =>
+                        onChange={(e) => {
+                          const prevGoal = draftConfig.objective.goalType;
+                          const nextGoal = e.target.value as GoalType;
+                          let nextDist = draftConfig.objective.raceDistanceKm ?? null;
+                          if (nextGoal === "couch_to_5k") {
+                            setDistancePreset("5k");
+                            setRaceDistanceInput("5.0");
+                            nextDist = 5.0;
+                          } else if (nextGoal === "race") {
+                            if (distancePreset === "none") {
+                              setDistancePreset("5k");
+                              setRaceDistanceInput("5.0");
+                              nextDist = 5.0;
+                            }
+                          } else if (prevGoal === "couch_to_5k" || prevGoal === "race") {
+                            setDistancePreset("none");
+                            setRaceDistanceInput("");
+                            nextDist = null;
+                          }
                           setDraftConfig({
                             ...draftConfig,
-                            objective: { ...draftConfig.objective, goalType: e.target.value as GoalType },
-                          })
-                        }
+                            objective: {
+                              ...draftConfig.objective,
+                              goalType: nextGoal,
+                              raceDistanceKm: nextDist,
+                            },
+                          });
+                        }}
                       >
                         <option value="general_fitness">General Fitness</option>
                         <option value="base_building">Base Building</option>
                         <option value="race">Target Race</option>
                         <option value="return_from_injury">Return from Injury</option>
+                        <option value="return_to_running">Back to Running (Re-Entry)</option>
+                        <option value="couch_to_5k">Couch to 5K (C25K)</option>
                         <option value="hybrid_hyrox">Hyrox / Hybrid Athlete</option>
                       </select>
                     </div>
                     <div>
-                      <label className="muted">Goal Time (optional)</label>
+                      <label className="muted">Target Distance</label>
+                      <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                        <select
+                          value={distancePreset}
+                          onChange={(e) => {
+                            const nextPreset = e.target.value as RaceDistancePreset;
+                            setDistancePreset(nextPreset);
+                            const km = presetDistanceKm(nextPreset);
+                            if (km !== null) {
+                              setRaceDistanceInput(km.toFixed(1));
+                              setDraftConfig({
+                                ...draftConfig,
+                                objective: { ...draftConfig.objective, raceDistanceKm: km },
+                              });
+                            } else if (nextPreset === "none") {
+                              setRaceDistanceInput("");
+                              setDraftConfig({
+                                ...draftConfig,
+                                objective: { ...draftConfig.objective, raceDistanceKm: null },
+                              });
+                            }
+                          }}
+                        >
+                          {RACE_DISTANCE_PRESETS.filter(
+                            (p) => p.id !== "none" || draftConfig.objective.goalType !== "race"
+                          ).map((p) => (
+                            <option key={p.id} value={p.id}>
+                              {p.label}
+                            </option>
+                          ))}
+                        </select>
+                        {distancePreset !== "none" && (
+                          <div style={{ display: "flex", alignItems: "center", gap: 4, flexShrink: 0 }}>
+                            <input
+                              type="number"
+                              step="0.1"
+                              min="0"
+                              style={{ width: 78 }}
+                              placeholder="km"
+                              value={raceDistanceInput}
+                              onChange={(e) => {
+                                const raw = e.target.value;
+                                setRaceDistanceInput(raw);
+                                const norm = raw.replace(",", ".").trim();
+                                if (!norm) {
+                                  if (
+                                    distancePreset !== "custom" &&
+                                    draftConfig.objective.goalType !== "race"
+                                  ) {
+                                    setDistancePreset("none");
+                                  }
+                                  setDraftConfig({
+                                    ...draftConfig,
+                                    objective: { ...draftConfig.objective, raceDistanceKm: null },
+                                  });
+                                } else {
+                                  const parsed = Number(norm);
+                                  if (Number.isFinite(parsed) && parsed > 0) {
+                                    setDistancePreset(
+                                      presetFromDistanceKm(
+                                        parsed,
+                                        draftConfig.objective.goalType !== "race"
+                                      )
+                                    );
+                                    setDraftConfig({
+                                      ...draftConfig,
+                                      objective: { ...draftConfig.objective, raceDistanceKm: parsed },
+                                    });
+                                  }
+                                }
+                              }}
+                            />
+                            <span className="muted" style={{ fontSize: 12 }}>km</span>
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                    <div>
+                      <label className="muted">Race / Event Name (optional)</label>
                       <input
-                        placeholder="Optional — leave blank if goal is to finish"
+                        placeholder="Optional (e.g., City 5K)"
+                        value={draftConfig.objective.raceName ?? ""}
+                        onChange={(e) =>
+                          setDraftConfig({
+                            ...draftConfig,
+                            objective: {
+                              ...draftConfig.objective,
+                              raceName: e.target.value.trim() ? e.target.value : null,
+                            },
+                          })
+                        }
+                      />
+                    </div>
+                    <div>
+                      <label className="muted">Target Finish Time (optional)</label>
+                      <input
+                        placeholder="HH:MM:SS — leave blank if goal is to finish"
                         value={draftConfig.objective.targetTimeDescription ?? ""}
                         onChange={(e) =>
                           setDraftConfig({
@@ -2195,6 +2369,11 @@ export default function App() {
                       />
                     </div>
                   </div>
+                  {draftConfig.objective.goalType === "couch_to_5k" && (
+                    <div style={{ color: "var(--accent-primary)", fontSize: 12, marginTop: 6 }}>
+                      C25K targets a progressive 8-9 week buildup from run-walk intervals to 5.0 km continuous running.
+                    </div>
+                  )}
 
                   {showRunner && (
                     <div style={{ borderTop: "1px solid var(--border)", paddingTop: 12, marginTop: 12 }}>
@@ -2588,9 +2767,22 @@ export default function App() {
                           : activeProfile.athlete_type === "hybrid_both"
                           ? "hybrid"
                           : "running";
+                      const parsedDistRaw = raceDistanceInput.trim()
+                        ? Number(raceDistanceInput.replace(",", "."))
+                        : null;
+                      const resolvedDistKm =
+                        parsedDistRaw && Number.isFinite(parsedDistRaw) && parsedDistRaw > 0
+                          ? parsedDistRaw
+                          : presetDistanceKm(distancePreset);
+                      const trimmedRaceName = (draftConfig.objective.raceName ?? "").trim();
                       const updatedConfig: AthleteConfig = {
                         ...draftConfig,
                         discipline: nextDiscipline,
+                        objective: {
+                          ...draftConfig.objective,
+                          raceName: trimmedRaceName || null,
+                          raceDistanceKm: resolvedDistKm,
+                        },
                         specs: {
                           ...draftConfig.specs,
                           weightBaselineConfirmed: Boolean(
@@ -2776,11 +2968,16 @@ export default function App() {
                         await invoke("clean_slate_reset");
                         try {
                           localStorage.clear();
+                          sessionStorage.clear();
                         } catch {
                           // ignore storage restrictions
                         }
                         setMessages([]);
                         setSelectedActivity(null);
+                        setDraftConfig(null);
+                        setDraftProfile(null);
+                        setDistancePreset("none");
+                        setRaceDistanceInput("");
                         setCoachError(null);
                         setStatusMsg(null);
                         setConfirmCleanSlate(false);

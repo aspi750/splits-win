@@ -56,7 +56,9 @@ impl ReadinessEngine {
             })
         });
 
-        let is_hybrid = input.athlete_config.objective.goal_type == GoalType::HybridHyrox;
+        let goal_type = input.athlete_config.objective.goal_type;
+        let is_hybrid = goal_type == GoalType::HybridHyrox;
+        let is_reentry_or_c25k = goal_type.is_reentry_or_starter();
         let mut high_strain_sessions: Vec<&ActivityRecord> = input
             .activities
             .iter()
@@ -108,7 +110,8 @@ impl ReadinessEngine {
 
         // 3. Hard Blocks (`CONTRACT.md §3.2`)
         let mut hard_blocks = Vec::new();
-        let min_spacing_hours = input.athlete_config.medical.min_rest_hours_between_runs.unwrap_or(36) as f64;
+        let default_spacing = if is_reentry_or_c25k { 48 } else { 36 };
+        let min_spacing_hours = input.athlete_config.medical.min_rest_hours_between_runs.unwrap_or(default_spacing) as f64;
         let spacing_ref_hours = if is_hybrid { hours_since_last_high_strain } else { hours_since_last_run };
         let spacing_label = if is_hybrid { "high-strain session" } else { "run" };
         if let Some(hrs) = spacing_ref_hours {
@@ -210,7 +213,14 @@ impl ReadinessEngine {
         // 5. Shoe Eligibility & Planned Session
         let (eligible_shoes, gated_shoes, blocked_shoes) = resolve_shoe_eligibility(input.gear_inventory, &prior_runs);
         let today_session = input.plan.and_then(|p| p.sessions.iter().find(|s| s.date == today_str));
-        let single_run_cap_km = input.plan.map_or(10.0, |p| p.envelope.max_single_run_km);
+        let default_single_cap_km = if goal_type == GoalType::CouchTo5k {
+            5.0
+        } else if is_reentry_or_c25k {
+            6.0
+        } else {
+            10.0
+        };
+        let single_run_cap_km = input.plan.map_or(default_single_cap_km, |p| p.envelope.max_single_run_km);
         let effective_today_max_km = round2(single_run_cap_km.min(remaining_7d_budget_km));
 
         // 6. Deterministic Prescription & Guardrail Clamping (`CONTRACT.md §3.4`)
@@ -254,9 +264,10 @@ impl ReadinessEngine {
                     format!("{dist:.1} km easy aerobic within HR <= {hr_cap} bpm."),
                 )
             } else {
+                let fallback_dist = if is_reentry_or_c25k { default_single_cap_km } else { 6.0 };
                 let planned_dist = today_session
                     .and_then(|s| s.target.distance_km.first().copied())
-                    .unwrap_or_else(|| 6.0_f64.min(remaining_7d_budget_km));
+                    .unwrap_or_else(|| fallback_dist.min(remaining_7d_budget_km));
                 let dist = round2(planned_dist.min(remaining_7d_budget_km));
                 let hr_cap = today_session
                     .map(|s| s.hr_cap_bpm)
@@ -269,9 +280,14 @@ impl ReadinessEngine {
                     .map(|v| v.round() as i32)
                     .unwrap_or_else(|| ((dist * pace_min_per_km).round() as i32).max(20));
                 let shoe = eligible_shoes.first().cloned().unwrap_or_else(|| "Daily Trainer".to_string());
+                let default_title = match goal_type {
+                    GoalType::CouchTo5k => "C25K Run-Walk Progression",
+                    GoalType::ReturnToRunning | GoalType::ReturnFromInjury => "Run-Walk Re-Entry",
+                    _ => "Aerobic Base Run",
+                };
                 let title = today_session
                     .map(|s| s.session_type.display_name().to_string())
-                    .unwrap_or_else(|| "Aerobic Base Run".to_string());
+                    .unwrap_or_else(|| default_title.to_string());
                 (
                     "🟢 GREEN - CLEARED TO TRAIN",
                     "RUN",
@@ -324,6 +340,16 @@ impl ReadinessEngine {
                 "Hybrid spacing: high-strain strength/erg sessions count toward the {}h structural spacing rule.",
                 min_spacing_hours as i32
             ));
+        } else if run_permitted && goal_type == GoalType::CouchTo5k {
+            checklist.push(
+                "C25K protocol: follow gradual run-walk intervals and keep 48h recovery spacing between sessions."
+                    .to_string(),
+            );
+        } else if run_permitted && matches!(goal_type, GoalType::ReturnToRunning | GoalType::ReturnFromInjury) {
+            checklist.push(
+                "Re-entry protocol: stop before sharp discomfort, use walk breaks as needed, and respect 48h spacing between runs."
+                    .to_string(),
+            );
         }
 
         let planned_session_snapshot = today_session.map(|s| PlannedSessionSnapshot {
@@ -470,6 +496,15 @@ fn resolve_weekly_volume_cap_km(plan: Option<&PlanFile>, config: &AthleteConfig)
         if p.envelope.max_weekly_km > 0.0 {
             return p.envelope.max_weekly_km;
         }
+    }
+    if config.objective.goal_type == GoalType::CouchTo5k {
+        return 15.0;
+    }
+    if matches!(
+        config.objective.goal_type,
+        GoalType::ReturnToRunning | GoalType::ReturnFromInjury
+    ) {
+        return 18.0;
     }
     if let Some(max_weekday_min) = config.availability.max_weekday_minutes {
         if max_weekday_min > 0 {

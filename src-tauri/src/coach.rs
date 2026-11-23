@@ -1474,6 +1474,7 @@ pub fn starter_coach_profile_markdown(config: &AthleteConfig, summary: &Training
 
 pub fn starter_training_plan_markdown(config: &AthleteConfig, summary: &TrainingHistorySummary) -> String {
     let today = Local::now().format("%Y-%m-%d").to_string();
+    let goal_type = config.objective.goal_type;
     let baseline = if summary.has_enough_history_for_audit {
         format!(
             "- **Recent baseline (trailing 365 days)**: {:.1} km/week and {:.1} runs/week",
@@ -1482,24 +1483,48 @@ pub fn starter_training_plan_markdown(config: &AthleteConfig, summary: &Training
     } else {
         "- **Recent baseline**: fewer than 14 days of synced history; start conservatively and re-baseline after two weeks.".to_string()
     };
-    let race_line = match config.objective.race_name.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-        Some(rn) => format!("- **Target Event**: {rn}"),
-        None => "- **Target Event**: Open / Base progression".to_string(),
+
+    let block_rhythm = if goal_type == GoalType::CouchTo5k {
+        "- **Block Rhythm**: 8-9 week Couch to 5K (C25K) run-walk progression targeting a continuous 5.0 km / 30 min run (3 sessions per week with 48h rest spacing)."
+    } else if goal_type.is_reentry_or_starter() {
+        "- **Block Rhythm**: Conservative aerobic re-entry wave using short run-walk intervals (48h rest spacing between runs; zero quality speedwork until durable)."
+    } else {
+        "- **Block Rhythm**: 3 build weeks followed by 1 deload week."
     };
-    let goal_time_line = match config
+
+    let trimmed_name = config.objective.race_name.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let valid_dist = config.objective.race_distance_km.filter(|&d| d > 0.0);
+    let trimmed_date = config.objective.race_date.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let trimmed_goal = config
         .objective
         .target_time_description
         .as_deref()
         .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        Some(t) => format!("\n- **Goal Time**: {t}"),
-        None => String::new(),
+        .filter(|s| !s.is_empty());
+
+    let targets_section = if trimmed_name.is_some() || valid_dist.is_some() || trimmed_date.is_some() {
+        let mut line = format!("- **Target Event**: {}", trimmed_name.unwrap_or(goal_type.display_name()));
+        if let Some(d) = valid_dist {
+            line.push_str(&format!(" ({d:.1} km)"));
+        }
+        if let Some(date) = trimmed_date {
+            line.push_str(&format!(" on {date}"));
+        }
+        if let Some(t) = trimmed_goal {
+            line.push_str(&format!("\n- **Goal Time**: {t}"));
+        } else {
+            line.push_str(" (finish goal — no target time set)");
+        }
+        line
+    } else if let Some(t) = trimmed_goal {
+        format!("- **Target Event**: Open / Base progression\n- **Goal Time**: {t}")
+    } else {
+        "- **Target Event**: Open / Base progression".to_string()
     };
 
     format!(
-        "# TRAINING PLAN\n\n## Current Phase & Baseline\n- **Objective**: {}\n{baseline}\n\n## Mesocycle & Block Structure\n- **Block Rhythm**: 3 build weeks followed by 1 deload week.\n\n## Race Calendar & Targets\n{race_line}{goal_time_line}\n\n## Change History\n- `{today}`: Seeded starter TRAINING_PLAN.md from synced history.\n",
-        config.objective.goal_type.display_name()
+        "# TRAINING PLAN\n\n## Current Phase & Baseline\n- **Objective**: {}\n{baseline}\n\n## Mesocycle & Block Structure\n{block_rhythm}\n\n## Race Calendar & Targets\n{targets_section}\n\n## Change History\n- `{today}`: Seeded starter TRAINING_PLAN.md from synced history.\n",
+        goal_type.display_name()
     )
 }
 
@@ -1507,11 +1532,104 @@ pub fn starter_plan_file(config: &AthleteConfig, summary: &TrainingHistorySummar
     let today = Local::now().date_naive();
     let from = today.format("%Y-%m-%d").to_string();
     let to = (today + Duration::days(6)).format("%Y-%m-%d").to_string();
-    let base_weekly = if summary.trailing.avg_weekly_km > 5.0 {
+    let goal_type = config.objective.goal_type;
+
+    let base_weekly = if goal_type == GoalType::CouchTo5k {
+        12.0
+    } else if goal_type.is_reentry_or_starter() {
+        if summary.trailing.avg_weekly_km > 4.0 {
+            (summary.trailing.avg_weekly_km * 0.6).clamp(8.0, 18.0).round()
+        } else {
+            12.0
+        }
+    } else if summary.trailing.avg_weekly_km > 5.0 {
         summary.trailing.avg_weekly_km.round()
     } else {
         15.0
     };
+
+    let max_single_km = if goal_type == GoalType::CouchTo5k {
+        5.0
+    } else {
+        let min_cap = if goal_type.is_reentry_or_starter() { 3.5 } else { 5.0 };
+        (base_weekly * 0.35).clamp(min_cap, 21.0)
+    };
+
+    let phase = if goal_type == GoalType::CouchTo5k {
+        "couch_to_5k"
+    } else if goal_type.is_reentry_or_starter() {
+        "aerobic_reentry"
+    } else {
+        "base"
+    };
+
+    let min_hours = config
+        .medical
+        .min_rest_hours_between_runs
+        .unwrap_or(if goal_type.is_reentry_or_starter() { 48 } else { 36 })
+        .max(12) as f64;
+    let hr_cap = config
+        .medical
+        .easy_hr_ceiling_bpm
+        .or(config.specs.vt1_ceiling_bpm)
+        .unwrap_or(145);
+
+    let avail_days: Vec<i32> = if config.availability.available_days.is_empty() {
+        vec![2, 4, 7]
+    } else {
+        config.availability.available_days.clone()
+    };
+    let long_day = config.availability.preferred_long_run_day.unwrap_or(7);
+    let min_day_gap = ((min_hours / 24.0).ceil() as i64).max(1);
+    let mut sessions = Vec::new();
+    let mut last_offset: Option<i64> = None;
+
+    for offset in 0..7i64 {
+        let day = today + Duration::days(offset);
+        let iso = day.weekday().number_from_monday() as i32;
+        if !avail_days.contains(&iso) {
+            continue;
+        }
+        if let Some(prev) = last_offset {
+            if offset - prev < min_day_gap {
+                continue;
+            }
+        }
+        let is_long = iso == long_day;
+        let typology = if goal_type.is_reentry_or_starter() {
+            RunTypology::RunWalkReentry
+        } else if is_long {
+            RunTypology::LongRun
+        } else {
+            RunTypology::EasyAerobic
+        };
+        let dist = if goal_type == GoalType::CouchTo5k {
+            ((base_weekly / 3.5).max(2.5).min(max_single_km) * 10.0).round() / 10.0
+        } else if is_long {
+            (max_single_km * 10.0).round() / 10.0
+        } else {
+            ((base_weekly / 3.5).max(3.0) * 10.0).round() / 10.0
+        };
+        let dur_min = ((dist * 7.5) * 10.0).round() / 10.0;
+        let date_str = day.format("%Y-%m-%d").to_string();
+        sessions.push(PlanSession {
+            id: format!("s-{date_str}"),
+            date: date_str,
+            session_type: typology,
+            target: PlanTargetRange {
+                duration_min: vec![(dur_min - 5.0).max(20.0), dur_min + 5.0],
+                distance_km: vec![(dist - 0.5).max(2.0), dist + 0.5],
+            },
+            hr_cap_bpm: hr_cap,
+            shoe_constraints: Vec::new(),
+            alternatives: vec!["30 min easy walk or mobility".to_string()],
+        });
+        last_offset = Some(offset);
+        if sessions.len() >= 3 {
+            break;
+        }
+    }
+
     PlanFile {
         version: 1,
         revision: 1,
@@ -1521,16 +1639,12 @@ pub fn starter_plan_file(config: &AthleteConfig, summary: &TrainingHistorySummar
         status: PlanStatus::Valid,
         envelope: PlanEnvelope {
             max_weekly_km: base_weekly,
-            max_single_run_km: (base_weekly * 0.35).clamp(5.0, 21.0),
-            mesocycle_phase: "base".to_string(),
-            min_hours_between_runs: config
-                .medical
-                .min_rest_hours_between_runs
-                .unwrap_or(24)
-                .max(12) as f64,
-            walk_hr_cap_bpm: config.specs.vt1_ceiling_bpm,
+            max_single_run_km: max_single_km,
+            mesocycle_phase: phase.to_string(),
+            min_hours_between_runs: min_hours,
+            walk_hr_cap_bpm: Some((hr_cap - 15).max(100)),
         },
-        sessions: Vec::new(),
+        sessions,
     }
 }
 

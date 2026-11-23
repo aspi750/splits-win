@@ -37,7 +37,56 @@ export type GoalType =
   | "base_building"
   | "general_fitness"
   | "return_from_injury"
+  | "return_to_running"
+  | "couch_to_5k"
   | "hybrid_hyrox";
+
+export type RaceDistancePreset =
+  | "none"
+  | "5k"
+  | "10k"
+  | "half_marathon"
+  | "marathon"
+  | "ultra_50k"
+  | "custom";
+
+export const RACE_DISTANCE_PRESETS: {
+  id: RaceDistancePreset;
+  label: string;
+  km: number | null;
+  defaultName: string | null;
+}[] = [
+  { id: "none", label: "No Specific Distance (Optional)", km: null, defaultName: null },
+  { id: "5k", label: "5K (5.0 km)", km: 5.0, defaultName: "5K" },
+  { id: "10k", label: "10K (10.0 km)", km: 10.0, defaultName: "10K" },
+  { id: "half_marathon", label: "Half Marathon (21.1 km)", km: 21.1, defaultName: "Half Marathon" },
+  { id: "marathon", label: "Marathon (42.2 km)", km: 42.2, defaultName: "Marathon" },
+  { id: "ultra_50k", label: "50K Ultra (50.0 km)", km: 50.0, defaultName: "50K Ultra" },
+  { id: "custom", label: "Custom Distance (km)", km: null, defaultName: null },
+];
+
+export function presetDistanceKm(preset: RaceDistancePreset): number | null {
+  return RACE_DISTANCE_PRESETS.find((p) => p.id === preset)?.km ?? null;
+}
+
+export function presetDefaultName(preset: RaceDistancePreset): string | null {
+  return RACE_DISTANCE_PRESETS.find((p) => p.id === preset)?.defaultName ?? null;
+}
+
+export function presetFromDistanceKm(
+  km: number | null | undefined,
+  allowNone = true
+): RaceDistancePreset {
+  if (!km || km <= 0) {
+    return allowNone ? "none" : "half_marathon";
+  }
+  if (Math.abs(km - 5.0) < 0.05) return "5k";
+  if (Math.abs(km - 10.0) < 0.05) return "10k";
+  if (Math.abs(km - 21.1) < 0.15) return "half_marathon";
+  if (Math.abs(km - 42.2) < 0.15) return "marathon";
+  if (Math.abs(km - 50.0) < 0.15) return "ultra_50k";
+  return "custom";
+}
 
 export interface HybridProfile {
   division: string | null;

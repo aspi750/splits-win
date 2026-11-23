@@ -38,13 +38,14 @@ pub struct SharedStore {
 }
 
 impl SharedStore {
-    pub fn default_coach_dir() -> PathBuf {
-        #[cfg(target_os = "windows")]
-        let base = dirs::data_local_dir().unwrap_or_else(|| PathBuf::from("."));
-        #[cfg(not(target_os = "windows"))]
-        let base = dirs::data_local_dir().unwrap_or_else(|| PathBuf::from("."));
+    pub fn default_base_dir() -> PathBuf {
+        dirs::data_local_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("SplitsCoach")
+    }
 
-        base.join("SplitsCoach").join("coach")
+    pub fn default_coach_dir() -> PathBuf {
+        Self::default_base_dir().join("coach")
     }
 
     pub fn new(override_root: Option<PathBuf>) -> Result<Self, StorageError> {
@@ -162,6 +163,7 @@ impl SharedStore {
             "outcomes.json",
             "coach_usage.log",
             "ASPI_Training_Log.txt",
+            "training_ledger.jsonl",
             "state/first_use_flow.json",
         ] {
             let p = self.root_dir.join(rel);
@@ -169,7 +171,46 @@ impl SharedStore {
                 let _ = fs::remove_file(&p);
             }
         }
-        for sub in ["attachments", "history"] {
+        if let Ok(entries) = fs::read_dir(&self.root_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_file() {
+                    let remove = path
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .map_or(false, |ext| {
+                            matches!(
+                                ext.to_ascii_lowercase().as_str(),
+                                "fit" | "zip" | "md" | "json" | "txt" | "log"
+                            )
+                        });
+                    if remove {
+                        let _ = fs::remove_file(&path);
+                    }
+                }
+            }
+        }
+        let state_dir = self.root_dir.join("state");
+        if let Ok(entries) = fs::read_dir(&state_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_file() {
+                    let remove = path
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .map_or(false, |ext| {
+                            matches!(
+                                ext.to_ascii_lowercase().as_str(),
+                                "fit" | "md" | "json" | "txt" | "log"
+                            )
+                        });
+                    if remove {
+                        let _ = fs::remove_file(&path);
+                    }
+                }
+            }
+        }
+        for sub in ["attachments", "history", ".backups", "Activities", "CoachCache"] {
             let dir = self.root_dir.join(sub);
             if dir.exists() {
                 let _ = fs::remove_dir_all(&dir);
@@ -435,6 +476,16 @@ impl Database {
              DELETE FROM weight_entries;
              DELETE FROM settings;",
         )?;
+        let optional_tables: Vec<String> = {
+            let mut stmt = conn.prepare(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('briefings', 'chat_messages')",
+            )?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            rows.filter_map(Result::ok).collect()
+        };
+        for table in optional_tables {
+            conn.execute(&format!("DELETE FROM {table}"), [])?;
+        }
         conn.execute(
             "INSERT INTO user_profile (id, athlete_type, onboarding_completed, runner_config_json, hyrox_config_json)
              VALUES (1, 'runner', 0, '{}', '{}')
