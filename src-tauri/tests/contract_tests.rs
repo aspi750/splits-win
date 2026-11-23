@@ -1401,3 +1401,43 @@ fn primary_discipline_switch_preserves_runner_and_hyrox_configs() {
     assert_eq!(reloaded.hyrox_config.division.as_deref(), Some("Men Pro"));
     assert_eq!(reloaded.hyrox_config.fresh_1km_pace_sec, Some(245));
 }
+
+#[test]
+fn v0_2_3_1_discipline_backcompat_goal_sync_and_force_hyrox_empty_laps() {
+    // 1. Legacy AthleteConfig JSON without `discipline` infers Hybrid when goalType == "hybrid_hyrox"
+    let legacy_json = r#"{
+      "specs": { "displayName": "Sam", "weightKg": 70.0, "maxHR": 190, "restingHRBaseline": 48, "vt1CeilingBPM": 145, "timezoneIdentifier": "UTC" },
+      "medical": { "conditionsAndNotes": "", "enforceEasyHRCeiling": false, "easyHRCeilingBPM": null, "enforcePaceFloor": false, "minPaceSecPerKm": null, "minRestHoursBetweenRuns": null },
+      "objective": { "goalType": "hybrid_hyrox", "raceName": "HYROX", "raceDistanceKm": null, "raceDate": null, "targetTimeDescription": null, "hybridProfile": null },
+      "availability": { "availableDays": [1,2,3,4,5,6,7], "preferredLongRunDay": 7, "maxWeekdayMinutes": null, "crossTrainingNotes": "" },
+      "updatedAt": "2026-11-23T00:00:00Z"
+    }"#;
+    let decoded: AthleteConfig = serde_json::from_str(legacy_json).unwrap();
+    assert_eq!(decoded.resolved_discipline(), TrainingDiscipline::Hybrid);
+
+    // 2. set_discipline syncs goal_type and prompt_summary
+    let mut cfg = AthleteConfig::default();
+    assert_eq!(cfg.resolved_discipline(), TrainingDiscipline::Running);
+    cfg.set_discipline(TrainingDiscipline::Hyrox);
+    assert_eq!(cfg.discipline, Some(TrainingDiscipline::Hyrox));
+    assert_eq!(cfg.objective.goal_type, GoalType::HybridHyrox);
+    assert!(cfg.prompt_summary(None).contains("- Training discipline: HYROX"));
+
+    cfg.set_discipline(TrainingDiscipline::Hybrid);
+    assert_eq!(cfg.objective.goal_type, GoalType::HybridHyrox);
+    assert!(cfg.prompt_summary(None).contains("- Training discipline: Hybrid (Mixed)"));
+
+    cfg.set_discipline(TrainingDiscipline::Running);
+    assert_eq!(cfg.discipline, Some(TrainingDiscipline::Running));
+    assert_eq!(cfg.objective.goal_type, GoalType::Race);
+
+    // 3. AthleteType <-> TrainingDiscipline lossless mapping
+    for d in [TrainingDiscipline::Running, TrainingDiscipline::Hyrox, TrainingDiscipline::Hybrid] {
+        assert_eq!(AthleteType::from_training_discipline(d).to_training_discipline(), d);
+    }
+
+    // 4. force_hyrox = true on empty laps returns 8x8/matrix dissection rather than None
+    assert!(dissect_hyrox_laps(&[], false).is_none());
+    let forced = dissect_hyrox_laps(&[], true).expect("forced hyrox on empty laps should return dissection");
+    assert!(forced.is_hyrox_sim);
+}

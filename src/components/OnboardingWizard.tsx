@@ -291,6 +291,12 @@ export function OnboardingWizard({
                 }
               : null,
         },
+        discipline:
+          athleteType === "hyrox"
+            ? "hyrox"
+            : athleteType === "hybrid_both"
+            ? "hybrid"
+            : "running",
         updatedAt: new Date().toISOString(),
       };
       await invoke("save_athlete_config", { config: nextConfig });
@@ -373,9 +379,9 @@ export function OnboardingWizard({
             <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 10, marginBottom: 14 }}>
               {(
                 [
-                  { id: "runner", title: "Endurance Runner", desc: "Road, trail & marathon aerobic/VT1 progression." },
-                  { id: "hyrox", title: "HYROX Athlete", desc: "8×1km compromised running + official station loads." },
-                  { id: "hybrid_both", title: "Hybrid Athlete (Both)", desc: "Concurrent running & HYROX/strength blocks." },
+                  { id: "runner", title: "Running", desc: "Road, trail & marathon aerobic/VT1 progression." },
+                  { id: "hyrox", title: "HYROX", desc: "8×1km compromised running + official station loads." },
+                  { id: "hybrid_both", title: "Hybrid (Mixed)", desc: "Concurrent running & HYROX/strength blocks." },
                 ] as const
               ).map((opt) => (
                 <button

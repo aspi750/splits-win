@@ -45,6 +45,8 @@ export interface HybridProfile {
   weeklyHybridSessionsTarget: number | null;
 }
 
+export type TrainingDiscipline = "running" | "hyrox" | "hybrid";
+
 export interface AthleteConfig {
   specs: {
     displayName: string;
@@ -77,6 +79,7 @@ export interface AthleteConfig {
     maxWeekdayMinutes: number | null;
     crossTrainingNotes: string;
   };
+  discipline?: TrainingDiscipline;
   updatedAt: string;
 }
 

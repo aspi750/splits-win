@@ -1,6 +1,6 @@
 [package]
 name = "splits-win"
-version = "0.2.3"
+version = "0.2.3+1"
 description = "Splits Coach — Garmin Personal API & Deterministic Readiness Analyst"
 authors = ["A750LABS"]
 edition = "2021"

@@ -290,6 +290,25 @@ impl Default for AthleteAvailability {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TrainingDiscipline {
+    #[default]
+    Running,
+    Hyrox,
+    Hybrid,
+}
+
+impl TrainingDiscipline {
+    pub fn display_name(&self) -> &'static str {
+        match self {
+            TrainingDiscipline::Running => "Running",
+            TrainingDiscipline::Hyrox => "HYROX",
+            TrainingDiscipline::Hybrid => "Hybrid (Mixed)",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AthleteConfig {
@@ -297,6 +316,8 @@ pub struct AthleteConfig {
     pub medical: AthleteMedical,
     pub objective: AthleteObjective,
     pub availability: AthleteAvailability,
+    #[serde(default)]
+    pub discipline: Option<TrainingDiscipline>,
     pub updated_at: String,
 }
 
@@ -307,12 +328,37 @@ impl Default for AthleteConfig {
             medical: AthleteMedical::default(),
             objective: AthleteObjective::default(),
             availability: AthleteAvailability::default(),
+            discipline: Some(TrainingDiscipline::Running),
             updated_at: Utc::now().to_rfc3339(),
         }
     }
 }
 
 impl AthleteConfig {
+    pub fn resolved_discipline(&self) -> TrainingDiscipline {
+        if let Some(d) = self.discipline {
+            return d;
+        }
+        if self.objective.goal_type == GoalType::HybridHyrox || self.objective.hybrid_profile.is_some() {
+            TrainingDiscipline::Hybrid
+        } else {
+            TrainingDiscipline::Running
+        }
+    }
+
+    pub fn set_discipline(&mut self, next: TrainingDiscipline) {
+        self.discipline = Some(next);
+        match next {
+            TrainingDiscipline::Running => {
+                if self.objective.goal_type == GoalType::HybridHyrox {
+                    self.objective.goal_type = GoalType::Race;
+                }
+            }
+            TrainingDiscipline::Hyrox | TrainingDiscipline::Hybrid => {
+                self.objective.goal_type = GoalType::HybridHyrox;
+            }
+        }
+    }
     /// Computes the median of valid resting HR entries across the trailing 30 days,
     /// requiring at least 5 valid days (`CONTRACT.md §2.1`).
     pub fn calibrated_resting_hr(samples: &[(DateTime<Utc>, Option<i32>)], reference_date: DateTime<Utc>) -> Option<i32> {
@@ -371,6 +417,7 @@ impl AthleteConfig {
         if !name.is_empty() {
             lines.push(format!("- Athlete: {name}"));
         }
+        lines.push(format!("- Training discipline: {}", self.resolved_discipline().display_name()));
         if let Some(w) = self.specs.weight_kg.filter(|&w| w > 0.0) {
             lines.push(format!("- Weight: {w:.1} kg"));
         }
@@ -1400,6 +1447,22 @@ impl AthleteType {
             "hyrox" => AthleteType::Hyrox,
             "hybrid_both" => AthleteType::HybridBoth,
             _ => AthleteType::Runner,
+        }
+    }
+
+    pub fn to_training_discipline(&self) -> TrainingDiscipline {
+        match self {
+            AthleteType::Runner => TrainingDiscipline::Running,
+            AthleteType::Hyrox => TrainingDiscipline::Hyrox,
+            AthleteType::HybridBoth => TrainingDiscipline::Hybrid,
+        }
+    }
+
+    pub fn from_training_discipline(d: TrainingDiscipline) -> Self {
+        match d {
+            TrainingDiscipline::Running => AthleteType::Runner,
+            TrainingDiscipline::Hyrox => AthleteType::Hyrox,
+            TrainingDiscipline::Hybrid => AthleteType::HybridBoth,
         }
     }
 }

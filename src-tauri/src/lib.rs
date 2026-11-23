@@ -78,10 +78,17 @@ fn get_bootstrap_state(state: State<'_, AppState>) -> Result<serde_json::Value, 
 
 #[tauri::command]
 fn save_garmin_key(key: String) -> Result<(), String> {
-    CredentialStore::save_secret(GARMIN_KEYRING_SERVICE, GARMIN_ACCOUNT, &key)
-        .map_err(|e| e.to_string())?;
-    let _ = CredentialStore::save_secret(APP_SERVICE, GARMIN_ACCOUNT, &key);
-    Ok(())
+    let trimmed = key.trim();
+    if trimmed.is_empty() {
+        CredentialStore::delete_secret(GARMIN_KEYRING_SERVICE, GARMIN_ACCOUNT).map_err(|e| e.to_string())?;
+        let _ = CredentialStore::delete_secret(APP_SERVICE, GARMIN_ACCOUNT);
+        Ok(())
+    } else {
+        CredentialStore::save_secret(GARMIN_KEYRING_SERVICE, GARMIN_ACCOUNT, trimmed)
+            .map_err(|e| e.to_string())?;
+        let _ = CredentialStore::save_secret(APP_SERVICE, GARMIN_ACCOUNT, trimmed);
+        Ok(())
+    }
 }
 
 #[tauri::command]

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { getVersion } from "@tauri-apps/api/app";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
@@ -41,6 +41,7 @@ import type {
   ModelSettings,
   PostRunContext,
   ThinkingLevel,
+  TrainingDiscipline,
   UserProfile,
 } from "./types";
 
@@ -52,6 +53,8 @@ interface ChatMessage {
   proposals?: CoachUpdateProposal[];
   hiddenInUI?: boolean;
   stageLabel?: string;
+  anchorId?: string;
+  isStage3Audit?: boolean;
 }
 
 const GEMINI_MODEL_OPTIONS = [
@@ -248,13 +251,17 @@ export default function App() {
   const [fresh1kmInput, setFresh1kmInput] = useState("");
   const [compromised1kmInput, setCompromised1kmInput] = useState("");
   const [hyroxTargetTimeInput, setHyroxTargetTimeInput] = useState("");
+  const chatInputRef = useRef<HTMLInputElement | null>(null);
+  const [showSettingsGarminKey, setShowSettingsGarminKey] = useState(false);
+  const [garminVerifyBusy, setGarminVerifyBusy] = useState(false);
+  const [garminVerifyStatus, setGarminVerifyStatus] = useState<{ ok: boolean; text: string } | null>(null);
   const [showSettingsGeminiKey, setShowSettingsGeminiKey] = useState(false);
   const [geminiVerifyBusy, setGeminiVerifyBusy] = useState(false);
   const [geminiVerifyStatus, setGeminiVerifyStatus] = useState<{ ok: boolean; text: string } | null>(null);
   const [confirmCleanSlate, setConfirmCleanSlate] = useState(false);
   const [cleanSlateBusy, setCleanSlateBusy] = useState(false);
 
-  const [appVersion, setAppVersion] = useState<string>("0.2.3-beta");
+  const [appVersion, setAppVersion] = useState<string>("0.2.3.1-beta");
   const [availableUpdate, setAvailableUpdate] = useState<Update | null>(null);
   const [updateStatus, setUpdateStatus] = useState<string | null>(null);
   const [updateChecking, setUpdateChecking] = useState(false);
@@ -770,18 +777,41 @@ export default function App() {
         : "Analyzing local training history and calibrating baselines…"
     );
     try {
-      await invoke("complete_history_sync_stage", { runGarminSync });
+      const res = await invoke<{ summary_markdown?: string; synced_activities?: number }>(
+        "complete_history_sync_stage",
+        { runGarminSync }
+      );
       setSyncProgressMsg(null);
       await reload();
+      const summaryMd = (res?.summary_markdown ?? "").trim();
+      const countText =
+        typeof res?.synced_activities === "number"
+          ? `Your Garmin history sync is complete (${res.synced_activities} activities indexed).`
+          : "Your Garmin history & baseline calibration is complete.";
+      const auditText = summaryMd
+        ? `${countText}\n\n${summaryMd}\n\nWould you like to continue with your historical block rhythm above, or adjust your weekly structure, rest spacing, or mesocycle wave before I draft your consolidated training plan?`
+        : `${countText}\n\nReady to confirm your preferred block structure and draft your consolidated training plan.`;
       setMessages((prev) => [
         ...prev,
         {
           role: "user",
           text: "",
           hiddenInUI: true,
-          stageLabel: "Stage 3 · History Sync & Baseline Calibration Complete",
+          stageLabel: "Stage 3 · History & Block Audit",
+          anchorId: "stage-3-block-audit-divider",
+        },
+        {
+          role: "assistant",
+          text: auditText,
+          anchorId: "stage-3-block-audit-response",
+          isStage3Audit: true,
         },
       ]);
+      requestAnimationFrame(() => {
+        document
+          .getElementById("stage-3-block-audit-divider")
+          ?.scrollIntoView({ behavior: "smooth", block: "start" });
+      });
     } catch (err) {
       setSyncProgressMsg(null);
       setCoachError(err instanceof Error ? err.message : String(err));
@@ -807,6 +837,10 @@ export default function App() {
   async function handleProposalDecision(msgIdx: number, propId: string, approve: boolean) {
     const targetProp = messages[msgIdx]?.proposals?.find((p) => p.id === propId);
     if (!targetProp) return;
+    const wasProfileApproval =
+      approve &&
+      targetProp.target_file === "COACH_PROFILE.md" &&
+      firstUseStage === "profile_approval";
     const wasPlanApproval =
       approve &&
       targetProp.target_file === "TRAINING_PLAN.md" &&
@@ -838,6 +872,13 @@ export default function App() {
       }
       return updated;
     });
+    if (wasProfileApproval) {
+      requestAnimationFrame(() => {
+        document
+          .getElementById("stage-3-history-sync-card")
+          ?.scrollIntoView({ behavior: "smooth", block: "start" });
+      });
+    }
     if (wasPlanApproval) {
       setJustCompletedGuidedSetup(true);
       setTimeout(() => setJustCompletedGuidedSetup(false), 2000);
@@ -1394,6 +1435,7 @@ export default function App() {
 
                 {firstUseStage === "history_sync" && (
                   <div
+                    id="stage-3-history-sync-card"
                     style={{
                       padding: 14,
                       borderRadius: 10,
@@ -1452,7 +1494,17 @@ export default function App() {
                           void handleRequestConsolidatedPlan("3 weeks build + 1 week deload, polarized Z2 + 1 quality session")
                         }
                       >
-                        Generate Consolidated Training Plan
+                        Keep This Block Structure
+                      </button>
+                      <button
+                        className="secondary"
+                        disabled={busy}
+                        onClick={() => {
+                          setChatInput("Before drafting my training plan, I'd like to adjust my block structure: ");
+                          chatInputRef.current?.focus();
+                        }}
+                      >
+                        Adjust Structure
                       </button>
                       <button
                         className="secondary"
@@ -1579,12 +1631,45 @@ export default function App() {
                   )}
                   {messages.map((m, i) =>
                     m.hiddenInUI ? (
-                      <div key={i} className="stage-divider-pill">
+                      <div key={i} id={m.anchorId} className="stage-divider-pill">
                         {m.stageLabel ?? "Guided Setup Step"}
                       </div>
                     ) : (
-                      <div key={i} className={`bubble ${m.role}`}>
-                        <div>{m.text || (busy && m.role === "assistant" ? "Thinking…" : "")}</div>
+                      <div key={i} id={m.anchorId} className={`bubble ${m.role}`}>
+                        {m.isStage3Audit && m.text ? (
+                          <MarkdownPreview markdown={m.text} />
+                        ) : (
+                          <div>{m.text || (busy && m.role === "assistant" ? "Thinking…" : "")}</div>
+                        )}
+                        {m.isStage3Audit && firstUseStage !== "active" && (
+                          <div style={{ display: "flex", gap: 8, marginTop: 12, flexWrap: "wrap" }}>
+                            <button
+                              type="button"
+                              className="primary"
+                              disabled={busy || state.engine_mode !== "gemini_api"}
+                              onClick={() =>
+                                void handleRequestConsolidatedPlan(
+                                  "Keep historical block rhythm and progressive build/deload wave"
+                                )
+                              }
+                            >
+                              Keep This Block Structure
+                            </button>
+                            <button
+                              type="button"
+                              className="secondary"
+                              disabled={busy}
+                              onClick={() => {
+                                setChatInput(
+                                  "Before drafting my training plan, I'd like to adjust my block structure: "
+                                );
+                                chatInputRef.current?.focus();
+                              }}
+                            >
+                              Adjust Structure
+                            </button>
+                          </div>
+                        )}
                         {m.proposals?.map((p) => {
                           const approveLabel =
                             p.target_file === "COACH_PROFILE.md" && firstUseStage === "profile_approval"
@@ -1643,6 +1728,7 @@ export default function App() {
 
             <div style={{ display: "flex", gap: 10, marginTop: 14 }}>
               <input
+                ref={chatInputRef}
                 placeholder="Ask your coach…"
                 value={chatInput}
                 onChange={(e) => setChatInput(e.target.value)}
@@ -1701,6 +1787,81 @@ export default function App() {
                   </button>
                 )}
               </div>
+            </div>
+
+            <div className="card">
+              <h3>Garmin Connect API Key</h3>
+              <p className="muted" style={{ marginTop: 0, marginBottom: 10 }}>
+                Status:{" "}
+                <strong>{state.has_garmin_key ? "Saved in Windows Credential Manager" : "Not set"}</strong>
+              </p>
+              <div className="key-input-group">
+                <input
+                  type={showSettingsGarminKey ? "text" : "password"}
+                  placeholder={state.has_garmin_key ? "Saved (paste new key to replace)" : "Garmin Personal API Key"}
+                  value={garminKeyInput}
+                  onChange={(e) => {
+                    setGarminKeyInput(e.target.value);
+                    setGarminVerifyStatus(null);
+                  }}
+                />
+                <button
+                  type="button"
+                  className="secondary"
+                  aria-label={showSettingsGarminKey ? "Hide Garmin API key" : "Show Garmin API key"}
+                  onClick={() => setShowSettingsGarminKey((v) => !v)}
+                >
+                  {showSettingsGarminKey ? <EyeOff size={15} /> : <Eye size={15} />}
+                </button>
+                <button
+                  type="button"
+                  className="primary"
+                  disabled={garminVerifyBusy || !garminKeyInput.trim()}
+                  onClick={async () => {
+                    setGarminVerifyBusy(true);
+                    setGarminVerifyStatus(null);
+                    try {
+                      await invoke("verify_garmin_key", { key: garminKeyInput.trim() });
+                      setGarminKeyInput("");
+                      setGarminVerifyStatus({
+                        ok: true,
+                        text: "Connected (HTTP 200) — saved in Windows Credential Manager.",
+                      });
+                      await reload();
+                    } catch (err) {
+                      setGarminVerifyStatus({
+                        ok: false,
+                        text: err instanceof Error ? err.message : String(err),
+                      });
+                    } finally {
+                      setGarminVerifyBusy(false);
+                    }
+                  }}
+                >
+                  {garminVerifyBusy ? "Validating…" : "Verify & Save"}
+                </button>
+                <button
+                  type="button"
+                  className="secondary"
+                  disabled={garminVerifyBusy || (!state.has_garmin_key && !garminKeyInput)}
+                  onClick={async () => {
+                    await invoke("save_garmin_key", { key: "" });
+                    setGarminKeyInput("");
+                    setGarminVerifyStatus({ ok: true, text: "Garmin Personal API key cleared." });
+                    await reload();
+                  }}
+                >
+                  Clear
+                </button>
+              </div>
+              {garminVerifyStatus && (
+                <div
+                  className={garminVerifyStatus.ok ? "key-status-ok" : "key-status-err"}
+                  style={{ marginTop: 8 }}
+                >
+                  {garminVerifyStatus.text}
+                </div>
+              )}
             </div>
 
             <div className="card">
@@ -1920,21 +2081,49 @@ export default function App() {
 
                   <div style={{ marginBottom: 14 }}>
                     <label className="muted" style={{ display: "block", marginBottom: 6 }}>
-                      Primary Discipline
+                      Training Discipline
                     </label>
                     <div style={{ display: "inline-flex", gap: 6, flexWrap: "wrap" }}>
                       {(
                         [
-                          { id: "runner", label: "Runner" },
+                          { id: "runner", label: "Running" },
                           { id: "hyrox", label: "HYROX" },
-                          { id: "hybrid_both", label: "Hybrid (Both)" },
+                          { id: "hybrid_both", label: "Hybrid (Mixed)" },
                         ] as { id: AthleteType; label: string }[]
                       ).map((opt) => (
                         <button
                           key={opt.id}
                           type="button"
                           className={activeProfile.athlete_type === opt.id ? "primary" : "secondary"}
-                          onClick={() => setDraftProfile({ ...activeProfile, athlete_type: opt.id })}
+                          onClick={async () => {
+                            const nextDiscipline: TrainingDiscipline =
+                              opt.id === "hyrox"
+                                ? "hyrox"
+                                : opt.id === "hybrid_both"
+                                ? "hybrid"
+                                : "running";
+                            const nextGoal: GoalType =
+                              opt.id === "runner"
+                                ? draftConfig.objective.goalType === "hybrid_hyrox"
+                                  ? "race"
+                                  : draftConfig.objective.goalType
+                                : "hybrid_hyrox";
+                            const nextConfig: AthleteConfig = {
+                              ...draftConfig,
+                              discipline: nextDiscipline,
+                              objective: { ...draftConfig.objective, goalType: nextGoal },
+                            };
+                            const nextProfile: UserProfile = {
+                              ...activeProfile,
+                              athlete_type: opt.id,
+                            };
+                            setDraftProfile(nextProfile);
+                            setDraftConfig(nextConfig);
+                            await invoke("save_athlete_config", { config: nextConfig });
+                            await invoke("save_user_profile", { profile: nextProfile });
+                            setStatusMsg(`Training discipline updated to ${opt.label}.`);
+                            await reload();
+                          }}
                         >
                           {opt.label}
                         </button>
@@ -2393,8 +2582,15 @@ export default function App() {
                       const syncedRhr =
                         activeProfile.runner_config.resting_hr_bpm ?? draftConfig.specs.restingHRBaseline ?? null;
 
+                      const nextDiscipline: TrainingDiscipline =
+                        activeProfile.athlete_type === "hyrox"
+                          ? "hyrox"
+                          : activeProfile.athlete_type === "hybrid_both"
+                          ? "hybrid"
+                          : "running";
                       const updatedConfig: AthleteConfig = {
                         ...draftConfig,
+                        discipline: nextDiscipline,
                         specs: {
                           ...draftConfig.specs,
                           weightBaselineConfirmed: Boolean(
@@ -2931,7 +3127,7 @@ function ActivityDetailView({
               <Download size={14} /> Export 1Hz CSV
             </button>
             <button
-              className="secondary"
+              className={isHyroxActive ? "primary" : "secondary"}
               onClick={() => void onToggleHyrox(!isHyroxActive)}
             >
               {isHyroxActive ? "HYROX / Hybrid Sim ✓" : "Mark as HYROX / Hybrid Sim"}

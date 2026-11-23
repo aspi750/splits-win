@@ -1149,6 +1149,18 @@ pub fn probe_fit_folder(folder_path: &std::path::Path) -> Result<FitBaselineProb
 /// HYROX compromised-run decay (`compromised_pace_decay_sec`) and recovery duration.
 pub fn dissect_hyrox_laps(laps: &[FitLap], force_hyrox: bool) -> Option<HyroxDissection> {
     if laps.is_empty() {
+        if force_hyrox {
+            return Some(HyroxDissection {
+                is_hyrox_sim: true,
+                run_splits: Vec::new(),
+                station_splits: Vec::new(),
+                roxzone_transitions: Vec::new(),
+                clean_run_pace_sec_per_km: None,
+                clean_aerobic_efficiency: None,
+                compromised_pace_decay_sec: None,
+                station_hr_recovery_sec: None,
+            });
+        }
         return None;
     }
 
