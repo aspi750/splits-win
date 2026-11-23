@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
+import { Eye, EyeOff } from "lucide-react";
 import type {
   AthleteConfig,
   AthleteType,
@@ -85,9 +86,14 @@ export function OnboardingWizard({
 
   // Step 2: Garmin BYOK, Auto-Calibrate & Optional Intake Files (.pdf / .fit)
   const [garminKey, setGarminKey] = useState("");
+  const [showGarminKey, setShowGarminKey] = useState(false);
   const [garminVerified, setGarminVerified] = useState(hasGarminKey);
+  const [garminSkipped, setGarminSkipped] = useState(false);
+  const [garminCheckState, setGarminCheckState] = useState<"idle" | "checking" | "verified" | "error">(
+    hasGarminKey ? "verified" : "idle"
+  );
   const [garminStatus, setGarminStatus] = useState<string | null>(
-    hasGarminKey ? "Garmin Personal API Key already stored in Credential Manager." : null
+    hasGarminKey ? "Garmin Personal API Key already stored in Windows Credential Manager." : null
   );
   const [autoCalibrate, setAutoCalibrate] = useState(
     initialFirstUseState?.auto_calibrate_after_first_sync ?? true
@@ -123,6 +129,15 @@ export function OnboardingWizard({
 
   // Step 4: Gemini BYOK & Global Model / Thinking Defaults
   const [geminiKey, setGeminiKey] = useState("");
+  const [showGeminiKey, setShowGeminiKey] = useState(false);
+  const [geminiVerified, setGeminiVerified] = useState(hasGeminiKey);
+  const [geminiSkipped, setGeminiSkipped] = useState(false);
+  const [geminiCheckState, setGeminiCheckState] = useState<"idle" | "checking" | "verified" | "error">(
+    hasGeminiKey ? "verified" : "idle"
+  );
+  const [geminiStatus, setGeminiStatus] = useState<string | null>(
+    hasGeminiKey ? "Gemini API key already stored in Windows Credential Manager." : null
+  );
   const [geminiModel, setGeminiModel] = useState(
     initialModelSettings?.global_model_id ?? "gemini-4-hydrogen"
   );
@@ -142,29 +157,50 @@ export function OnboardingWizard({
     if (!garminKey.trim()) return;
     setBusy(true);
     setErrorMsg(null);
+    setGarminCheckState("checking");
+    setGarminStatus("Validating Garmin Personal API key…");
     try {
       await invoke("verify_garmin_key", { key: garminKey.trim() });
       setGarminVerified(true);
-      setGarminStatus("Verified & cached 24h bearer token in Windows Credential Manager.");
+      setGarminSkipped(false);
+      setGarminCheckState("verified");
+      setGarminStatus("Connected (HTTP 200) — saved & verified in Windows Credential Manager.");
       setGarminKey("");
     } catch (err) {
-      setErrorMsg(err instanceof Error ? err.message : String(err));
+      const msg = err instanceof Error ? err.message : String(err);
+      setGarminVerified(false);
+      setGarminCheckState("error");
+      setGarminStatus(msg);
     } finally {
       setBusy(false);
     }
   }
 
-  async function handleSaveGarminOnly() {
-    if (!garminKey.trim()) return;
+  async function handleVerifyGemini() {
+    if (!geminiKey.trim()) return;
     setBusy(true);
     setErrorMsg(null);
+    setGeminiCheckState("checking");
+    setGeminiStatus("Validating Gemini API key…");
     try {
-      await invoke("save_garmin_key", { key: garminKey.trim() });
-      setGarminVerified(true);
-      setGarminStatus("Saved to Windows Credential Manager.");
-      setGarminKey("");
+      const res = await invoke<{ ok: boolean; http_status: number; message?: string }>("verify_gemini_key", {
+        key: geminiKey.trim(),
+        persist: true,
+      });
+      setGeminiVerified(true);
+      setGeminiSkipped(false);
+      setGeminiCheckState("verified");
+      setGeminiStatus(
+        res.message
+          ? `Connected (HTTP ${res.http_status}) — ${res.message}`
+          : "Connected (HTTP 200) — saved & verified in Windows Credential Manager."
+      );
+      setGeminiKey("");
     } catch (err) {
-      setErrorMsg(err instanceof Error ? err.message : String(err));
+      const msg = err instanceof Error ? err.message : String(err);
+      setGeminiVerified(false);
+      setGeminiCheckState("error");
+      setGeminiStatus(msg);
     } finally {
       setBusy(false);
     }
@@ -210,12 +246,12 @@ export function OnboardingWizard({
     }
   }
 
-  async function handleFinish() {
+  async function handleFinish(skipGemini = false) {
     setBusy(true);
     setErrorMsg(null);
     try {
-      if (geminiKey.trim()) {
-        await invoke("save_gemini_key", { key: geminiKey.trim() });
+      if (!skipGemini && geminiKey.trim() && !geminiVerified) {
+        await invoke("verify_gemini_key", { key: geminiKey.trim(), persist: true });
       }
       await invoke("save_global_model_settings", {
         modelId: geminiModel,
@@ -223,13 +259,16 @@ export function OnboardingWizard({
       });
       await invoke("set_auto_calibrate_after_sync", { enabled: autoCalibrate });
 
+      const parsedWeightKg = weightKg.trim() ? Number(weightKg) : null;
+      const validWeightKg = parsedWeightKg && Number.isFinite(parsedWeightKg) && parsedWeightKg > 0 ? parsedWeightKg : null;
       const cleanGoalTime = goalTime.trim();
       const nextConfig: AthleteConfig = {
         ...initialConfig,
         specs: {
           ...initialConfig.specs,
           displayName: displayName.trim(),
-          weightKg: weightKg ? Number(weightKg) : null,
+          weightKg: validWeightKg,
+          weightBaselineConfirmed: Boolean(validWeightKg),
           maxHR: maxHR ? Number(maxHR) : null,
           restingHRBaseline: rhrBaseline ? Number(rhrBaseline) : null,
         },
@@ -260,12 +299,15 @@ export function OnboardingWizard({
         athlete_type: athleteType,
         onboarding_completed: true,
         runner_config: {
+          ...initialProfile.runner_config,
           primary_distance: primaryDistance || null,
           hr_first_governor: initialProfile.runner_config.hr_first_governor ?? true,
           pace_floor_sec_per_km: initialProfile.runner_config.pace_floor_sec_per_km ?? null,
           z2_range_bpm: initialProfile.runner_config.z2_range_bpm,
           z3_range_bpm: initialProfile.runner_config.z3_range_bpm,
           lthr_bpm: lthrBpm ? Number(lthrBpm) : null,
+          max_hr_bpm: maxHR ? Number(maxHR) : initialProfile.runner_config.max_hr_bpm ?? null,
+          resting_hr_bpm: rhrBaseline ? Number(rhrBaseline) : initialProfile.runner_config.resting_hr_bpm ?? null,
         },
         hyrox_config: {
           division: athleteType === "runner" ? null : division,
@@ -375,27 +417,65 @@ export function OnboardingWizard({
 
         {step === 2 && (
           <div>
-            <h3>Step 2 — Telemetry & Calibration (BYOK)</h3>
+            <h3>Step 2 — Telemetry &amp; Calibration (BYOK)</h3>
             <p className="muted" style={{ fontSize: 13 }}>
               In Garmin Connect Web (<strong>Settings → Personal API Key</strong>), generate a 30/90/180/365-day key.
-              Garmin displays the key only once upon creation — paste it below to store securely in Windows Credential Manager.
+              Garmin displays the key only once upon creation — paste it below to validate and store securely in Windows Credential Manager.
             </p>
-            <div style={{ display: "flex", gap: 8, marginBottom: 10 }}>
+            <div className="key-input-group" style={{ marginBottom: 8 }}>
               <input
-                type="password"
-                placeholder="Garmin Personal API Key"
+                type={showGarminKey ? "text" : "password"}
+                placeholder={garminVerified ? "Garmin key verified (paste new key to replace)" : "Garmin Personal API Key"}
                 value={garminKey}
-                onChange={(e) => setGarminKey(e.target.value)}
+                onChange={(e) => {
+                  setGarminKey(e.target.value);
+                  setGarminVerified(false);
+                  setGarminSkipped(false);
+                  setGarminCheckState("idle");
+                  setGarminStatus(null);
+                }}
               />
-              <button className="primary" disabled={busy || !garminKey.trim()} onClick={() => void handleVerifyGarmin()}>
-                Verify & Save Key
+              <button
+                type="button"
+                className="secondary"
+                aria-label={showGarminKey ? "Hide Garmin API key" : "Show Garmin API key"}
+                onClick={() => setShowGarminKey((v) => !v)}
+              >
+                {showGarminKey ? <EyeOff size={15} /> : <Eye size={15} />}
               </button>
-              <button className="secondary" disabled={busy || !garminKey.trim()} onClick={() => void handleSaveGarminOnly()}>
-                Save Only
+              <button
+                type="button"
+                className="primary"
+                disabled={busy || !garminKey.trim()}
+                onClick={() => void handleVerifyGarmin()}
+              >
+                {garminCheckState === "checking" ? "Validating…" : "Verify & Save Key"}
+              </button>
+              <button
+                type="button"
+                className="secondary"
+                disabled={busy}
+                onClick={() => {
+                  setGarminSkipped(true);
+                  setGarminCheckState("idle");
+                  setGarminStatus("Skipped Garmin setup for now — you can connect later in Settings.");
+                  setStep(3);
+                }}
+              >
+                Skip Garmin for now
               </button>
             </div>
             {garminStatus && (
-              <div className="muted" style={{ fontSize: 12, marginBottom: 14 }}>
+              <div
+                className={
+                  garminCheckState === "verified"
+                    ? "key-status-ok"
+                    : garminCheckState === "error"
+                    ? "key-status-err"
+                    : "muted"
+                }
+                style={{ marginBottom: 14 }}
+              >
                 {garminVerified ? "✓ " : ""}{garminStatus}
               </div>
             )}
@@ -578,17 +658,74 @@ export function OnboardingWizard({
             <h3>Step 4 — Gemini AI Key &amp; Global Model</h3>
             <p className="muted" style={{ fontSize: 13 }}>
               {hasGeminiKey
-                ? "A Gemini API key is already saved. Leave blank to keep it or paste a new key to replace it."
-                : "Paste your Gemini API key (stored in Windows Credential Manager) to enable live streaming AI coaching."}
+                ? "A Gemini API key is already saved. Paste a new key and validate it, or continue with your saved key."
+                : "Paste your Gemini API key (stored in Windows Credential Manager) to validate and enable live streaming AI coaching."}
             </p>
             <div style={{ marginBottom: 12 }}>
               <label className="muted">Gemini API Key</label>
-              <input
-                type="password"
-                placeholder={hasGeminiKey ? "Saved (leave blank to keep)" : "AIza..."}
-                value={geminiKey}
-                onChange={(e) => setGeminiKey(e.target.value)}
-              />
+              <div className="key-input-group" style={{ marginTop: 4 }}>
+                <input
+                  type={showGeminiKey ? "text" : "password"}
+                  placeholder={hasGeminiKey ? "Saved (leave blank to keep)" : "AIza..."}
+                  value={geminiKey}
+                  onChange={(e) => {
+                    const val = e.target.value;
+                    setGeminiKey(val);
+                    if (!val.trim() && hasGeminiKey) {
+                      setGeminiVerified(true);
+                      setGeminiCheckState("verified");
+                      setGeminiStatus("Using existing Gemini API key in Windows Credential Manager.");
+                    } else {
+                      setGeminiVerified(false);
+                      setGeminiSkipped(false);
+                      setGeminiCheckState("idle");
+                      setGeminiStatus(null);
+                    }
+                  }}
+                />
+                <button
+                  type="button"
+                  className="secondary"
+                  aria-label={showGeminiKey ? "Hide Gemini API key" : "Show Gemini API key"}
+                  onClick={() => setShowGeminiKey((v) => !v)}
+                >
+                  {showGeminiKey ? <EyeOff size={15} /> : <Eye size={15} />}
+                </button>
+                <button
+                  type="button"
+                  className="primary"
+                  disabled={busy || !geminiKey.trim()}
+                  onClick={() => void handleVerifyGemini()}
+                >
+                  {geminiCheckState === "checking" ? "Validating…" : "Validate & Save Key"}
+                </button>
+                <button
+                  type="button"
+                  className="secondary"
+                  disabled={busy}
+                  onClick={() => {
+                    setGeminiSkipped(true);
+                    setGeminiCheckState("idle");
+                    void handleFinish(true);
+                  }}
+                >
+                  Skip Gemini for now
+                </button>
+              </div>
+              {geminiStatus && (
+                <div
+                  className={
+                    geminiCheckState === "verified"
+                      ? "key-status-ok"
+                      : geminiCheckState === "error"
+                      ? "key-status-err"
+                      : "muted"
+                  }
+                  style={{ marginTop: 6 }}
+                >
+                  {geminiVerified ? "✓ " : ""}{geminiStatus}
+                </div>
+              )}
             </div>
             <div className="form-row">
               <div>
@@ -629,14 +766,18 @@ export function OnboardingWizard({
           {step < 4 ? (
             <button
               className="primary"
-              disabled={busy}
+              disabled={busy || (step === 2 && !(garminVerified || garminSkipped))}
               onClick={() => setStep((s) => (s < 4 ? ((s + 1) as 1 | 2 | 3 | 4) : s))}
             >
               Next
             </button>
           ) : (
-            <button className="primary" disabled={busy} onClick={() => void handleFinish()}>
-              {busy ? "Saving…" : "Finish Setup"}
+            <button
+              className="primary"
+              disabled={busy || !(geminiVerified || geminiSkipped)}
+              onClick={() => void handleFinish(false)}
+            >
+              {busy ? "Saving…" : "Complete Setup"}
             </button>
           )}
         </div>

@@ -91,11 +91,66 @@ async fn verify_garmin_key(key: String) -> Result<serde_json::Value, String> {
         return Err("Garmin Personal API key cannot be empty.".to_string());
     }
     let client = garmin::GarminClient::new(Some(trimmed.clone()));
-    client.authenticate(true).await.map_err(|e| e.to_string())?;
+    if let Err(err) = client.authenticate(true).await {
+        return match err {
+            garmin::GarminError::BadKey => {
+                Err("HTTP 401/403 Invalid API Key — check your Garmin Personal API key.".to_string())
+            }
+            other => Err(other.to_string()),
+        };
+    }
     CredentialStore::save_secret(GARMIN_KEYRING_SERVICE, GARMIN_ACCOUNT, &trimmed)
         .map_err(|e| e.to_string())?;
     let _ = CredentialStore::save_secret(APP_SERVICE, GARMIN_ACCOUNT, &trimmed);
-    Ok(serde_json::json!({ "ok": true, "token_cached": true }))
+    let read_back = CredentialStore::read_secret(GARMIN_KEYRING_SERVICE, GARMIN_ACCOUNT)
+        .or_else(|| CredentialStore::read_secret(APP_SERVICE, GARMIN_ACCOUNT));
+    if read_back.as_deref() != Some(trimmed.as_str()) {
+        return Err("Garmin key saved but could not be verified on read-back from Credential Manager.".to_string());
+    }
+    Ok(serde_json::json!({ "ok": true, "http_status": 200, "token_cached": true, "persisted": true }))
+}
+
+#[tauri::command]
+async fn verify_gemini_key(
+    key: Option<String>,
+    persist: Option<bool>,
+) -> Result<serde_json::Value, String> {
+    let candidate = match key.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(k) => k.to_string(),
+        None => CredentialStore::read_secret(APP_SERVICE, GEMINI_ACCOUNT)
+            .ok_or_else(|| "Enter or save a Gemini API key first.".to_string())?,
+    };
+    let message = coach::verify_gemini_api_key(&candidate).await?;
+    let should_persist = persist.unwrap_or(true);
+    let mut persisted = false;
+    if should_persist && key.as_deref().map(str::trim).filter(|s| !s.is_empty()).is_some() {
+        CredentialStore::save_secret(APP_SERVICE, GEMINI_ACCOUNT, &candidate)
+            .map_err(|e| e.to_string())?;
+        let read_back = CredentialStore::read_secret(APP_SERVICE, GEMINI_ACCOUNT);
+        if read_back.as_deref() != Some(candidate.as_str()) {
+            return Err("Gemini API key could not be verified on read-back from Credential Manager.".to_string());
+        }
+        persisted = true;
+    } else if CredentialStore::read_secret(APP_SERVICE, GEMINI_ACCOUNT).as_deref() == Some(candidate.as_str()) {
+        persisted = true;
+    }
+    Ok(serde_json::json!({
+        "ok": true,
+        "http_status": 200,
+        "message": message,
+        "persisted": persisted,
+    }))
+}
+
+#[tauri::command]
+fn clean_slate_reset(state: State<'_, AppState>) -> Result<(), String> {
+    let store = state.load_store()?;
+    let db = state.open_db()?;
+    db.clean_slate_reset().map_err(|e| e.to_string())?;
+    store.clean_slate_files().map_err(|e| e.to_string())?;
+    let _ = CredentialStore::clear_all();
+    *state.settings.lock().unwrap() = AppSettings::default();
+    Ok(())
 }
 
 #[tauri::command]
@@ -223,7 +278,9 @@ async fn perform_full_garmin_sync(
 
     let windows = scale_matcher::activity_windows(&activities);
     if let Some(baseline_kg) = scale_matcher::latest_baseline_weight_kg(&all_weights, &windows) {
-        if (config.specs.weight_kg.unwrap_or(0.0) - baseline_kg).abs() >= 0.05 {
+        if (!config.specs.weight_baseline_confirmed || config.specs.weight_kg.unwrap_or(0.0) <= 0.0)
+            && (config.specs.weight_kg.unwrap_or(0.0) - baseline_kg).abs() >= 0.05
+        {
             config.specs.weight_kg = Some(baseline_kg);
             let _ = store.save_athlete_config(&config);
         }
@@ -328,9 +385,17 @@ fn apply_coach_proposal(state: State<'_, AppState>, proposal: CoachUpdateProposa
     coach::apply_coach_proposal(&store, &proposal)?;
 
     let mut first_use = store.load_first_use_state().map_err(|e| e.to_string())?;
-    if proposal.target_file == "COACH_PROFILE.md" && first_use.stage == FirstUseStage::ProfileApproval {
-        first_use.stage = FirstUseStage::HistorySync;
-        store.save_first_use_state(&first_use).map_err(|e| e.to_string())?;
+    if proposal.target_file == "COACH_PROFILE.md" {
+        let mut user_profile = db.get_user_profile().unwrap_or_default();
+        let mut config = store.load_athlete_config().map_err(|e| e.to_string())?.unwrap_or_default();
+        if coach::hydrate_profile_from_proposal(&proposal, &mut user_profile, &mut config) {
+            db.save_user_profile(&user_profile).map_err(|e| e.to_string())?;
+            store.save_athlete_config(&config).map_err(|e| e.to_string())?;
+        }
+        if first_use.stage == FirstUseStage::ProfileApproval {
+            first_use.stage = FirstUseStage::HistorySync;
+            store.save_first_use_state(&first_use).map_err(|e| e.to_string())?;
+        }
     } else if proposal.target_file == "TRAINING_PLAN.md" {
         let config = store.load_athlete_config().map_err(|e| e.to_string())?.unwrap_or_default();
         let activities = db.list_activities(5000).map_err(|e| e.to_string())?;
@@ -874,6 +939,8 @@ pub fn run() {
             get_bootstrap_state,
             save_garmin_key,
             verify_garmin_key,
+            verify_gemini_key,
+            clean_slate_reset,
             probe_fit_baseline,
             save_gemini_key,
             save_global_model_settings,

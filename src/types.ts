@@ -49,6 +49,7 @@ export interface AthleteConfig {
   specs: {
     displayName: string;
     weightKg: number | null;
+    weightBaselineConfirmed?: boolean;
     maxHR: number | null;
     restingHRBaseline: number | null;
     vt1CeilingBPM: number | null;
@@ -127,6 +128,12 @@ export interface RunnerConfig {
   z2_range_bpm: [number, number] | null;
   z3_range_bpm: [number, number] | null;
   lthr_bpm: number | null;
+  vt1_bpm?: number | null;
+  vt2_bpm?: number | null;
+  vt1_pace_sec_per_km?: number | null;
+  vt2_pace_sec_per_km?: number | null;
+  max_hr_bpm?: number | null;
+  resting_hr_bpm?: number | null;
 }
 
 export interface HyroxConfig {
@@ -226,6 +233,28 @@ export interface BootstrapState {
   first_use_state?: FirstUseFlowState;
 }
 
+export interface CoachProfileThresholds {
+  vt1_bpm?: number | null;
+  vt2_bpm?: number | null;
+  vt1_pace_sec_per_km?: number | null;
+  vt2_pace_sec_per_km?: number | null;
+  lthr_bpm?: number | null;
+  max_hr_bpm?: number | null;
+  resting_hr_bpm?: number | null;
+  z2_range_bpm?: [number, number] | null;
+  z3_range_bpm?: [number, number] | null;
+  weight_kg?: number | null;
+  primary_distance?: string | null;
+  hr_first_governor?: boolean | null;
+  hard_pace_floor_sec_per_km?: number | null;
+  hyrox_division?: string | null;
+  hyrox_watch_logging_mode?: string | null;
+  hyrox_target_total_time_sec?: number | null;
+  hyrox_fresh_1km_pace_sec?: number | null;
+  hyrox_compromised_1km_target_sec?: number | null;
+  hyrox_weak_stations?: string[] | null;
+}
+
 export interface CoachUpdateProposal {
   id: string;
   target_file: string;
@@ -235,6 +264,7 @@ export interface CoachUpdateProposal {
   diff_preview: string;
   status: string;
   plan_json?: unknown | null;
+  profile_thresholds?: CoachProfileThresholds | null;
 }
 
 export interface FitTrackPoint {

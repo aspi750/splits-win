@@ -320,6 +320,7 @@ fn test_apply_coach_proposal_and_history_backup() {
         diff_preview: String::new(),
         status: "pending_user_approval".to_string(),
         plan_json: None,
+        profile_thresholds: None,
     };
 
     apply_coach_proposal(&store, &proposal).unwrap();
@@ -536,6 +537,7 @@ fn test_stage3_1_user_profile_migration_and_hyrox_reclassification() {
             z2_range_bpm: Some([130, 144]),
             z3_range_bpm: Some([145, 160]),
             lthr_bpm: Some(172),
+            ..Default::default()
         },
         hyrox_config: HyroxConfig {
             division: Some("Open Men".to_string()),
@@ -1155,6 +1157,7 @@ fn test_v0_2_2_first_use_state_machine_and_proposal_consolidation() {
             diff_preview: String::new(),
             status: "pending_user_approval".to_string(),
             plan_json: None,
+            profile_thresholds: None,
         },
         CoachUpdateProposal {
             id: "2".to_string(),
@@ -1165,6 +1168,7 @@ fn test_v0_2_2_first_use_state_machine_and_proposal_consolidation() {
             diff_preview: String::new(),
             status: "pending_user_approval".to_string(),
             plan_json: None,
+            profile_thresholds: None,
         },
         CoachUpdateProposal {
             id: "3".to_string(),
@@ -1175,6 +1179,7 @@ fn test_v0_2_2_first_use_state_machine_and_proposal_consolidation() {
             diff_preview: String::new(),
             status: "pending_user_approval".to_string(),
             plan_json: Some(plan_obj),
+            profile_thresholds: None,
         },
     ];
 
@@ -1199,4 +1204,200 @@ fn test_v0_2_2_first_use_state_machine_and_proposal_consolidation() {
     assert_eq!(store.load_first_use_state().unwrap().stage, FirstUseStage::Active);
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn clean_slate_reset_clears_sqlite_and_shared_files() {
+    let dir = make_temp_dir("clean-slate");
+    let store = SharedStore::new(Some(dir.clone())).unwrap();
+    store.write_text_atomic("COACH_PROFILE.md", "# seeded profile").unwrap();
+    store.write_text_atomic("TRAINING_PLAN.md", "# seeded plan").unwrap();
+    store.save_athlete_config(&AthleteConfig::default()).unwrap();
+    let mut fus = FirstUseFlowState::default();
+    fus.stage = FirstUseStage::HistorySync;
+    store.save_first_use_state(&fus).unwrap();
+
+    let db = Database::open_in_memory().unwrap();
+    db.save_user_profile(&UserProfile {
+        athlete_type: AthleteType::Hyrox,
+        onboarding_completed: true,
+        runner_config: RunnerConfig {
+            vt1_bpm: Some(150),
+            ..Default::default()
+        },
+        hyrox_config: HyroxConfig {
+            division: Some("Men Open".to_string()),
+            ..Default::default()
+        },
+    })
+    .unwrap();
+    db.set_setting("coach_model_override_id", Some("gemini-2.5-pro")).unwrap();
+
+    db.clean_slate_reset().unwrap();
+    store.clean_slate_files().unwrap();
+
+    assert!(db.list_activities(10).unwrap().is_empty());
+    assert!(db.list_days(10).unwrap().is_empty());
+    let reset_profile = db.get_user_profile().unwrap();
+    assert!(!reset_profile.onboarding_completed);
+    assert_eq!(reset_profile.athlete_type, AthleteType::Runner);
+    assert!(db.get_setting("coach_model_override_id").unwrap().is_none());
+    assert_eq!(
+        db.load_model_settings().unwrap().global_model_id,
+        DEFAULT_GEMINI_MODEL_ID
+    );
+    assert!(store.read_text("COACH_PROFILE.md").unwrap().is_none());
+    assert!(store.read_text("TRAINING_PLAN.md").unwrap().is_none());
+    assert!(store.load_athlete_config().unwrap().is_none());
+    assert_eq!(store.load_first_use_state().unwrap().stage, FirstUseStage::Intake);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn gemini_verify_url_and_status_classification() {
+    let url = splits_win_lib::coach::build_gemini_verify_url("  AIzaTestKey_99 ", "gemini-4-hydrogen");
+    assert_eq!(
+        url,
+        "https://generativelanguage.googleapis.com/v1beta/models/gemini-4-hydrogen?key=AIzaTestKey_99"
+    );
+
+    let ok_msg = splits_win_lib::coach::classify_gemini_verify_status(
+        200,
+        r#"{"displayName":"Gemini 4 Hydrogen"}"#,
+    )
+    .unwrap();
+    assert!(ok_msg.contains("HTTP 200"));
+    assert!(ok_msg.contains("Hydrogen"));
+
+    let err_400 = splits_win_lib::coach::classify_gemini_verify_status(
+        400,
+        r#"{"error":{"message":"API key not valid. Please pass a valid API key."}}"#,
+    )
+    .unwrap_err();
+    assert!(err_400.contains("HTTP 400 Invalid API Key"));
+
+    let err_403 = splits_win_lib::coach::classify_gemini_verify_status(403, "").unwrap_err();
+    assert!(err_403.contains("HTTP 403 Invalid API Key"));
+
+    let err_429 = splits_win_lib::coach::classify_gemini_verify_status(
+        429,
+        r#"{"error":{"message":"Quota exceeded"}}"#,
+    )
+    .unwrap_err();
+    assert!(err_429.contains("HTTP 429 Quota Reached"));
+}
+
+#[test]
+fn stage2_profile_hydration_populates_thresholds_and_locks_weight() {
+    let mut profile = UserProfile::default();
+    let mut config = AthleteConfig::default();
+
+    let structured = CoachUpdateProposal {
+        id: "stage2".to_string(),
+        target_file: "COACH_PROFILE.md".to_string(),
+        reason: "Initial profile synthesis".to_string(),
+        updated_section_markdown: "## Thresholds\n- VT1: 149 bpm\n- VT2: 171 bpm".to_string(),
+        expires_on: None,
+        diff_preview: String::new(),
+        status: "pending_user_approval".to_string(),
+        plan_json: None,
+        profile_thresholds: Some(CoachProfileThresholds {
+            vt1_bpm: Some(149),
+            vt2_bpm: Some(171),
+            vt1_pace_sec_per_km: Some(295),
+            vt2_pace_sec_per_km: Some(255),
+            lthr_bpm: Some(170),
+            max_hr_bpm: Some(191),
+            resting_hr_bpm: Some(46),
+            weight_kg: Some(71.4),
+            hr_first_governor: Some(true),
+            hard_pace_floor_sec_per_km: Some(375),
+            ..Default::default()
+        }),
+    };
+
+    assert!(splits_win_lib::coach::hydrate_profile_from_proposal(
+        &structured,
+        &mut profile,
+        &mut config
+    ));
+    assert_eq!(profile.runner_config.vt1_bpm, Some(149));
+    assert_eq!(profile.runner_config.vt2_bpm, Some(171));
+    assert_eq!(profile.runner_config.vt1_pace_sec_per_km, Some(295));
+    assert_eq!(profile.runner_config.vt2_pace_sec_per_km, Some(255));
+    assert_eq!(profile.runner_config.lthr_bpm, Some(170));
+    assert_eq!(profile.runner_config.max_hr_bpm, Some(191));
+    assert_eq!(profile.runner_config.resting_hr_bpm, Some(46));
+    assert_eq!(config.specs.vt1_ceiling_bpm, Some(149));
+    assert_eq!(config.specs.max_hr, Some(191));
+    assert_eq!(config.specs.resting_hr_baseline, Some(46));
+    assert_eq!(config.specs.weight_kg, Some(71.4));
+    assert!(config.specs.weight_baseline_confirmed);
+
+    // Markdown fallback test when structured profile_thresholds is omitted
+    let mut md_profile = UserProfile::default();
+    let mut md_config = AthleteConfig::default();
+    let md_only = CoachUpdateProposal {
+        id: "stage2-md".to_string(),
+        target_file: "COACH_PROFILE.md".to_string(),
+        reason: "Markdown fallback".to_string(),
+        updated_section_markdown: "## Physiology\n- **VT1**: 147 bpm @ 5:05/km\n- **Max HR**: 189 bpm\n- **Weight**: 68.5 kg\n".to_string(),
+        expires_on: None,
+        diff_preview: String::new(),
+        status: "pending_user_approval".to_string(),
+        plan_json: None,
+        profile_thresholds: None,
+    };
+    assert!(splits_win_lib::coach::hydrate_profile_from_proposal(
+        &md_only,
+        &mut md_profile,
+        &mut md_config
+    ));
+    assert_eq!(md_profile.runner_config.vt1_bpm, Some(147));
+    assert_eq!(md_profile.runner_config.vt1_pace_sec_per_km, Some(305));
+    assert_eq!(md_profile.runner_config.max_hr_bpm, Some(189));
+    assert_eq!(md_config.specs.weight_kg, Some(68.5));
+    assert!(md_config.specs.weight_baseline_confirmed);
+}
+
+#[test]
+fn primary_discipline_switch_preserves_runner_and_hyrox_configs() {
+    let db = Database::open_in_memory().unwrap();
+    let initial = UserProfile {
+        athlete_type: AthleteType::HybridBoth,
+        onboarding_completed: true,
+        runner_config: RunnerConfig {
+            primary_distance: Some("Marathon".to_string()),
+            hr_first_governor: true,
+            vt1_bpm: Some(148),
+            vt2_bpm: Some(168),
+            lthr_bpm: Some(167),
+            ..Default::default()
+        },
+        hyrox_config: HyroxConfig {
+            division: Some("Men Pro".to_string()),
+            fresh_1km_pace_sec: Some(245),
+            compromised_1km_target_sec: Some(265),
+            weak_stations: vec!["Sled Push".to_string()],
+            ..Default::default()
+        },
+    };
+    db.save_user_profile(&initial).unwrap();
+
+    let mut as_hyrox = db.get_user_profile().unwrap();
+    as_hyrox.athlete_type = AthleteType::Hyrox;
+    db.save_user_profile(&as_hyrox).unwrap();
+
+    let mut as_runner = db.get_user_profile().unwrap();
+    assert_eq!(as_runner.runner_config.vt1_bpm, Some(148));
+    assert_eq!(as_runner.runner_config.primary_distance.as_deref(), Some("Marathon"));
+    as_runner.athlete_type = AthleteType::Runner;
+    db.save_user_profile(&as_runner).unwrap();
+
+    let reloaded = db.get_user_profile().unwrap();
+    assert_eq!(reloaded.athlete_type, AthleteType::Runner);
+    assert_eq!(reloaded.runner_config.vt2_bpm, Some(168));
+    assert_eq!(reloaded.hyrox_config.division.as_deref(), Some("Men Pro"));
+    assert_eq!(reloaded.hyrox_config.fresh_1km_pace_sec, Some(245));
 }

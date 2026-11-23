@@ -211,6 +211,8 @@ impl GoalType {
 pub struct AthleteSpecs {
     pub display_name: String,
     pub weight_kg: Option<f64>,
+    #[serde(default)]
+    pub weight_baseline_confirmed: bool,
     #[serde(rename = "maxHR")]
     pub max_hr: Option<i32>,
     #[serde(rename = "restingHRBaseline")]
@@ -225,6 +227,7 @@ impl Default for AthleteSpecs {
         Self {
             display_name: String::new(),
             weight_kg: None,
+            weight_baseline_confirmed: false,
             max_hr: None,
             resting_hr_baseline: None,
             vt1_ceiling_bpm: None,
@@ -1113,7 +1116,97 @@ pub struct AvailabilityEntry {
     pub last_confirmed: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct CoachProfileThresholds {
+    #[serde(default)]
+    pub vt1_bpm: Option<i32>,
+    #[serde(default)]
+    pub vt2_bpm: Option<i32>,
+    #[serde(default)]
+    pub vt1_pace_sec_per_km: Option<i32>,
+    #[serde(default)]
+    pub vt2_pace_sec_per_km: Option<i32>,
+    #[serde(default)]
+    pub lthr_bpm: Option<i32>,
+    #[serde(default)]
+    pub max_hr_bpm: Option<i32>,
+    #[serde(default)]
+    pub resting_hr_bpm: Option<i32>,
+    #[serde(default)]
+    pub z2_range_bpm: Option<[i32; 2]>,
+    #[serde(default)]
+    pub z3_range_bpm: Option<[i32; 2]>,
+    #[serde(default)]
+    pub weight_kg: Option<f64>,
+    #[serde(default)]
+    pub primary_distance: Option<String>,
+    #[serde(default)]
+    pub hr_first_governor: Option<bool>,
+    #[serde(default)]
+    pub hard_pace_floor_sec_per_km: Option<i32>,
+    #[serde(default)]
+    pub hyrox_division: Option<String>,
+    #[serde(default)]
+    pub hyrox_watch_logging_mode: Option<String>,
+    #[serde(default)]
+    pub hyrox_target_total_time_sec: Option<i32>,
+    #[serde(default)]
+    pub hyrox_fresh_1km_pace_sec: Option<i32>,
+    #[serde(default)]
+    pub hyrox_compromised_1km_target_sec: Option<i32>,
+    #[serde(default)]
+    pub hyrox_weak_stations: Option<Vec<String>>,
+}
+
+impl CoachProfileThresholds {
+    pub fn is_empty(&self) -> bool {
+        self.vt1_bpm.is_none()
+            && self.vt2_bpm.is_none()
+            && self.vt1_pace_sec_per_km.is_none()
+            && self.vt2_pace_sec_per_km.is_none()
+            && self.lthr_bpm.is_none()
+            && self.max_hr_bpm.is_none()
+            && self.resting_hr_bpm.is_none()
+            && self.z2_range_bpm.is_none()
+            && self.z3_range_bpm.is_none()
+            && self.weight_kg.is_none()
+            && self.primary_distance.is_none()
+            && self.hr_first_governor.is_none()
+            && self.hard_pace_floor_sec_per_km.is_none()
+            && self.hyrox_division.is_none()
+            && self.hyrox_watch_logging_mode.is_none()
+            && self.hyrox_target_total_time_sec.is_none()
+            && self.hyrox_fresh_1km_pace_sec.is_none()
+            && self.hyrox_compromised_1km_target_sec.is_none()
+            && self.hyrox_weak_stations.is_none()
+    }
+
+    pub fn merged(&self, fallback: &Self) -> Self {
+        Self {
+            vt1_bpm: self.vt1_bpm.or(fallback.vt1_bpm),
+            vt2_bpm: self.vt2_bpm.or(fallback.vt2_bpm),
+            vt1_pace_sec_per_km: self.vt1_pace_sec_per_km.or(fallback.vt1_pace_sec_per_km),
+            vt2_pace_sec_per_km: self.vt2_pace_sec_per_km.or(fallback.vt2_pace_sec_per_km),
+            lthr_bpm: self.lthr_bpm.or(fallback.lthr_bpm),
+            max_hr_bpm: self.max_hr_bpm.or(fallback.max_hr_bpm),
+            resting_hr_bpm: self.resting_hr_bpm.or(fallback.resting_hr_bpm),
+            z2_range_bpm: self.z2_range_bpm.or(fallback.z2_range_bpm),
+            z3_range_bpm: self.z3_range_bpm.or(fallback.z3_range_bpm),
+            weight_kg: self.weight_kg.or(fallback.weight_kg),
+            primary_distance: self.primary_distance.clone().or_else(|| fallback.primary_distance.clone()),
+            hr_first_governor: self.hr_first_governor.or(fallback.hr_first_governor),
+            hard_pace_floor_sec_per_km: self.hard_pace_floor_sec_per_km.or(fallback.hard_pace_floor_sec_per_km),
+            hyrox_division: self.hyrox_division.clone().or_else(|| fallback.hyrox_division.clone()),
+            hyrox_watch_logging_mode: self.hyrox_watch_logging_mode.clone().or_else(|| fallback.hyrox_watch_logging_mode.clone()),
+            hyrox_target_total_time_sec: self.hyrox_target_total_time_sec.or(fallback.hyrox_target_total_time_sec),
+            hyrox_fresh_1km_pace_sec: self.hyrox_fresh_1km_pace_sec.or(fallback.hyrox_fresh_1km_pace_sec),
+            hyrox_compromised_1km_target_sec: self.hyrox_compromised_1km_target_sec.or(fallback.hyrox_compromised_1km_target_sec),
+            hyrox_weak_stations: self.hyrox_weak_stations.clone().or_else(|| fallback.hyrox_weak_stations.clone()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct CoachUpdateProposal {
     pub id: String,
     pub target_file: String,
@@ -1124,6 +1217,8 @@ pub struct CoachUpdateProposal {
     pub status: String,
     #[serde(default)]
     pub plan_json: Option<PlanFile>,
+    #[serde(default)]
+    pub profile_thresholds: Option<CoachProfileThresholds>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1318,6 +1413,18 @@ pub struct RunnerConfig {
     pub z2_range_bpm: Option<[i32; 2]>,
     pub z3_range_bpm: Option<[i32; 2]>,
     pub lthr_bpm: Option<i32>,
+    #[serde(default)]
+    pub vt1_bpm: Option<i32>,
+    #[serde(default)]
+    pub vt2_bpm: Option<i32>,
+    #[serde(default)]
+    pub vt1_pace_sec_per_km: Option<i32>,
+    #[serde(default)]
+    pub vt2_pace_sec_per_km: Option<i32>,
+    #[serde(default)]
+    pub max_hr_bpm: Option<i32>,
+    #[serde(default)]
+    pub resting_hr_bpm: Option<i32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]

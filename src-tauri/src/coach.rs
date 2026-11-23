@@ -283,6 +283,12 @@ pub fn consolidate_proposals(proposals: Vec<CoachUpdateProposal>) -> Vec<CoachUp
             if prop.plan_json.is_some() {
                 existing.plan_json = prop.plan_json;
             }
+            if let Some(incoming_t) = prop.profile_thresholds {
+                existing.profile_thresholds = Some(match existing.profile_thresholds.as_ref() {
+                    Some(prev) => incoming_t.merged(prev),
+                    None => incoming_t,
+                });
+            }
         } else {
             order.push(key.clone());
             let mut normalized = prop;
@@ -292,6 +298,88 @@ pub fn consolidate_proposals(proposals: Vec<CoachUpdateProposal>) -> Vec<CoachUp
     }
 
     order.into_iter().filter_map(|k| grouped.remove(&k)).collect()
+}
+
+pub fn build_gemini_verify_url(api_key: &str, model_id: &str) -> String {
+    let trimmed = api_key.trim();
+    let model = if model_id.trim().is_empty() {
+        GEMINI_MODEL_ID
+    } else {
+        model_id.trim()
+    };
+    let mut url = reqwest::Url::parse(&format!(
+        "https://generativelanguage.googleapis.com/v1beta/models/{model}"
+    ))
+    .expect("static Gemini URL must parse");
+    url.query_pairs_mut().append_pair("key", trimmed);
+    url.to_string()
+}
+
+pub fn classify_gemini_verify_status(status: u16, body: &str) -> Result<String, String> {
+    if (200..=299).contains(&status) {
+        let model_name = serde_json::from_str::<Value>(body)
+            .ok()
+            .and_then(|v| {
+                v["displayName"]
+                    .as_str()
+                    .or_else(|| v["name"].as_str())
+                    .map(str::to_string)
+            })
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "Gemini 4 Hydrogen".to_string());
+        let label = if model_name.to_lowercase().contains("hydrogen") {
+            "Gemini 4 Hydrogen".to_string()
+        } else {
+            model_name
+        };
+        return Ok(format!("Connected ({label} verified · HTTP {status})"));
+    }
+
+    let detail = serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|v| v["error"]["message"].as_str().map(str::trim).map(str::to_string))
+        .filter(|s| !s.is_empty())
+        .unwrap_or_default();
+
+    if status == 400 || status == 403 {
+        return Err(if detail.is_empty() {
+            format!("HTTP {status} Invalid API Key")
+        } else {
+            format!("HTTP {status} Invalid API Key: {detail}")
+        });
+    }
+    if status == 429 {
+        return Err(if detail.is_empty() {
+            "HTTP 429 Quota Reached".to_string()
+        } else {
+            format!("HTTP 429 Quota Reached: {detail}")
+        });
+    }
+    Err(if detail.is_empty() {
+        format!("HTTP {status} error from Gemini API")
+    } else {
+        format!("HTTP {status}: {detail}")
+    })
+}
+
+pub async fn verify_gemini_api_key(api_key: &str) -> Result<String, String> {
+    let trimmed = api_key.trim();
+    if trimmed.is_empty() {
+        return Err("Gemini API key cannot be empty.".to_string());
+    }
+    let url = build_gemini_verify_url(trimmed, GEMINI_MODEL_ID);
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("Network error: {e}"))?;
+    let status = resp.status().as_u16();
+    let body = resp.text().await.unwrap_or_default();
+    classify_gemini_verify_status(status, &body)
 }
 
 pub fn resolve_coach_engine_mode() -> CoachEngineMode {
@@ -381,7 +469,11 @@ pub fn gemini_tool_declarations() -> Value {
                     "reason": { "type": "STRING" },
                     "updated_section_markdown": { "type": "STRING" },
                     "expires_on": { "type": "STRING" },
-                    "plan_json": { "type": "OBJECT" }
+                    "plan_json": { "type": "OBJECT" },
+                    "profile_thresholds": {
+                        "type": "OBJECT",
+                        "description": "Structured athlete thresholds for COACH_PROFILE.md updates (vt1_bpm, vt2_bpm, vt1_pace_sec_per_km, vt2_pace_sec_per_km, lthr_bpm, max_hr_bpm, resting_hr_bpm, z2_range_bpm, z3_range_bpm, weight_kg, primary_distance, hr_first_governor, hard_pace_floor_sec_per_km)."
+                    }
                 },
                 "required": ["target_file", "reason", "updated_section_markdown"]
             }
@@ -863,6 +955,18 @@ fn execute_tool(
                 .get("plan_json")
                 .filter(|v| !v.is_null())
                 .and_then(|v| serde_json::from_value(v.clone()).ok());
+            let parsed_thresholds: Option<CoachProfileThresholds> = args
+                .get("profile_thresholds")
+                .and_then(|v| serde_json::from_value::<CoachProfileThresholds>(v.clone()).ok());
+            let md_thresholds = parse_profile_thresholds_from_markdown(&section);
+            let combined_thresholds = match parsed_thresholds {
+                Some(t) => {
+                    let m = t.merged(&md_thresholds);
+                    if m.is_empty() { None } else { Some(m) }
+                }
+                None if !md_thresholds.is_empty() => Some(md_thresholds),
+                None => None,
+            };
             let id = uuid::Uuid::new_v4().to_string();
             proposals.push(CoachUpdateProposal {
                 id: id.clone(),
@@ -873,6 +977,7 @@ fn execute_tool(
                 diff_preview: section,
                 status: "pending_user_approval".to_string(),
                 plan_json,
+                profile_thresholds: combined_thresholds,
             });
             json!({ "status": "pending_user_approval", "proposal_id": id, "target_file": target })
         }
@@ -1504,6 +1609,20 @@ pub fn format_user_profile_context(profile: &UserProfile) -> String {
         if let Some(pf) = r.pace_floor_sec_per_km {
             r_parts.push(format!("Pace floor: {}/km", AthleteConfig::format_pace(pf)));
         }
+        if let Some(vt1) = r.vt1_bpm {
+            let pace_txt = r
+                .vt1_pace_sec_per_km
+                .map(|p| format!(" ({}/km)", AthleteConfig::format_pace(p)))
+                .unwrap_or_default();
+            r_parts.push(format!("VT1: {vt1} bpm{pace_txt}"));
+        }
+        if let Some(vt2) = r.vt2_bpm {
+            let pace_txt = r
+                .vt2_pace_sec_per_km
+                .map(|p| format!(" ({}/km)", AthleteConfig::format_pace(p)))
+                .unwrap_or_default();
+            r_parts.push(format!("VT2: {vt2} bpm{pace_txt}"));
+        }
         if let Some([lo, hi]) = r.z2_range_bpm {
             r_parts.push(format!("Z2: {lo}-{hi} bpm"));
         }
@@ -1512,6 +1631,12 @@ pub fn format_user_profile_context(profile: &UserProfile) -> String {
         }
         if let Some(lthr) = r.lthr_bpm {
             r_parts.push(format!("LTHR: {lthr} bpm"));
+        }
+        if let Some(mhr) = r.max_hr_bpm {
+            r_parts.push(format!("Max HR: {mhr} bpm"));
+        }
+        if let Some(rhr) = r.resting_hr_bpm {
+            r_parts.push(format!("Resting HR: {rhr} bpm"));
         }
         lines.push(format!("- Runner Config: {}", r_parts.join(" · ")));
     }
@@ -1545,6 +1670,244 @@ pub fn format_user_profile_context(profile: &UserProfile) -> String {
     lines.join("\n")
 }
 
+fn extract_first_bpm_in_line(line: &str) -> Option<i32> {
+    let lower = line.to_lowercase();
+    for (idx, _) in lower.match_indices("bpm") {
+        let prefix = lower[..idx].trim_end();
+        let digits: String = prefix
+            .chars()
+            .rev()
+            .take_while(|c| c.is_ascii_digit())
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect();
+        if let Ok(v) = digits.parse::<i32>() {
+            if (30..=230).contains(&v) {
+                return Some(v);
+            }
+        }
+    }
+    if let Some(colon_idx) = line.find(':') {
+        for tok in line[colon_idx + 1..].split(|c: char| !c.is_ascii_digit()) {
+            if let Ok(v) = tok.parse::<i32>() {
+                if (30..=230).contains(&v) {
+                    return Some(v);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn extract_pace_sec_in_line(line: &str) -> Option<i32> {
+    for raw_tok in line.split(|c: char| c.is_whitespace() || matches!(c, '(' | ')' | ',' | ';')) {
+        let cleaned = raw_tok.trim_end_matches("/km").trim_end_matches("min");
+        let parts: Vec<&str> = cleaned.split(':').collect();
+        if parts.len() == 2 {
+            if let (Ok(m), Ok(s)) = (parts[0].parse::<i32>(), parts[1].parse::<i32>()) {
+                if (2..=20).contains(&m) && (0..60).contains(&s) && parts[1].len() == 2 {
+                    return Some(m * 60 + s);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn extract_range_in_line(line: &str) -> Option<[i32; 2]> {
+    let normalized = line.replace(['–', '—'], "-");
+    for seg in normalized.split_whitespace() {
+        if let Some((a, b)) = seg.split_once('-') {
+            let a_digits: String = a.chars().filter(|c| c.is_ascii_digit()).collect();
+            let b_digits: String = b.chars().filter(|c| c.is_ascii_digit()).collect();
+            if let (Ok(lo), Ok(hi)) = (a_digits.parse::<i32>(), b_digits.parse::<i32>()) {
+                if (60..=230).contains(&lo) && (lo..=230).contains(&hi) {
+                    return Some([lo, hi]);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn extract_weight_kg_in_line(line: &str) -> Option<f64> {
+    let lower = line.to_lowercase();
+    for (idx, _) in lower.match_indices("kg") {
+        let prefix = lower[..idx].trim_end();
+        let num_str: String = prefix
+            .chars()
+            .rev()
+            .take_while(|c| c.is_ascii_digit() || *c == '.')
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect();
+        if let Ok(w) = num_str.parse::<f64>() {
+            if (30.0..=220.0).contains(&w) {
+                return Some(w);
+            }
+        }
+    }
+    None
+}
+
+pub fn parse_profile_thresholds_from_markdown(markdown: &str) -> CoachProfileThresholds {
+    let mut out = CoachProfileThresholds::default();
+    for raw in markdown.lines() {
+        let cleaned = raw.replace('*', "").trim().to_string();
+        if cleaned.is_empty() {
+            continue;
+        }
+        let lower = cleaned.to_lowercase();
+        if lower.contains("vt1") {
+            if out.vt1_bpm.is_none() {
+                out.vt1_bpm = extract_first_bpm_in_line(&cleaned);
+            }
+            if out.vt1_pace_sec_per_km.is_none() {
+                out.vt1_pace_sec_per_km = extract_pace_sec_in_line(&cleaned);
+            }
+        } else if lower.contains("vt2") {
+            if out.vt2_bpm.is_none() {
+                out.vt2_bpm = extract_first_bpm_in_line(&cleaned);
+            }
+            if out.vt2_pace_sec_per_km.is_none() {
+                out.vt2_pace_sec_per_km = extract_pace_sec_in_line(&cleaned);
+            }
+        }
+        if out.lthr_bpm.is_none() && (lower.contains("lthr") || lower.contains("lactate threshold")) {
+            out.lthr_bpm = extract_first_bpm_in_line(&cleaned);
+        }
+        if out.max_hr_bpm.is_none() && (lower.contains("max hr") || lower.contains("maximum heart rate")) {
+            out.max_hr_bpm = extract_first_bpm_in_line(&cleaned);
+        }
+        if out.resting_hr_bpm.is_none() && (lower.contains("resting hr") || lower.contains("resting heart rate")) {
+            out.resting_hr_bpm = extract_first_bpm_in_line(&cleaned);
+        }
+        if out.z2_range_bpm.is_none() && (lower.contains("z2") || lower.contains("zone 2")) {
+            out.z2_range_bpm = extract_range_in_line(&cleaned);
+        }
+        if out.z3_range_bpm.is_none() && (lower.contains("z3") || lower.contains("zone 3")) {
+            out.z3_range_bpm = extract_range_in_line(&cleaned);
+        }
+        if out.weight_kg.is_none() && (lower.contains("weight") || lower.contains("mass")) {
+            out.weight_kg = extract_weight_kg_in_line(&cleaned);
+        }
+        if out.hard_pace_floor_sec_per_km.is_none()
+            && (lower.contains("pace floor") || lower.contains("minimum pace"))
+        {
+            out.hard_pace_floor_sec_per_km = extract_pace_sec_in_line(&cleaned);
+        }
+        if out.hr_first_governor.is_none() && lower.contains("hr-first") {
+            if lower.contains("disabled") || lower.contains("false") || lower.contains("off") || lower.contains("no") {
+                out.hr_first_governor = Some(false);
+            } else if lower.contains("enabled") || lower.contains("true") || lower.contains("active") || lower.contains("on") {
+                out.hr_first_governor = Some(true);
+            }
+        }
+        if out.primary_distance.is_none()
+            && (lower.contains("primary distance") || lower.contains("primary event"))
+        {
+            if let Some((_, rhs)) = cleaned.split_once(':') {
+                let v = rhs.trim();
+                if !v.is_empty() {
+                    out.primary_distance = Some(v.to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
+pub fn hydrate_profile_from_proposal(
+    proposal: &CoachUpdateProposal,
+    profile: &mut UserProfile,
+    config: &mut AthleteConfig,
+) -> bool {
+    let md_fallback = parse_profile_thresholds_from_markdown(&proposal.updated_section_markdown);
+    let merged = match proposal.profile_thresholds.as_ref() {
+        Some(t) => t.merged(&md_fallback),
+        None => md_fallback,
+    };
+    if merged.is_empty() {
+        return false;
+    }
+
+    if let Some(v) = merged.vt1_bpm.filter(|&v| v > 0) {
+        profile.runner_config.vt1_bpm = Some(v);
+        config.specs.vt1_ceiling_bpm = Some(v);
+        if config.medical.easy_hr_ceiling_bpm.is_none() {
+            config.medical.easy_hr_ceiling_bpm = Some(v);
+        }
+    }
+    if let Some(v) = merged.vt2_bpm.filter(|&v| v > 0) {
+        profile.runner_config.vt2_bpm = Some(v);
+    }
+    if let Some(v) = merged.vt1_pace_sec_per_km.filter(|&v| v > 0) {
+        profile.runner_config.vt1_pace_sec_per_km = Some(v);
+    }
+    if let Some(v) = merged.vt2_pace_sec_per_km.filter(|&v| v > 0) {
+        profile.runner_config.vt2_pace_sec_per_km = Some(v);
+    }
+    if let Some(v) = merged.lthr_bpm.filter(|&v| v > 0) {
+        profile.runner_config.lthr_bpm = Some(v);
+    }
+    if let Some(v) = merged.max_hr_bpm.filter(|&v| v > 0) {
+        profile.runner_config.max_hr_bpm = Some(v);
+        config.specs.max_hr = Some(v);
+    }
+    if let Some(v) = merged.resting_hr_bpm.filter(|&v| v > 0) {
+        profile.runner_config.resting_hr_bpm = Some(v);
+        config.specs.resting_hr_baseline = Some(v);
+    }
+    if let Some(z2) = merged.z2_range_bpm {
+        profile.runner_config.z2_range_bpm = Some(z2);
+    }
+    if let Some(z3) = merged.z3_range_bpm {
+        profile.runner_config.z3_range_bpm = Some(z3);
+    }
+    if let Some(ref d) = merged.primary_distance {
+        if !d.trim().is_empty() {
+            profile.runner_config.primary_distance = Some(d.trim().to_string());
+        }
+    }
+    if let Some(gov) = merged.hr_first_governor {
+        profile.runner_config.hr_first_governor = gov;
+        config.medical.enforce_easy_hr_ceiling = gov;
+    }
+    if let Some(pf) = merged.hard_pace_floor_sec_per_km.filter(|&v| v > 0) {
+        profile.runner_config.pace_floor_sec_per_km = Some(pf);
+        config.medical.enforce_pace_floor = true;
+        config.medical.min_pace_sec_per_km = Some(pf);
+    }
+    if let Some(w) = merged.weight_kg.filter(|&w| w > 0.0) {
+        config.specs.weight_kg = Some(w);
+        config.specs.weight_baseline_confirmed = true;
+    }
+
+    if let Some(ref div) = merged.hyrox_division {
+        profile.hyrox_config.division = Some(div.clone());
+    }
+    if let Some(ref mode) = merged.hyrox_watch_logging_mode {
+        profile.hyrox_config.watch_logging_mode = Some(mode.clone());
+    }
+    if let Some(tot) = merged.hyrox_target_total_time_sec {
+        profile.hyrox_config.target_total_time_sec = Some(tot);
+    }
+    if let Some(fresh) = merged.hyrox_fresh_1km_pace_sec {
+        profile.hyrox_config.fresh_1km_pace_sec = Some(fresh);
+    }
+    if let Some(comp) = merged.hyrox_compromised_1km_target_sec {
+        profile.hyrox_config.compromised_1km_target_sec = Some(comp);
+    }
+    if let Some(ref weak) = merged.hyrox_weak_stations {
+        if !weak.is_empty() {
+            profile.hyrox_config.weak_stations = weak.clone();
+        }
+    }
+    true
+}
+
 pub fn build_static_system_instruction(
     store: &SharedStore,
     config: &AthleteConfig,
@@ -1575,7 +1938,7 @@ pub fn build_static_system_instruction(
         match fu.stage {
             FirstUseStage::Intake | FirstUseStage::ProfileApproval => {
                 sections.push(format!(
-                    "GUIDED STAGE (Profile Synthesis): {guardrail_note} Synthesize ATHLETE CONFIG and any attached intake files (lab stress test PDF, Garmin stress .FIT, notes) into ONE consolidated `COACH_PROFILE.md` proposal via a single `propose_coach_update` call. Do NOT propose `TRAINING_PLAN.md` yet — training block design waits until after Garmin history sync."
+                    "GUIDED STAGE (Profile Synthesis): {guardrail_note} Synthesize ATHLETE CONFIG and any attached intake files (lab stress test PDF, Garmin stress .FIT, notes) into ONE consolidated `COACH_PROFILE.md` proposal via a single `propose_coach_update` call. Always populate `profile_thresholds` with every resolved threshold (vt1_bpm, vt2_bpm, vt1_pace_sec_per_km, vt2_pace_sec_per_km, lthr_bpm, max_hr_bpm, resting_hr_bpm, z2_range_bpm, z3_range_bpm, weight_kg, primary_distance, hr_first_governor, hard_pace_floor_sec_per_km). Do NOT propose `TRAINING_PLAN.md` yet — training block design waits until after Garmin history sync."
                 ));
             }
             FirstUseStage::HistorySync => {

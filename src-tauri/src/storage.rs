@@ -150,6 +150,35 @@ impl SharedStore {
         Ok(())
     }
 
+    pub fn clean_slate_files(&self) -> Result<(), StorageError> {
+        for rel in [
+            "athlete_config.json",
+            "COACH_PROFILE.md",
+            "TRAINING_PLAN.md",
+            "plan.json",
+            "readiness_state.json",
+            "today_adapted_target.json",
+            "gear_inventory.json",
+            "outcomes.json",
+            "coach_usage.log",
+            "ASPI_Training_Log.txt",
+            "state/first_use_flow.json",
+        ] {
+            let p = self.root_dir.join(rel);
+            if p.exists() {
+                let _ = fs::remove_file(&p);
+            }
+        }
+        for sub in ["attachments", "history"] {
+            let dir = self.root_dir.join(sub);
+            if dir.exists() {
+                let _ = fs::remove_dir_all(&dir);
+            }
+        }
+        Self::ensure_subdirectories(&self.root_dir)?;
+        Ok(())
+    }
+
     fn backup_if_exists(&self, target: &Path) -> Result<(), StorageError> {
         if !target.exists() {
             return Ok(());
@@ -207,6 +236,14 @@ impl CredentialStore {
             Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
             Err(e) => Err(StorageError::Keyring(e.to_string())),
         }
+    }
+
+    pub fn clear_all() -> Result<(), StorageError> {
+        let _ = Self::delete_secret(GARMIN_KEYRING_SERVICE, GARMIN_ACCOUNT);
+        let _ = Self::delete_secret(APP_SERVICE, GARMIN_ACCOUNT);
+        let _ = Self::delete_secret(APP_SERVICE, GEMINI_ACCOUNT);
+        let _ = Self::delete_secret(APP_SERVICE, UISERVER_ACCOUNT);
+        Ok(())
     }
 }
 
@@ -385,6 +422,36 @@ impl Database {
         self.conn.lock().unwrap().execute(
             "UPDATE activities SET fit_temp_source = ?1 WHERE garmin_id = ?2",
             params![temp_source, garmin_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn clean_slate_reset(&self) -> Result<(), StorageError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute_batch(
+            "DELETE FROM activities;
+             DELETE FROM days;
+             DELETE FROM fit_tracks;
+             DELETE FROM weight_entries;
+             DELETE FROM settings;",
+        )?;
+        conn.execute(
+            "INSERT INTO user_profile (id, athlete_type, onboarding_completed, runner_config_json, hyrox_config_json)
+             VALUES (1, 'runner', 0, '{}', '{}')
+             ON CONFLICT(id) DO UPDATE SET
+                athlete_type = 'runner',
+                onboarding_completed = 0,
+                runner_config_json = '{}',
+                hyrox_config_json = '{}'",
+            [],
+        )?;
+        conn.execute(
+            "INSERT OR IGNORE INTO settings (key, value) VALUES ('global_model_id', ?1)",
+            params![DEFAULT_GEMINI_MODEL_ID],
+        )?;
+        conn.execute(
+            "INSERT OR IGNORE INTO settings (key, value) VALUES ('global_thinking_level', ?1)",
+            params![DEFAULT_GEMINI_THINKING_LEVEL],
         )?;
         Ok(())
     }

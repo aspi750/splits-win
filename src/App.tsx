@@ -8,12 +8,16 @@ import { check, type Update } from "@tauri-apps/plugin-updater";
 import {
   Activity,
   ArrowLeft,
+  ArrowUp,
   Check,
   ChevronDown,
   Clipboard,
   Download,
+  Eye,
+  EyeOff,
   FileText,
   MessageSquare,
+  MoreHorizontal,
   RefreshCw,
   Settings,
   Sparkles,
@@ -27,6 +31,7 @@ import type {
   ActivityDetailPayload,
   ActivityRecord,
   AthleteConfig,
+  AthleteType,
   BootstrapState,
   CoachUpdateProposal,
   ExecutionMode,
@@ -36,6 +41,7 @@ import type {
   ModelSettings,
   PostRunContext,
   ThinkingLevel,
+  UserProfile,
 } from "./types";
 
 type NavTab = "today" | "activities" | "coach" | "settings";
@@ -44,6 +50,8 @@ interface ChatMessage {
   role: "user" | "assistant";
   text: string;
   proposals?: CoachUpdateProposal[];
+  hiddenInUI?: boolean;
+  stageLabel?: string;
 }
 
 const GEMINI_MODEL_OPTIONS = [
@@ -228,11 +236,25 @@ export default function App() {
   const [loadingDetail, setLoadingDetail] = useState(false);
 
   const [draftConfig, setDraftConfig] = useState<AthleteConfig | null>(null);
+  const [draftProfile, setDraftProfile] = useState<UserProfile | null>(null);
   const [showOnboarding, setShowOnboarding] = useState(false);
+  const [onboardingKey, setOnboardingKey] = useState(0);
+  const [showToolsMenu, setShowToolsMenu] = useState(false);
+  const [justCompletedGuidedSetup, setJustCompletedGuidedSetup] = useState(false);
   const [ledgerNotice, setLedgerNotice] = useState<string | null>(null);
   const [paceFloorInput, setPaceFloorInput] = useState("");
+  const [vt1PaceInput, setVt1PaceInput] = useState("");
+  const [vt2PaceInput, setVt2PaceInput] = useState("");
+  const [fresh1kmInput, setFresh1kmInput] = useState("");
+  const [compromised1kmInput, setCompromised1kmInput] = useState("");
+  const [hyroxTargetTimeInput, setHyroxTargetTimeInput] = useState("");
+  const [showSettingsGeminiKey, setShowSettingsGeminiKey] = useState(false);
+  const [geminiVerifyBusy, setGeminiVerifyBusy] = useState(false);
+  const [geminiVerifyStatus, setGeminiVerifyStatus] = useState<{ ok: boolean; text: string } | null>(null);
+  const [confirmCleanSlate, setConfirmCleanSlate] = useState(false);
+  const [cleanSlateBusy, setCleanSlateBusy] = useState(false);
 
-  const [appVersion, setAppVersion] = useState<string>("0.2.2-beta");
+  const [appVersion, setAppVersion] = useState<string>("0.2.3-beta");
   const [availableUpdate, setAvailableUpdate] = useState<Update | null>(null);
   const [updateStatus, setUpdateStatus] = useState<string | null>(null);
   const [updateChecking, setUpdateChecking] = useState(false);
@@ -244,9 +266,45 @@ export default function App() {
     const data = await invoke<BootstrapState>("get_bootstrap_state");
     setState(data);
     setDraftConfig(data.athlete_config);
+    const loadedProfile: UserProfile = data.user_profile ?? {
+      athlete_type: "runner",
+      onboarding_completed: false,
+      runner_config: {
+        primary_distance: null,
+        hr_first_governor: true,
+        pace_floor_sec_per_km: null,
+        z2_range_bpm: null,
+        z3_range_bpm: null,
+        lthr_bpm: null,
+        vt1_bpm: null,
+        vt2_bpm: null,
+        vt1_pace_sec_per_km: null,
+        vt2_pace_sec_per_km: null,
+        max_hr_bpm: null,
+        resting_hr_bpm: null,
+      },
+      hyrox_config: {
+        division: null,
+        watch_logging_mode: null,
+        target_total_time_sec: null,
+        fresh_1km_pace_sec: null,
+        compromised_1km_target_sec: null,
+        weak_stations: [],
+      },
+    };
+    setDraftProfile(loadedProfile);
     const sec = data.athlete_config.medical.minPaceSecPerKm;
     setPaceFloorInput(
       sec && sec > 0 ? `${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, "0")}` : ""
+    );
+    setVt1PaceInput(formatMmSsOptional(loadedProfile.runner_config.vt1_pace_sec_per_km));
+    setVt2PaceInput(formatMmSsOptional(loadedProfile.runner_config.vt2_pace_sec_per_km));
+    setFresh1kmInput(formatMmSsOptional(loadedProfile.hyrox_config.fresh_1km_pace_sec));
+    setCompromised1kmInput(formatMmSsOptional(loadedProfile.hyrox_config.compromised_1km_target_sec));
+    setHyroxTargetTimeInput(
+      loadedProfile.hyrox_config.target_total_time_sec && loadedProfile.hyrox_config.target_total_time_sec > 0
+        ? formatDuration(loadedProfile.hyrox_config.target_total_time_sec)
+        : ""
     );
   }
 
@@ -307,6 +365,17 @@ export default function App() {
     void reload();
     void getVersion().then(setAppVersion).catch(() => {});
     void runUpdateCheck(true);
+  }, []);
+
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && e.key === ",") {
+        e.preventDefault();
+        setTab("settings");
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
   }, []);
 
   useEffect(() => {
@@ -388,6 +457,7 @@ export default function App() {
     };
     return (
       <OnboardingWizard
+        key={onboardingKey}
         initialConfig={draftConfig}
         initialProfile={defaultProfile}
         initialModelSettings={state.model_settings}
@@ -407,7 +477,7 @@ export default function App() {
     );
   }
 
-  if (!state.has_garmin_key) {
+  if (!state.has_garmin_key && !state.user_profile?.onboarding_completed) {
     return (
       <div className="onboarding card">
         {onboardStep === 1 && (
@@ -543,13 +613,16 @@ export default function App() {
     setTimeout(() => setCopiedPacket(false), 1500);
   }
 
-  async function sendPrompt(promptText: string) {
+  async function sendPrompt(
+    promptText: string,
+    opts?: { hiddenInUI?: boolean; stageLabel?: string }
+  ) {
     const trimmed = promptText.trim();
     if (!trimmed || busy) return;
     setCoachError(null);
     setMessages((prev) => [
       ...prev,
-      { role: "user", text: trimmed },
+      { role: "user", text: trimmed, hiddenInUI: opts?.hiddenInUI, stageLabel: opts?.stageLabel },
       { role: "assistant", text: "" },
     ]);
     setBusy(true);
@@ -562,6 +635,7 @@ export default function App() {
         proposals?: CoachUpdateProposal[];
       }>("send_coach_message", { prompt: trimmed });
 
+      const proposals = res.proposals ?? [];
       setMessages((prev) => {
         const next = [...prev];
         const idx = next.length - 1;
@@ -570,7 +644,7 @@ export default function App() {
             next[idx] = {
               role: "assistant",
               text: res.text || next[idx].text,
-              proposals: res.proposals ?? [],
+              proposals,
             };
           } else {
             if (res.packet) void navigator.clipboard.writeText(res.packet);
@@ -582,6 +656,14 @@ export default function App() {
         }
         return next;
       });
+      const firstPending = proposals.find((p) => p.status === "pending_user_approval");
+      if (firstPending) {
+        requestAnimationFrame(() => {
+          document
+            .getElementById(`proposal-${firstPending.id}`)
+            ?.scrollIntoView({ behavior: "smooth", block: "start" });
+        });
+      }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       setCoachError(msg);
@@ -667,9 +749,12 @@ export default function App() {
         count > 0
           ? `I uploaded ${count} file(s) for intake (${firstUseState.queued_intake_files.map((f) => f.file_name).join(", ")}). `
           : "I have no additional files to upload right now. ";
-      const prompt = `${fileSummary}Please review my onboarding profile, ask about or clarify my advanced guardrails (HR-First Governor, Hard Pace Floor, rest spacing), and prepare ONE consolidated COACH_PROFILE.md proposal for my approval.`;
+      const prompt = `${fileSummary}Please review my onboarding profile, ask about or clarify my advanced guardrails (HR-First Governor, Hard Pace Floor, rest spacing), and prepare ONE consolidated COACH_PROFILE.md proposal (including structured profile_thresholds) for my approval.`;
       setBusy(false);
-      await sendPrompt(prompt);
+      await sendPrompt(prompt, {
+        hiddenInUI: true,
+        stageLabel: "Stage 2 · Synthesizing Athlete Profile",
+      });
     } catch (err) {
       setCoachError(err instanceof Error ? err.message : String(err));
       setBusy(false);
@@ -688,6 +773,15 @@ export default function App() {
       await invoke("complete_history_sync_stage", { runGarminSync });
       setSyncProgressMsg(null);
       await reload();
+      setMessages((prev) => [
+        ...prev,
+        {
+          role: "user",
+          text: "",
+          hiddenInUI: true,
+          stageLabel: "Stage 3 · History Sync & Baseline Calibration Complete",
+        },
+      ]);
     } catch (err) {
       setSyncProgressMsg(null);
       setCoachError(err instanceof Error ? err.message : String(err));
@@ -702,19 +796,27 @@ export default function App() {
       ? `My preferred block structure / scheduling constraints: ${trimmed}. `
       : "Use a balanced progressive block structure suited to my recent history. ";
     await sendPrompt(
-      `${prefText}Review my synced lifetime and 365-day history summary and propose ONE consolidated TRAINING_PLAN.md (with structured plan_json) for my approval.`
+      `${prefText}Review my synced lifetime and 365-day history summary and propose ONE consolidated TRAINING_PLAN.md (with structured plan_json) for my approval.`,
+      {
+        hiddenInUI: true,
+        stageLabel: "Stage 4 · Generating Initial Training Plan",
+      }
     );
   }
 
   async function handleProposalDecision(msgIdx: number, propId: string, approve: boolean) {
     const targetProp = messages[msgIdx]?.proposals?.find((p) => p.id === propId);
     if (!targetProp) return;
+    const wasPlanApproval =
+      approve &&
+      targetProp.target_file === "TRAINING_PLAN.md" &&
+      firstUseStage === "plan_approval";
     if (approve) {
       await invoke("apply_coach_proposal", { proposal: targetProp });
       await reload();
     }
-    setMessages((prev) =>
-      prev.map((m, i) =>
+    setMessages((prev) => {
+      const updated = prev.map((m, i) =>
         i !== msgIdx
           ? m
           : {
@@ -723,8 +825,23 @@ export default function App() {
                 p.id === propId ? { ...p, status: approve ? "applied" : "dismissed" } : p
               ),
             }
-      )
-    );
+      );
+      if (wasPlanApproval) {
+        updated.push({
+          role: "assistant",
+          text:
+            "Setup complete — your profile and training block are now active.\n\n" +
+            "- **Today**: Check daily readiness gatekeeper status, HR ceiling, and your prescribed session.\n" +
+            "- **Activities**: Review synced Garmin runs/HYROX splits, .fit telemetry, and Garmin notes.\n" +
+            "- **Coach**: Ask questions anytime or run weekly/monthly block reviews from the Tools menu.",
+        });
+      }
+      return updated;
+    });
+    if (wasPlanApproval) {
+      setJustCompletedGuidedSetup(true);
+      setTimeout(() => setJustCompletedGuidedSetup(false), 2000);
+    }
   }
 
   const stageSteps: { id: FirstUseStage; label: string }[] = [
@@ -754,10 +871,24 @@ export default function App() {
         <button className={`nav-btn ${tab === "coach" ? "active" : ""}`} onClick={() => setTab("coach")}>
           <MessageSquare size={16} /> Coach
         </button>
-        <button className={`nav-btn ${tab === "settings" ? "active" : ""}`} onClick={() => setTab("settings")}>
-          <Settings size={16} /> Settings
-        </button>
-        <div style={{ marginTop: "auto", padding: 8 }}>
+        <div
+          style={{
+            marginTop: "auto",
+            padding: 8,
+            borderTop: "1px solid var(--border)",
+            display: "flex",
+            flexDirection: "column",
+            gap: 6,
+          }}
+        >
+          <button
+            className={`nav-btn ${tab === "settings" ? "active" : ""}`}
+            onClick={() => setTab("settings")}
+          >
+            <Settings size={16} />
+            <span>Settings</span>
+            <span className="muted" style={{ marginLeft: "auto", fontSize: 11 }}>Ctrl+,</span>
+          </button>
           <button
             className="secondary"
             style={{ width: "100%", display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }}
@@ -953,16 +1084,16 @@ export default function App() {
         {tab === "coach" && (
           <div className="card">
             <div className="card-header">
-              <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
-                <strong>Living Coach</strong>
-                <span className="pill green">
+              <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap", minWidth: 0 }}>
+                <strong className="header-nowrap">Living Coach</strong>
+                <span className="pill green header-nowrap">
                   {state.engine_mode === "gemini_api" ? "Gemini API" : "Clipboard Packet"}
                 </span>
 
                 <div className="model-pill-wrap">
                   <button
                     type="button"
-                    className="model-pill-btn"
+                    className="model-pill-btn header-nowrap"
                     onClick={() => setShowModelPopover((v) => !v)}
                   >
                     <span>{coachPillText}</span>
@@ -1048,49 +1179,10 @@ export default function App() {
 
                 {ledgerNotice && <span className="pill">{ledgerNotice}</span>}
               </div>
-              <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+              <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
                 <button
-                  className="secondary"
-                  style={{ display: "flex", alignItems: "center", gap: 6 }}
-                  onClick={async () => {
-                    const selected = await open({
-                      multiple: false,
-                      filters: [{ name: "Training Ledger", extensions: ["txt", "md"] }],
-                    });
-                    if (typeof selected === "string" && selected) {
-                      try {
-                        const lines = await invoke<number>("import_training_ledger", { sourcePath: selected });
-                        setLedgerNotice(`Imported ledger (${lines} lines)`);
-                      } catch (err) {
-                        setLedgerNotice(`Import error: ${err instanceof Error ? err.message : String(err)}`);
-                      }
-                    }
-                  }}
-                >
-                  <Upload size={14} /> Import Ledger
-                </button>
-                <button
-                  className="secondary"
-                  style={{ display: "flex", alignItems: "center", gap: 6 }}
-                  onClick={async () => {
-                    const target = await save({
-                      defaultPath: "ASPI_Training_Log.txt",
-                      filters: [{ name: "Training Ledger", extensions: ["txt", "md"] }],
-                    });
-                    if (target) {
-                      try {
-                        const lines = await invoke<number>("export_training_ledger", { targetPath: target });
-                        setLedgerNotice(`Exported ledger (${lines} lines)`);
-                      } catch (err) {
-                        setLedgerNotice(`Export error: ${err instanceof Error ? err.message : String(err)}`);
-                      }
-                    }
-                  }}
-                >
-                  <Download size={14} /> Export Ledger
-                </button>
-                <button
-                  className="secondary"
+                  type="button"
+                  className="secondary header-nowrap"
                   style={{ display: "flex", alignItems: "center", gap: 6 }}
                   disabled={busy || messages.length === 0}
                   onClick={() => setMessages([])}
@@ -1098,15 +1190,108 @@ export default function App() {
                   <SquarePen size={14} /> New Chat
                 </button>
                 <button
-                  className="secondary"
+                  type="button"
+                  className="secondary header-nowrap"
                   style={{ display: "flex", alignItems: "center", gap: 6 }}
                   onClick={handleCopyPacket}
                 >
                   {copiedPacket ? <Check size={14} /> : <Clipboard size={14} />}
                   {copiedPacket ? "Copied" : "Copy Coach Packet"}
                 </button>
+                <div className="tools-menu-wrap">
+                  <button
+                    type="button"
+                    className="secondary header-nowrap"
+                    aria-label="Coach Tools"
+                    style={{ display: "flex", alignItems: "center", gap: 5 }}
+                    onClick={() => setShowToolsMenu((v) => !v)}
+                  >
+                    <MoreHorizontal size={14} /> Tools
+                  </button>
+                  {showToolsMenu && (
+                    <div className="tools-popover">
+                      <button
+                        type="button"
+                        className="secondary"
+                        disabled={busy}
+                        onClick={() => {
+                          setShowToolsMenu(false);
+                          void sendPrompt(
+                            "Run a weekly training block review across my last 7 days: mileage, readiness compliance, aerobic decoupling, shoe rotation, and recommended adjustments."
+                          );
+                        }}
+                      >
+                        <Sparkles size={13} style={{ marginRight: 6 }} /> Weekly Review
+                      </button>
+                      <button
+                        type="button"
+                        className="secondary"
+                        disabled={busy}
+                        onClick={() => {
+                          setShowToolsMenu(false);
+                          void sendPrompt(
+                            "Run a monthly training block audit across my trailing 28–30 days: volume progression, VT1 ceiling adherence, fatigue trends, and next mesocycle recommendations."
+                          );
+                        }}
+                      >
+                        <Sparkles size={13} style={{ marginRight: 6 }} /> Monthly Review
+                      </button>
+                      <button
+                        type="button"
+                        className="secondary"
+                        onClick={async () => {
+                          setShowToolsMenu(false);
+                          const selected = await open({
+                            multiple: false,
+                            filters: [{ name: "Training Ledger", extensions: ["txt", "md"] }],
+                          });
+                          if (typeof selected === "string" && selected) {
+                            try {
+                              const lines = await invoke<number>("import_training_ledger", { sourcePath: selected });
+                              setLedgerNotice(`Imported ledger (${lines} lines)`);
+                            } catch (err) {
+                              setLedgerNotice(`Import error: ${err instanceof Error ? err.message : String(err)}`);
+                            }
+                          }
+                        }}
+                      >
+                        <Upload size={13} style={{ marginRight: 6 }} /> Import Ledger
+                      </button>
+                      <button
+                        type="button"
+                        className="secondary"
+                        onClick={async () => {
+                          setShowToolsMenu(false);
+                          const target = await save({
+                            defaultPath: "ASPI_Training_Log.txt",
+                            filters: [{ name: "Training Ledger", extensions: ["txt", "md"] }],
+                          });
+                          if (target) {
+                            try {
+                              const lines = await invoke<number>("export_training_ledger", { targetPath: target });
+                              setLedgerNotice(`Exported ledger (${lines} lines)`);
+                            } catch (err) {
+                              setLedgerNotice(`Export error: ${err instanceof Error ? err.message : String(err)}`);
+                            }
+                          }
+                        }}
+                      >
+                        <Download size={13} style={{ marginRight: 6 }} /> Export Ledger
+                      </button>
+                    </div>
+                  )}
+                </div>
               </div>
             </div>
+
+            {justCompletedGuidedSetup && !isGuidedFirstUse && (
+              <div
+                className="pill green"
+                style={{ marginBottom: 12, display: "inline-flex", alignItems: "center", gap: 6 }}
+              >
+                <Check size={13} /> Setup Complete ✓
+              </div>
+            )}
 
             {isGuidedFirstUse && (
               <div style={{ marginBottom: 14 }}>
@@ -1291,57 +1476,78 @@ export default function App() {
               </div>
             )}
 
-            {messages.length === 0 && !isGuidedFirstUse && (
-              <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 12 }}>
-                {(state.user_profile?.athlete_type === "hyrox" ||
-                state.user_profile?.athlete_type === "hybrid_both"
-                  ? [
-                      {
-                        label: "Analyze compromised 1km run decay",
-                        prompt:
-                          "Analyze my latest HYROX / hybrid session's compromised 1km run decay and clean running efficiency.",
-                      },
-                      {
-                        label: "Audit Run vs. Station split ratio",
-                        prompt:
-                          "Audit my Run vs. Station split ratio and Roxzone transitions from my latest HYROX sim.",
-                      },
-                      {
-                        label: "Target weakest station session",
-                        prompt:
-                          "Design a targeted session for my weakest HYROX stations without compromising my aerobic running base.",
-                      },
-                      {
-                        label: "Today's readiness check",
-                        prompt: "Check today's gatekeeper readiness, recovery status, and recommended session.",
-                      },
-                    ]
-                  : [
-                      {
-                        label: "Analyze last run",
-                        prompt: "Analyze my latest run in detail, including splits, heart rate drift, and pacing.",
-                      },
-                      {
-                        label: "Today's readiness check",
-                        prompt: "Check today's gatekeeper readiness, recovery status, and recommended session.",
-                      },
-                      {
-                        label: "Lifetime & 365d history",
-                        prompt: "Review my lifetime training overview and trailing 365-day block audit.",
-                      },
-                    ]
-                ).map((q) => (
-                  <button
-                    key={q.label}
-                    className="secondary"
-                    disabled={busy}
-                    onClick={() => setChatInput(q.prompt)}
-                  >
-                    {q.label}
-                  </button>
-                ))}
-              </div>
-            )}
+            {messages.length === 0 && !isGuidedFirstUse && (() => {
+              const runnerChips = [
+                {
+                  tag: "Runner",
+                  label: "Analyze last run",
+                  prompt: "Analyze my latest run in detail, including splits, heart rate drift, and pacing.",
+                },
+                {
+                  tag: "Runner",
+                  label: "Today's readiness check",
+                  prompt: "Check today's gatekeeper readiness, recovery status, and recommended session.",
+                },
+                {
+                  tag: "Runner",
+                  label: "Audit aerobic decoupling & VT1",
+                  prompt: "Audit aerobic decoupling, cardiac drift, and VT1 ceiling compliance across my recent easy runs.",
+                },
+                {
+                  tag: "Runner",
+                  label: "Lifetime & 365d history",
+                  prompt: "Review my lifetime training overview and trailing 365-day block audit.",
+                },
+              ];
+              const hyroxChips = [
+                {
+                  tag: "HYROX",
+                  label: "Analyze compromised 1km run decay",
+                  prompt:
+                    "Analyze my latest HYROX / hybrid session's compromised 1km run decay and clean running efficiency.",
+                },
+                {
+                  tag: "HYROX",
+                  label: "Audit Run vs. Station split ratio",
+                  prompt:
+                    "Audit my Run vs. Station split ratio and Roxzone transitions from my latest HYROX sim.",
+                },
+                {
+                  tag: "HYROX",
+                  label: "Target weakest station session",
+                  prompt:
+                    "Design a targeted session for my weakest HYROX stations without compromising my aerobic running base.",
+                },
+                {
+                  tag: "HYROX",
+                  label: "Compare dual-benchmark 1km splits",
+                  prompt:
+                    "Compare my fresh 1km pace against compromised 1km race splits and estimate station fatigue cost.",
+                },
+              ];
+              const isHyroxFirst =
+                state.user_profile?.athlete_type === "hyrox" ||
+                state.user_profile?.athlete_type === "hybrid_both";
+              const chips = isHyroxFirst
+                ? [...hyroxChips, ...runnerChips]
+                : [...runnerChips, ...hyroxChips];
+              return (
+                <div className="starter-chips-grid" style={{ marginBottom: 12 }}>
+                  {chips.map((q) => (
+                    <button
+                      key={`${q.tag}-${q.label}`}
+                      type="button"
+                      className="starter-chip-btn"
+                      disabled={busy}
+                      onClick={() => setChatInput(q.prompt)}
+                    >
+                      <span className="starter-chip-tag">{q.tag}</span>
+                      <span>{q.label}</span>
+                    </button>
+                  ))}
+                </div>
+              );
+            })()}
 
             {liveToolLabel && (
               <div className="pill amber" style={{ marginBottom: 12 }}>
@@ -1349,62 +1555,91 @@ export default function App() {
               </div>
             )}
 
-            <div className="chat-box">
-              {messages.map((m, i) => (
-                <div key={i} className={`bubble ${m.role}`}>
-                  <div>{m.text || (busy && m.role === "assistant" ? "Thinking…" : "")}</div>
-                  {m.proposals?.map((p) => {
-                    const approveLabel =
-                      p.target_file === "COACH_PROFILE.md" && firstUseStage === "profile_approval"
-                        ? "Approve Initial Profile"
-                        : p.target_file === "TRAINING_PLAN.md" && firstUseStage === "plan_approval"
-                        ? "Approve Training Plan"
-                        : "Approve & Apply";
-                    return (
-                      <div key={p.id} className="proposal-card">
-                        <div className="proposal-header">
-                          <div>
-                            <div className="proposal-title">{p.target_file}</div>
-                            <div className="muted" style={{ fontSize: 12.5, marginTop: 2 }}>
-                              {p.reason}
-                            </div>
-                          </div>
-                          <span className={`pill ${p.status === "applied" ? "green" : p.status === "dismissed" ? "" : "accent"}`}>
-                            {p.status === "pending_user_approval" ? "Pending Approval" : p.status}
-                          </span>
-                        </div>
-                        {p.expires_on && (
-                          <div className="muted" style={{ marginBottom: 8 }}>
-                            Expires: {p.expires_on}
-                          </div>
-                        )}
-                        <MarkdownPreview markdown={p.updated_section_markdown || p.diff_preview} />
-                        <details className="raw-diff-details">
-                          <summary>View Raw Diff</summary>
-                          <pre className="raw-diff-pre">{p.diff_preview}</pre>
-                        </details>
-                        {p.status === "pending_user_approval" && (
-                          <div style={{ display: "flex", gap: 8, marginTop: 12 }}>
-                            <button
-                              className="primary"
-                              onClick={() => void handleProposalDecision(i, p.id, true)}
-                            >
-                              {approveLabel}
-                            </button>
-                            <button
-                              className="secondary"
-                              onClick={() => void handleProposalDecision(i, p.id, false)}
-                            >
-                              Dismiss
-                            </button>
-                          </div>
-                        )}
+            {(() => {
+              const pendingProposals = messages.flatMap((m) =>
+                (m.proposals ?? []).filter((p) => p.status === "pending_user_approval")
+              );
+              return (
+                <div className="chat-box">
+                  {pendingProposals.length > 0 && (
+                    <button
+                      type="button"
+                      className="pending-jump-pill"
+                      onClick={() =>
+                        document
+                          .getElementById(`proposal-${pendingProposals[0].id}`)
+                          ?.scrollIntoView({ behavior: "smooth", block: "start" })
+                      }
+                    >
+                      <ArrowUp size={13} />
+                      {pendingProposals.length === 1
+                        ? "1 Proposal Pending"
+                        : `${pendingProposals.length} Proposals Pending`}
+                    </button>
+                  )}
+                  {messages.map((m, i) =>
+                    m.hiddenInUI ? (
+                      <div key={i} className="stage-divider-pill">
+                        {m.stageLabel ?? "Guided Setup Step"}
                       </div>
-                    );
-                  })}
+                    ) : (
+                      <div key={i} className={`bubble ${m.role}`}>
+                        <div>{m.text || (busy && m.role === "assistant" ? "Thinking…" : "")}</div>
+                        {m.proposals?.map((p) => {
+                          const approveLabel =
+                            p.target_file === "COACH_PROFILE.md" && firstUseStage === "profile_approval"
+                              ? "Approve Initial Profile"
+                              : p.target_file === "TRAINING_PLAN.md" && firstUseStage === "plan_approval"
+                              ? "Approve Training Plan"
+                              : "Approve & Apply";
+                          return (
+                            <div key={p.id} id={`proposal-${p.id}`} className="proposal-card">
+                              <div className="proposal-header">
+                                <div>
+                                  <div className="proposal-title">{p.target_file}</div>
+                                  <div className="muted" style={{ fontSize: 12.5, marginTop: 2 }}>
+                                    {p.reason}
+                                  </div>
+                                </div>
+                                <span className={`pill ${p.status === "applied" ? "green" : p.status === "dismissed" ? "" : "accent"}`}>
+                                  {p.status === "pending_user_approval" ? "Pending Approval" : p.status}
+                                </span>
+                              </div>
+                              {p.expires_on && (
+                                <div className="muted" style={{ marginBottom: 8 }}>
+                                  Expires: {p.expires_on}
+                                </div>
+                              )}
+                              <MarkdownPreview markdown={p.updated_section_markdown || p.diff_preview} />
+                              <details className="raw-diff-details">
+                                <summary>View Raw Diff</summary>
+                                <pre className="raw-diff-pre">{p.diff_preview}</pre>
+                              </details>
+                              {p.status === "pending_user_approval" && (
+                                <div style={{ display: "flex", gap: 8, marginTop: 12 }}>
+                                  <button
+                                    className="primary"
+                                    onClick={() => void handleProposalDecision(i, p.id, true)}
+                                  >
+                                    {approveLabel}
+                                  </button>
+                                  <button
+                                    className="secondary"
+                                    onClick={() => void handleProposalDecision(i, p.id, false)}
+                                  >
+                                    Dismiss
+                                  </button>
+                                </div>
+                              )}
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )
+                  )}
                 </div>
-              ))}
-            </div>
+              );
+            })()}
 
             <div style={{ display: "flex", gap: 10, marginTop: 14 }}>
               <input
@@ -1515,278 +1750,711 @@ export default function App() {
                 Gemini API Key (Windows Credential Manager):{" "}
                 <strong>{state.has_gemini_key ? "Saved" : "Not set (Clipboard Packet mode)"}</strong>
               </div>
-              <div style={{ display: "flex", gap: 10 }}>
+              <div className="key-input-group">
                 <input
-                  type="password"
-                  placeholder="Gemini API key"
+                  type={showSettingsGeminiKey ? "text" : "password"}
+                  placeholder={state.has_gemini_key ? "Saved (paste new key to replace)" : "AIza..."}
                   value={geminiKeyInput}
-                  onChange={(e) => setGeminiKeyInput(e.target.value)}
+                  onChange={(e) => {
+                    setGeminiKeyInput(e.target.value);
+                    setGeminiVerifyStatus(null);
+                  }}
                 />
                 <button
+                  type="button"
+                  className="secondary"
+                  aria-label={showSettingsGeminiKey ? "Hide Gemini API key" : "Show Gemini API key"}
+                  onClick={() => setShowSettingsGeminiKey((v) => !v)}
+                >
+                  {showSettingsGeminiKey ? <EyeOff size={15} /> : <Eye size={15} />}
+                </button>
+                <button
+                  type="button"
                   className="primary"
+                  disabled={!geminiKeyInput.trim() || geminiVerifyBusy}
                   onClick={async () => {
-                    await invoke("save_gemini_key", { key: geminiKeyInput });
+                    await invoke("save_gemini_key", { key: geminiKeyInput.trim() });
                     setGeminiKeyInput("");
+                    setGeminiVerifyStatus({ ok: true, text: "Saved to Windows Credential Manager." });
                     await reload();
                   }}
                 >
-                  Save Key
+                  Save
+                </button>
+                <button
+                  type="button"
+                  className="secondary"
+                  disabled={geminiVerifyBusy || (!geminiKeyInput.trim() && !state.has_gemini_key)}
+                  onClick={async () => {
+                    setGeminiVerifyBusy(true);
+                    setGeminiVerifyStatus(null);
+                    try {
+                      const candidate = geminiKeyInput.trim();
+                      const res = await invoke<{ ok: boolean; http_status: number; message?: string; persisted?: boolean }>(
+                        "verify_gemini_key",
+                        {
+                          key: candidate ? candidate : null,
+                          persist: Boolean(candidate),
+                        }
+                      );
+                      setGeminiVerifyStatus({
+                        ok: true,
+                        text: res.message || `Connected (HTTP ${res.http_status})`,
+                      });
+                      if (candidate) {
+                        setGeminiKeyInput("");
+                        await reload();
+                      }
+                    } catch (err) {
+                      setGeminiVerifyStatus({
+                        ok: false,
+                        text: err instanceof Error ? err.message : String(err),
+                      });
+                    } finally {
+                      setGeminiVerifyBusy(false);
+                    }
+                  }}
+                >
+                  {geminiVerifyBusy ? "Verifying…" : "Verify"}
+                </button>
+                <button
+                  type="button"
+                  className="secondary"
+                  disabled={geminiVerifyBusy || (!state.has_gemini_key && !geminiKeyInput)}
+                  onClick={async () => {
+                    await invoke("save_gemini_key", { key: "" });
+                    setGeminiKeyInput("");
+                    setGeminiVerifyStatus({ ok: true, text: "Gemini API key cleared." });
+                    await reload();
+                  }}
+                >
+                  Clear
                 </button>
               </div>
-            </div>
-
-            <div className="card">
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
-                <h3 style={{ margin: 0 }}>Athlete Profile</h3>
-                <button className="secondary" onClick={() => setShowOnboarding(true)}>
-                  Edit Athlete Profile / Re-run Onboarding
-                </button>
-              </div>
-              <div className="form-row">
-                <div>
-                  <label className="muted">Display Name</label>
-                  <input
-                    value={draftConfig.specs.displayName}
-                    onChange={(e) =>
-                      setDraftConfig({ ...draftConfig, specs: { ...draftConfig.specs, displayName: e.target.value } })
-                    }
-                  />
-                </div>
-                <div>
-                  <label className="muted">Goal Type</label>
-                  <select
-                    value={draftConfig.objective.goalType}
-                    onChange={(e) =>
-                      setDraftConfig({
-                        ...draftConfig,
-                        objective: { ...draftConfig.objective, goalType: e.target.value as GoalType },
-                      })
-                    }
-                  >
-                    <option value="general_fitness">General Fitness</option>
-                    <option value="base_building">Base Building</option>
-                    <option value="race">Target Race</option>
-                    <option value="return_from_injury">Return from Injury</option>
-                    <option value="hybrid_hyrox">Hyrox / Hybrid Athlete</option>
-                  </select>
-                </div>
-              </div>
-              <div className="form-row">
-                <div>
-                  <label className="muted">Goal Time (optional)</label>
-                  <input
-                    placeholder="Optional — leave blank if goal is to finish"
-                    value={draftConfig.objective.targetTimeDescription ?? ""}
-                    onChange={(e) =>
-                      setDraftConfig({
-                        ...draftConfig,
-                        objective: {
-                          ...draftConfig.objective,
-                          targetTimeDescription: e.target.value.trim() ? e.target.value : null,
-                        },
-                      })
-                    }
-                  />
-                </div>
-                <div>
-                  <label className="muted">VT1 Ceiling (bpm)</label>
-                  <input
-                    type="number"
-                    value={draftConfig.specs.vt1CeilingBPM ?? ""}
-                    onChange={(e) =>
-                      setDraftConfig({
-                        ...draftConfig,
-                        specs: { ...draftConfig.specs, vt1CeilingBPM: e.target.value ? Number(e.target.value) : null },
-                      })
-                    }
-                  />
-                </div>
-              </div>
-              {draftConfig.objective.goalType === "hybrid_hyrox" && (
-                <div className="form-row" style={{ marginTop: 10 }}>
-                  <div>
-                    <label className="muted">Hyrox Division</label>
-                    <input
-                      placeholder="e.g. Open Men, Pro Women, Doubles"
-                      value={draftConfig.objective.hybridProfile?.division ?? ""}
-                      onChange={(e) =>
-                        setDraftConfig({
-                          ...draftConfig,
-                          objective: {
-                            ...draftConfig.objective,
-                            hybridProfile: {
-                              division: e.target.value || null,
-                              focusStations: draftConfig.objective.hybridProfile?.focusStations ?? [],
-                              weeklyHybridSessionsTarget:
-                                draftConfig.objective.hybridProfile?.weeklyHybridSessionsTarget ?? 3,
-                            },
-                          },
-                        })
-                      }
-                    />
-                  </div>
-                  <div>
-                    <label className="muted">Focus Stations (comma-separated)</label>
-                    <input
-                      placeholder="e.g. Sled Push, Wall Balls, SkiErg"
-                      value={(draftConfig.objective.hybridProfile?.focusStations ?? []).join(", ")}
-                      onChange={(e) =>
-                        setDraftConfig({
-                          ...draftConfig,
-                          objective: {
-                            ...draftConfig.objective,
-                            hybridProfile: {
-                              division: draftConfig.objective.hybridProfile?.division ?? null,
-                              focusStations: e.target.value
-                                .split(",")
-                                .map((s) => s.trim())
-                                .filter(Boolean),
-                              weeklyHybridSessionsTarget:
-                                draftConfig.objective.hybridProfile?.weeklyHybridSessionsTarget ?? 3,
-                            },
-                          },
-                        })
-                      }
-                    />
-                  </div>
-                  <div>
-                    <label className="muted">Hybrid Sessions / Week</label>
-                    <input
-                      type="number"
-                      value={draftConfig.objective.hybridProfile?.weeklyHybridSessionsTarget ?? ""}
-                      onChange={(e) =>
-                        setDraftConfig({
-                          ...draftConfig,
-                          objective: {
-                            ...draftConfig.objective,
-                            hybridProfile: {
-                              division: draftConfig.objective.hybridProfile?.division ?? null,
-                              focusStations: draftConfig.objective.hybridProfile?.focusStations ?? [],
-                              weeklyHybridSessionsTarget: e.target.value ? Number(e.target.value) : null,
-                            },
-                          },
-                        })
-                      }
-                    />
-                  </div>
+              {geminiVerifyStatus && (
+                <div
+                  className={geminiVerifyStatus.ok ? "key-status-ok" : "key-status-err"}
+                  style={{ marginTop: 8 }}
+                >
+                  {geminiVerifyStatus.text}
                 </div>
               )}
+            </div>
 
-              <div style={{ borderTop: "1px solid var(--border)", paddingTop: 12, marginTop: 12 }}>
-                <h4 style={{ margin: "0 0 8px" }}>Advanced · Pace &amp; HR Guardrails</h4>
-                <div className="form-row">
-                  <div>
-                    <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13, marginBottom: 6 }}>
+            {(() => {
+              const activeProfile: UserProfile = draftProfile ??
+                state.user_profile ?? {
+                  athlete_type: "runner",
+                  onboarding_completed: true,
+                  runner_config: {
+                    primary_distance: null,
+                    hr_first_governor: true,
+                    pace_floor_sec_per_km: null,
+                    z2_range_bpm: null,
+                    z3_range_bpm: null,
+                    lthr_bpm: null,
+                    vt1_bpm: null,
+                    vt2_bpm: null,
+                    vt1_pace_sec_per_km: null,
+                    vt2_pace_sec_per_km: null,
+                    max_hr_bpm: null,
+                    resting_hr_bpm: null,
+                  },
+                  hyrox_config: {
+                    division: null,
+                    watch_logging_mode: null,
+                    target_total_time_sec: null,
+                    fresh_1km_pace_sec: null,
+                    compromised_1km_target_sec: null,
+                    weak_stations: [],
+                  },
+                };
+              const showRunner =
+                activeProfile.athlete_type === "runner" || activeProfile.athlete_type === "hybrid_both";
+              const showHyrox =
+                activeProfile.athlete_type === "hyrox" || activeProfile.athlete_type === "hybrid_both";
+              const divisionValue =
+                activeProfile.hyrox_config.division ??
+                draftConfig.objective.hybridProfile?.division ??
+                "Men Open";
+              const standardDivisions = [
+                "Men Open",
+                "Men Pro",
+                "Women Open",
+                "Women Pro",
+                "Doubles",
+                "Relay",
+              ];
+              const watchModeValue = activeProfile.hyrox_config.watch_logging_mode ?? "Manual Laps";
+              const standardWatchModes = [
+                "Manual Laps",
+                "Multisport/Cardio",
+                "Connect IQ ROXFIT/RoxTrack",
+              ];
+              const setZoneBound = (zone: "z2" | "z3", idx: 0 | 1, raw: string) => {
+                const parsed = raw.trim() ? Number(raw) : null;
+                const prev =
+                  zone === "z2" ? activeProfile.runner_config.z2_range_bpm : activeProfile.runner_config.z3_range_bpm;
+                const nextPair: [number, number] | null =
+                  parsed === null && (!prev || prev[idx === 0 ? 1 : 0] === 0)
+                    ? null
+                    : idx === 0
+                    ? [parsed ?? 0, prev?.[1] ?? parsed ?? 0]
+                    : [prev?.[0] ?? parsed ?? 0, parsed ?? 0];
+                setDraftProfile({
+                  ...activeProfile,
+                  runner_config: {
+                    ...activeProfile.runner_config,
+                    ...(zone === "z2" ? { z2_range_bpm: nextPair } : { z3_range_bpm: nextPair }),
+                  },
+                });
+              };
+              return (
+                <div className="card">
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12, flexWrap: "wrap", gap: 8 }}>
+                    <h3 style={{ margin: 0 }}>Athlete Profile</h3>
+                    <button className="secondary" onClick={() => setShowOnboarding(true)}>
+                      Edit Athlete Profile / Re-run Onboarding
+                    </button>
+                  </div>
+
+                  <div style={{ marginBottom: 14 }}>
+                    <label className="muted" style={{ display: "block", marginBottom: 6 }}>
+                      Primary Discipline
+                    </label>
+                    <div style={{ display: "inline-flex", gap: 6, flexWrap: "wrap" }}>
+                      {(
+                        [
+                          { id: "runner", label: "Runner" },
+                          { id: "hyrox", label: "HYROX" },
+                          { id: "hybrid_both", label: "Hybrid (Both)" },
+                        ] as { id: AthleteType; label: string }[]
+                      ).map((opt) => (
+                        <button
+                          key={opt.id}
+                          type="button"
+                          className={activeProfile.athlete_type === opt.id ? "primary" : "secondary"}
+                          onClick={() => setDraftProfile({ ...activeProfile, athlete_type: opt.id })}
+                        >
+                          {opt.label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  <div className="form-row">
+                    <div>
+                      <label className="muted">Display Name</label>
                       <input
-                        type="checkbox"
-                        style={{ width: "auto" }}
-                        checked={draftConfig.medical.enforceEasyHRCeiling}
+                        value={draftConfig.specs.displayName}
+                        onChange={(e) =>
+                          setDraftConfig({ ...draftConfig, specs: { ...draftConfig.specs, displayName: e.target.value } })
+                        }
+                      />
+                    </div>
+                    <div>
+                      <label className="muted">Weight (kg)</label>
+                      <input
+                        type="number"
+                        step="0.1"
+                        value={draftConfig.specs.weightKg ?? ""}
+                        onChange={(e) => {
+                          const v = e.target.value ? Number(e.target.value) : null;
+                          setDraftConfig({
+                            ...draftConfig,
+                            specs: {
+                              ...draftConfig.specs,
+                              weightKg: v,
+                              weightBaselineConfirmed: Boolean(v && v > 0),
+                            },
+                          });
+                        }}
+                      />
+                    </div>
+                    <div>
+                      <label className="muted">Goal Type</label>
+                      <select
+                        value={draftConfig.objective.goalType}
                         onChange={(e) =>
                           setDraftConfig({
                             ...draftConfig,
-                            medical: { ...draftConfig.medical, enforceEasyHRCeiling: e.target.checked },
+                            objective: { ...draftConfig.objective, goalType: e.target.value as GoalType },
                           })
                         }
-                      />
-                      HR-First Governor (enforce Easy HR ceiling)
-                    </label>
-                    <input
-                      type="number"
-                      placeholder="Easy HR Ceiling (bpm)"
-                      value={draftConfig.medical.easyHRCeilingBPM ?? ""}
-                      onChange={(e) =>
-                        setDraftConfig({
-                          ...draftConfig,
-                          medical: {
-                            ...draftConfig.medical,
-                            easyHRCeilingBPM: e.target.value ? Number(e.target.value) : null,
-                          },
-                        })
-                      }
-                    />
-                  </div>
-                  <div>
-                    <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13, marginBottom: 6 }}>
+                      >
+                        <option value="general_fitness">General Fitness</option>
+                        <option value="base_building">Base Building</option>
+                        <option value="race">Target Race</option>
+                        <option value="return_from_injury">Return from Injury</option>
+                        <option value="hybrid_hyrox">Hyrox / Hybrid Athlete</option>
+                      </select>
+                    </div>
+                    <div>
+                      <label className="muted">Goal Time (optional)</label>
                       <input
-                        type="checkbox"
-                        style={{ width: "auto" }}
-                        checked={draftConfig.medical.enforcePaceFloor}
+                        placeholder="Optional — leave blank if goal is to finish"
+                        value={draftConfig.objective.targetTimeDescription ?? ""}
                         onChange={(e) =>
                           setDraftConfig({
                             ...draftConfig,
-                            medical: { ...draftConfig.medical, enforcePaceFloor: e.target.checked },
+                            objective: {
+                              ...draftConfig.objective,
+                              targetTimeDescription: e.target.value.trim() ? e.target.value : null,
+                            },
                           })
                         }
                       />
-                      Hard Pace Floor (mm:ss/km)
-                    </label>
-                    <input
-                      placeholder="e.g. 6:30"
-                      value={paceFloorInput}
-                      onChange={(e) => setPaceFloorInput(e.target.value)}
-                    />
+                    </div>
                   </div>
-                  <div>
-                    <label className="muted">Min Rest Between Runs (h)</label>
-                    <input
-                      type="number"
-                      value={draftConfig.medical.minRestHoursBetweenRuns ?? ""}
-                      onChange={(e) =>
-                        setDraftConfig({
-                          ...draftConfig,
-                          medical: {
-                            ...draftConfig.medical,
-                            minRestHoursBetweenRuns: e.target.value ? Number(e.target.value) : null,
-                          },
-                        })
-                      }
-                    />
-                  </div>
-                </div>
-              </div>
 
-              <button
-                className="primary"
-                onClick={async () => {
-                  const parts = paceFloorInput.trim().split(":");
-                  let parsedPaceSec: number | null = draftConfig.medical.minPaceSecPerKm;
-                  if (!paceFloorInput.trim()) {
-                    parsedPaceSec = null;
-                  } else if (parts.length === 2) {
-                    const m = Number(parts[0]);
-                    const s = Number(parts[1]);
-                    if (Number.isFinite(m) && Number.isFinite(s) && m >= 0 && s >= 0 && s < 60) {
-                      parsedPaceSec = Math.round(m * 60 + s);
-                    }
-                  }
-                  const updatedConfig: AthleteConfig = {
-                    ...draftConfig,
-                    medical: {
-                      ...draftConfig.medical,
-                      minPaceSecPerKm: parsedPaceSec,
-                    },
-                  };
-                  await invoke("save_athlete_config", { config: updatedConfig });
-                  if (state.user_profile) {
-                    await invoke("save_user_profile", {
-                      profile: {
-                        ...state.user_profile,
+                  {showRunner && (
+                    <div style={{ borderTop: "1px solid var(--border)", paddingTop: 12, marginTop: 12 }}>
+                      <h4 style={{ margin: "0 0 8px" }}>Runner Thresholds</h4>
+                      <div className="form-row">
+                        <div>
+                          <label className="muted">Primary Distance</label>
+                          <input
+                            placeholder="e.g. Half Marathon, Marathon"
+                            value={activeProfile.runner_config.primary_distance ?? ""}
+                            onChange={(e) =>
+                              setDraftProfile({
+                                ...activeProfile,
+                                runner_config: {
+                                  ...activeProfile.runner_config,
+                                  primary_distance: e.target.value || null,
+                                },
+                              })
+                            }
+                          />
+                        </div>
+                        <div>
+                          <label className="muted">VT1 (bpm)</label>
+                          <input
+                            type="number"
+                            value={activeProfile.runner_config.vt1_bpm ?? draftConfig.specs.vt1CeilingBPM ?? ""}
+                            onChange={(e) => {
+                              const v = e.target.value ? Number(e.target.value) : null;
+                              setDraftConfig({
+                                ...draftConfig,
+                                specs: { ...draftConfig.specs, vt1CeilingBPM: v },
+                              });
+                              setDraftProfile({
+                                ...activeProfile,
+                                runner_config: { ...activeProfile.runner_config, vt1_bpm: v },
+                              });
+                            }}
+                          />
+                        </div>
+                        <div>
+                          <label className="muted">VT2 (bpm)</label>
+                          <input
+                            type="number"
+                            value={activeProfile.runner_config.vt2_bpm ?? ""}
+                            onChange={(e) =>
+                              setDraftProfile({
+                                ...activeProfile,
+                                runner_config: {
+                                  ...activeProfile.runner_config,
+                                  vt2_bpm: e.target.value ? Number(e.target.value) : null,
+                                },
+                              })
+                            }
+                          />
+                        </div>
+                        <div>
+                          <label className="muted">VT1 Pace (mm:ss/km)</label>
+                          <input
+                            placeholder="e.g. 5:00"
+                            value={vt1PaceInput}
+                            onChange={(e) => setVt1PaceInput(e.target.value)}
+                          />
+                        </div>
+                        <div>
+                          <label className="muted">VT2 Pace (mm:ss/km)</label>
+                          <input
+                            placeholder="e.g. 4:15"
+                            value={vt2PaceInput}
+                            onChange={(e) => setVt2PaceInput(e.target.value)}
+                          />
+                        </div>
+                        <div>
+                          <label className="muted">LTHR (bpm)</label>
+                          <input
+                            type="number"
+                            value={activeProfile.runner_config.lthr_bpm ?? ""}
+                            onChange={(e) =>
+                              setDraftProfile({
+                                ...activeProfile,
+                                runner_config: {
+                                  ...activeProfile.runner_config,
+                                  lthr_bpm: e.target.value ? Number(e.target.value) : null,
+                                },
+                              })
+                            }
+                          />
+                        </div>
+                        <div>
+                          <label className="muted">Max HR (bpm)</label>
+                          <input
+                            type="number"
+                            value={activeProfile.runner_config.max_hr_bpm ?? draftConfig.specs.maxHR ?? ""}
+                            onChange={(e) => {
+                              const v = e.target.value ? Number(e.target.value) : null;
+                              setDraftConfig({ ...draftConfig, specs: { ...draftConfig.specs, maxHR: v } });
+                              setDraftProfile({
+                                ...activeProfile,
+                                runner_config: { ...activeProfile.runner_config, max_hr_bpm: v },
+                              });
+                            }}
+                          />
+                        </div>
+                        <div>
+                          <label className="muted">Resting HR (bpm)</label>
+                          <input
+                            type="number"
+                            value={
+                              activeProfile.runner_config.resting_hr_bpm ??
+                              draftConfig.specs.restingHRBaseline ??
+                              ""
+                            }
+                            onChange={(e) => {
+                              const v = e.target.value ? Number(e.target.value) : null;
+                              setDraftConfig({
+                                ...draftConfig,
+                                specs: { ...draftConfig.specs, restingHRBaseline: v },
+                              });
+                              setDraftProfile({
+                                ...activeProfile,
+                                runner_config: { ...activeProfile.runner_config, resting_hr_bpm: v },
+                              });
+                            }}
+                          />
+                        </div>
+                        <div>
+                          <label className="muted">Z2 Min (bpm)</label>
+                          <input
+                            type="number"
+                            value={activeProfile.runner_config.z2_range_bpm?.[0] ?? ""}
+                            onChange={(e) => setZoneBound("z2", 0, e.target.value)}
+                          />
+                        </div>
+                        <div>
+                          <label className="muted">Z2 Max (bpm)</label>
+                          <input
+                            type="number"
+                            value={activeProfile.runner_config.z2_range_bpm?.[1] ?? ""}
+                            onChange={(e) => setZoneBound("z2", 1, e.target.value)}
+                          />
+                        </div>
+                        <div>
+                          <label className="muted">Z3 Min (bpm)</label>
+                          <input
+                            type="number"
+                            value={activeProfile.runner_config.z3_range_bpm?.[0] ?? ""}
+                            onChange={(e) => setZoneBound("z3", 0, e.target.value)}
+                          />
+                        </div>
+                        <div>
+                          <label className="muted">Z3 Max (bpm)</label>
+                          <input
+                            type="number"
+                            value={activeProfile.runner_config.z3_range_bpm?.[1] ?? ""}
+                            onChange={(e) => setZoneBound("z3", 1, e.target.value)}
+                          />
+                        </div>
+                      </div>
+                    </div>
+                  )}
+
+                  {showHyrox && (
+                    <div style={{ borderTop: "1px solid var(--border)", paddingTop: 12, marginTop: 12 }}>
+                      <h4 style={{ margin: "0 0 8px" }}>HYROX / Hybrid Configuration</h4>
+                      <div className="form-row">
+                        <div>
+                          <label className="muted">Hyrox Division</label>
+                          <select
+                            value={divisionValue}
+                            onChange={(e) => {
+                              const div = e.target.value || null;
+                              setDraftProfile({
+                                ...activeProfile,
+                                hyrox_config: { ...activeProfile.hyrox_config, division: div },
+                              });
+                              setDraftConfig({
+                                ...draftConfig,
+                                objective: {
+                                  ...draftConfig.objective,
+                                  hybridProfile: {
+                                    division: div,
+                                    focusStations: activeProfile.hyrox_config.weak_stations,
+                                    weeklyHybridSessionsTarget:
+                                      draftConfig.objective.hybridProfile?.weeklyHybridSessionsTarget ?? 3,
+                                  },
+                                },
+                              });
+                            }}
+                          >
+                            {!standardDivisions.includes(divisionValue) && divisionValue && (
+                              <option value={divisionValue}>{divisionValue}</option>
+                            )}
+                            {standardDivisions.map((d) => (
+                              <option key={d} value={d}>
+                                {d}
+                              </option>
+                            ))}
+                          </select>
+                        </div>
+                        <div>
+                          <label className="muted">Watch Logging Mode</label>
+                          <select
+                            value={watchModeValue}
+                            onChange={(e) =>
+                              setDraftProfile({
+                                ...activeProfile,
+                                hyrox_config: {
+                                  ...activeProfile.hyrox_config,
+                                  watch_logging_mode: e.target.value || null,
+                                },
+                              })
+                            }
+                          >
+                            {!standardWatchModes.includes(watchModeValue) && watchModeValue && (
+                              <option value={watchModeValue}>{watchModeValue}</option>
+                            )}
+                            {standardWatchModes.map((m) => (
+                              <option key={m} value={m}>
+                                {m}
+                              </option>
+                            ))}
+                          </select>
+                        </div>
+                        <div>
+                          <label className="muted">Target Total Time (h:mm:ss)</label>
+                          <input
+                            placeholder="e.g. 1:15:00"
+                            value={hyroxTargetTimeInput}
+                            onChange={(e) => setHyroxTargetTimeInput(e.target.value)}
+                          />
+                        </div>
+                        <div>
+                          <label className="muted">Fresh 1km Pace (mm:ss/km)</label>
+                          <input
+                            placeholder="e.g. 4:15"
+                            value={fresh1kmInput}
+                            onChange={(e) => setFresh1kmInput(e.target.value)}
+                          />
+                        </div>
+                        <div>
+                          <label className="muted">Compromised 1km Target (mm:ss/km)</label>
+                          <input
+                            placeholder="e.g. 4:35"
+                            value={compromised1kmInput}
+                            onChange={(e) => setCompromised1kmInput(e.target.value)}
+                          />
+                        </div>
+                        <div>
+                          <label className="muted">Weak Stations (comma-separated)</label>
+                          <input
+                            placeholder="e.g. Sled Push, Wall Balls, SkiErg"
+                            value={activeProfile.hyrox_config.weak_stations.join(", ")}
+                            onChange={(e) => {
+                              const weak = e.target.value
+                                .split(",")
+                                .map((s) => s.trim())
+                                .filter(Boolean);
+                              setDraftProfile({
+                                ...activeProfile,
+                                hyrox_config: { ...activeProfile.hyrox_config, weak_stations: weak },
+                              });
+                              setDraftConfig({
+                                ...draftConfig,
+                                objective: {
+                                  ...draftConfig.objective,
+                                  hybridProfile: {
+                                    division: activeProfile.hyrox_config.division,
+                                    focusStations: weak,
+                                    weeklyHybridSessionsTarget:
+                                      draftConfig.objective.hybridProfile?.weeklyHybridSessionsTarget ?? 3,
+                                  },
+                                },
+                              });
+                            }}
+                          />
+                        </div>
+                        <div>
+                          <label className="muted">Hybrid Sessions / Week</label>
+                          <input
+                            type="number"
+                            value={draftConfig.objective.hybridProfile?.weeklyHybridSessionsTarget ?? ""}
+                            onChange={(e) =>
+                              setDraftConfig({
+                                ...draftConfig,
+                                objective: {
+                                  ...draftConfig.objective,
+                                  hybridProfile: {
+                                    division:
+                                      draftConfig.objective.hybridProfile?.division ??
+                                      activeProfile.hyrox_config.division,
+                                    focusStations:
+                                      draftConfig.objective.hybridProfile?.focusStations ??
+                                      activeProfile.hyrox_config.weak_stations,
+                                    weeklyHybridSessionsTarget: e.target.value ? Number(e.target.value) : null,
+                                  },
+                                },
+                              })
+                            }
+                          />
+                        </div>
+                      </div>
+                    </div>
+                  )}
+
+                  <div style={{ borderTop: "1px solid var(--border)", paddingTop: 12, marginTop: 12 }}>
+                    <h4 style={{ margin: "0 0 8px" }}>Advanced · Pace &amp; HR Guardrails</h4>
+                    <div className="form-row">
+                      <div>
+                        <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13, marginBottom: 6 }}>
+                          <input
+                            type="checkbox"
+                            style={{ width: "auto" }}
+                            checked={draftConfig.medical.enforceEasyHRCeiling}
+                            onChange={(e) =>
+                              setDraftConfig({
+                                ...draftConfig,
+                                medical: { ...draftConfig.medical, enforceEasyHRCeiling: e.target.checked },
+                              })
+                            }
+                          />
+                          HR-First Governor (enforce Easy HR ceiling)
+                        </label>
+                        <input
+                          type="number"
+                          placeholder="Easy HR Ceiling (bpm)"
+                          value={draftConfig.medical.easyHRCeilingBPM ?? ""}
+                          onChange={(e) =>
+                            setDraftConfig({
+                              ...draftConfig,
+                              medical: {
+                                ...draftConfig.medical,
+                                easyHRCeilingBPM: e.target.value ? Number(e.target.value) : null,
+                              },
+                            })
+                          }
+                        />
+                      </div>
+                      <div>
+                        <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13, marginBottom: 6 }}>
+                          <input
+                            type="checkbox"
+                            style={{ width: "auto" }}
+                            checked={draftConfig.medical.enforcePaceFloor}
+                            onChange={(e) =>
+                              setDraftConfig({
+                                ...draftConfig,
+                                medical: { ...draftConfig.medical, enforcePaceFloor: e.target.checked },
+                              })
+                            }
+                          />
+                          Hard Pace Floor (mm:ss/km)
+                        </label>
+                        <input
+                          placeholder="e.g. 6:30"
+                          value={paceFloorInput}
+                          onChange={(e) => setPaceFloorInput(e.target.value)}
+                        />
+                      </div>
+                      <div>
+                        <label className="muted">Min Rest Between Runs (h)</label>
+                        <input
+                          type="number"
+                          value={draftConfig.medical.minRestHoursBetweenRuns ?? ""}
+                          onChange={(e) =>
+                            setDraftConfig({
+                              ...draftConfig,
+                              medical: {
+                                ...draftConfig.medical,
+                                minRestHoursBetweenRuns: e.target.value ? Number(e.target.value) : null,
+                              },
+                            })
+                          }
+                        />
+                      </div>
+                    </div>
+                  </div>
+
+                  <button
+                    className="primary"
+                    onClick={async () => {
+                      const parsedPaceSec = parseMmSsOrNull(paceFloorInput, draftConfig.medical.minPaceSecPerKm);
+                      const vt1Ceiling =
+                        activeProfile.runner_config.vt1_bpm ?? draftConfig.specs.vt1CeilingBPM ?? null;
+                      const syncedMaxHr =
+                        activeProfile.runner_config.max_hr_bpm ?? draftConfig.specs.maxHR ?? null;
+                      const syncedRhr =
+                        activeProfile.runner_config.resting_hr_bpm ?? draftConfig.specs.restingHRBaseline ?? null;
+
+                      const updatedConfig: AthleteConfig = {
+                        ...draftConfig,
+                        specs: {
+                          ...draftConfig.specs,
+                          weightBaselineConfirmed: Boolean(
+                            draftConfig.specs.weightKg && draftConfig.specs.weightKg > 0
+                          ),
+                          vt1CeilingBPM: vt1Ceiling,
+                          maxHR: syncedMaxHr,
+                          restingHRBaseline: syncedRhr,
+                        },
+                        medical: {
+                          ...draftConfig.medical,
+                          minPaceSecPerKm: parsedPaceSec,
+                        },
+                      };
+                      const updatedProfile: UserProfile = {
+                        ...activeProfile,
                         runner_config: {
-                          ...state.user_profile.runner_config,
+                          ...activeProfile.runner_config,
                           hr_first_governor: updatedConfig.medical.enforceEasyHRCeiling,
                           pace_floor_sec_per_km: parsedPaceSec,
+                          vt1_bpm: vt1Ceiling,
+                          vt1_pace_sec_per_km: parseMmSsOrNull(
+                            vt1PaceInput,
+                            activeProfile.runner_config.vt1_pace_sec_per_km ?? null
+                          ),
+                          vt2_pace_sec_per_km: parseMmSsOrNull(
+                            vt2PaceInput,
+                            activeProfile.runner_config.vt2_pace_sec_per_km ?? null
+                          ),
+                          max_hr_bpm: syncedMaxHr,
+                          resting_hr_bpm: syncedRhr,
                         },
-                      },
-                    });
-                  }
-                  setStatusMsg("Profile & guardrails saved.");
-                  await reload();
-                }}
-              >
-                Save Profile
-              </button>
-              {statusMsg && <span className="muted" style={{ marginLeft: 12 }}>{statusMsg}</span>}
-            </div>
+                        hyrox_config: {
+                          ...activeProfile.hyrox_config,
+                          target_total_time_sec: parseHmsOrNull(
+                            hyroxTargetTimeInput,
+                            activeProfile.hyrox_config.target_total_time_sec ?? null
+                          ),
+                          fresh_1km_pace_sec: parseMmSsOrNull(
+                            fresh1kmInput,
+                            activeProfile.hyrox_config.fresh_1km_pace_sec ?? null
+                          ),
+                          compromised_1km_target_sec: parseMmSsOrNull(
+                            compromised1kmInput,
+                            activeProfile.hyrox_config.compromised_1km_target_sec ?? null
+                          ),
+                        },
+                      };
+                      await invoke("save_athlete_config", { config: updatedConfig });
+                      await invoke("save_user_profile", { profile: updatedProfile });
+                      setStatusMsg("Profile, thresholds & guardrails saved.");
+                      await reload();
+                    }}
+                  >
+                    Save Profile
+                  </button>
+                  {statusMsg && <span className="muted" style={{ marginLeft: 12 }}>{statusMsg}</span>}
+                </div>
+              );
+            })()}
 
             <div className="card">
               <div className="card-header">
@@ -1880,6 +2548,69 @@ export default function App() {
                 </div>
               )}
             </div>
+
+            <div className="card" style={{ borderColor: "rgba(224, 108, 117, 0.45)" }}>
+              <h3 style={{ color: "var(--red)" }}>Danger Zone · Clean-Slate Reset</h3>
+              <p className="muted" style={{ marginTop: 4, marginBottom: 12 }}>
+                Deletes your local SQLite database, cached Garmin/Gemini credentials, Coach Markdown/JSON files, and restarts Onboarding from Step 1.
+              </p>
+              {!confirmCleanSlate ? (
+                <button
+                  type="button"
+                  className="secondary"
+                  style={{ borderColor: "var(--red)", color: "var(--red)" }}
+                  onClick={() => setConfirmCleanSlate(true)}
+                >
+                  <Trash2 size={14} style={{ marginRight: 6, verticalAlign: "middle" }} />
+                  Clean-Slate Reset…
+                </button>
+              ) : (
+                <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+                  <span style={{ color: "var(--red)", fontSize: 13, fontWeight: 600 }}>
+                    Confirm deleting all local data and restarting Onboarding Step 1?
+                  </span>
+                  <button
+                    type="button"
+                    className="primary"
+                    style={{ background: "var(--red)", borderColor: "var(--red)", color: "#fff" }}
+                    disabled={cleanSlateBusy}
+                    onClick={async () => {
+                      setCleanSlateBusy(true);
+                      try {
+                        await invoke("clean_slate_reset");
+                        try {
+                          localStorage.clear();
+                        } catch {
+                          // ignore storage restrictions
+                        }
+                        setMessages([]);
+                        setSelectedActivity(null);
+                        setCoachError(null);
+                        setStatusMsg(null);
+                        setConfirmCleanSlate(false);
+                        setOnboardingKey((k) => k + 1);
+                        await reload();
+                        setShowOnboarding(true);
+                      } catch (err) {
+                        setStatusMsg(`Reset failed: ${err instanceof Error ? err.message : String(err)}`);
+                      } finally {
+                        setCleanSlateBusy(false);
+                      }
+                    }}
+                  >
+                    {cleanSlateBusy ? "Resetting…" : "Confirm Reset & Erase All Local Data"}
+                  </button>
+                  <button
+                    type="button"
+                    className="secondary"
+                    disabled={cleanSlateBusy}
+                    onClick={() => setConfirmCleanSlate(false)}
+                  >
+                    Cancel
+                  </button>
+                </div>
+              )}
+            </div>
           </>
         )}
       </main>
@@ -1920,6 +2651,40 @@ function sanitizeFilenamePart(raw: string): string {
 function parseOptionalNum(raw: string): number | null {
   const n = Number(raw);
   return raw.trim() !== "" && Number.isFinite(n) ? n : null;
+}
+
+function formatMmSsOptional(sec?: number | null): string {
+  if (!sec || !Number.isFinite(sec) || sec <= 0) return "";
+  const total = Math.round(sec);
+  return `${Math.floor(total / 60)}:${String(total % 60).padStart(2, "0")}`;
+}
+
+function parseMmSsOrNull(raw: string, fallback: number | null): number | null {
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+  const parts = trimmed.split(":");
+  if (parts.length !== 2) return fallback;
+  const m = Number(parts[0]);
+  const s = Number(parts[1]);
+  if (!Number.isFinite(m) || !Number.isFinite(s) || m < 0 || s < 0 || s >= 60) {
+    return fallback;
+  }
+  const total = Math.round(m * 60 + s);
+  return total > 0 ? total : null;
+}
+
+function parseHmsOrNull(raw: string, fallback: number | null): number | null {
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+  const parts = trimmed.split(":").map((p) => Number(p));
+  if (parts.some((n) => !Number.isFinite(n) || n < 0)) return fallback;
+  if (parts.length === 3) {
+    return Math.round(parts[0] * 3600 + parts[1] * 60 + parts[2]);
+  }
+  if (parts.length === 2) {
+    return Math.round(parts[0] * 60 + parts[1]);
+  }
+  return fallback;
 }
 
 function parseRatingOrZero(raw: string): number {
