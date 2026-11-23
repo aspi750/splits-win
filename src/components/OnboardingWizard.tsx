@@ -4,9 +4,11 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { Eye, EyeOff } from "lucide-react";
 import {
   RACE_DISTANCE_PRESETS,
+  parseValidHrBpm,
   presetDefaultName,
   presetDistanceKm,
   presetFromDistanceKm,
+  sanitizeHrInput,
   type AthleteConfig,
   type AthleteType,
   type FirstUseFlowState,
@@ -99,7 +101,7 @@ export function OnboardingWizard({
     hasGarminKey ? "verified" : "idle"
   );
   const [garminStatus, setGarminStatus] = useState<string | null>(
-    hasGarminKey ? "Garmin Personal API Key already stored in Windows Credential Manager." : null
+    hasGarminKey ? "Garmin Personal API Key already saved locally (credentials.json)." : null
   );
   const [autoCalibrate, setAutoCalibrate] = useState(
     initialFirstUseState?.auto_calibrate_after_first_sync ?? true
@@ -152,7 +154,7 @@ export function OnboardingWizard({
     hasGeminiKey ? "verified" : "idle"
   );
   const [geminiStatus, setGeminiStatus] = useState<string | null>(
-    hasGeminiKey ? "Gemini API key already stored in Windows Credential Manager." : null
+    hasGeminiKey ? "Gemini API key already saved locally (credentials.json)." : null
   );
   const [geminiModel, setGeminiModel] = useState(
     initialModelSettings?.global_model_id ?? "gemini-4-hydrogen"
@@ -180,7 +182,7 @@ export function OnboardingWizard({
       setGarminVerified(true);
       setGarminSkipped(false);
       setGarminCheckState("verified");
-      setGarminStatus("Connected (HTTP 200) — saved & verified in Windows Credential Manager.");
+      setGarminStatus("Connected (HTTP 200) — saved locally (credentials.json).");
       setGarminKey("");
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -209,7 +211,7 @@ export function OnboardingWizard({
       setGeminiStatus(
         res.message
           ? `Connected (HTTP ${res.http_status}) — ${res.message}`
-          : "Connected (HTTP 200) — saved & verified in Windows Credential Manager."
+          : "Connected (HTTP 200) — saved locally (credentials.json)."
       );
       setGeminiKey("");
     } catch (err) {
@@ -296,8 +298,8 @@ export function OnboardingWizard({
           displayName: displayName.trim(),
           weightKg: validWeightKg,
           weightBaselineConfirmed: Boolean(validWeightKg),
-          maxHR: maxHR ? Number(maxHR) : null,
-          restingHRBaseline: rhrBaseline ? Number(rhrBaseline) : null,
+          maxHR: parseValidHrBpm(maxHR),
+          restingHRBaseline: parseValidHrBpm(rhrBaseline),
         },
         medical: {
           ...initialConfig.medical,
@@ -339,9 +341,9 @@ export function OnboardingWizard({
           pace_floor_sec_per_km: initialProfile.runner_config.pace_floor_sec_per_km ?? null,
           z2_range_bpm: initialProfile.runner_config.z2_range_bpm,
           z3_range_bpm: initialProfile.runner_config.z3_range_bpm,
-          lthr_bpm: lthrBpm ? Number(lthrBpm) : null,
-          max_hr_bpm: maxHR ? Number(maxHR) : initialProfile.runner_config.max_hr_bpm ?? null,
-          resting_hr_bpm: rhrBaseline ? Number(rhrBaseline) : initialProfile.runner_config.resting_hr_bpm ?? null,
+          lthr_bpm: parseValidHrBpm(lthrBpm),
+          max_hr_bpm: parseValidHrBpm(maxHR) ?? initialProfile.runner_config.max_hr_bpm ?? null,
+          resting_hr_bpm: parseValidHrBpm(rhrBaseline) ?? initialProfile.runner_config.resting_hr_bpm ?? null,
         },
         hyrox_config: {
           division: athleteType === "runner" ? null : division,
@@ -464,7 +466,7 @@ export function OnboardingWizard({
             <h3>Step 2 — Telemetry &amp; Calibration (BYOK)</h3>
             <p className="muted" style={{ fontSize: 13 }}>
               In Garmin Connect Web (<strong>Settings → Personal API Key</strong>), generate a 30/90/180/365-day key.
-              Garmin displays the key only once upon creation — paste it below to validate and store securely in Windows Credential Manager.
+              Garmin displays the key only once upon creation — paste it below to validate and store locally in credentials.json.
             </p>
             <div className="key-input-group" style={{ marginBottom: 8 }}>
               <input
@@ -585,15 +587,36 @@ export function OnboardingWizard({
               <div className="form-row">
                 <div>
                   <label className="muted">Max HR (bpm, optional)</label>
-                  <input type="number" value={maxHR} onChange={(e) => setMaxHR(e.target.value)} placeholder="Auto-calibrated if blank" />
+                  <input
+                    type="text"
+                    inputMode="numeric"
+                    maxLength={3}
+                    value={maxHR}
+                    onChange={(e) => setMaxHR(sanitizeHrInput(e.target.value))}
+                    placeholder="Auto-calibrated if blank"
+                  />
                 </div>
                 <div>
                   <label className="muted">Resting HR Baseline (bpm, optional)</label>
-                  <input type="number" value={rhrBaseline} onChange={(e) => setRhrBaseline(e.target.value)} placeholder="Auto-calibrated if blank" />
+                  <input
+                    type="text"
+                    inputMode="numeric"
+                    maxLength={3}
+                    value={rhrBaseline}
+                    onChange={(e) => setRhrBaseline(sanitizeHrInput(e.target.value))}
+                    placeholder="Auto-calibrated if blank"
+                  />
                 </div>
                 <div>
                   <label className="muted">Estimated LTHR (bpm, optional)</label>
-                  <input type="number" value={lthrBpm} onChange={(e) => setLthrBpm(e.target.value)} placeholder="Auto-calibrated if blank" />
+                  <input
+                    type="text"
+                    inputMode="numeric"
+                    maxLength={3}
+                    value={lthrBpm}
+                    onChange={(e) => setLthrBpm(sanitizeHrInput(e.target.value))}
+                    placeholder="Auto-calibrated if blank"
+                  />
                 </div>
               </div>
             </div>
@@ -799,7 +822,7 @@ export function OnboardingWizard({
             <p className="muted" style={{ fontSize: 13 }}>
               {hasGeminiKey
                 ? "A Gemini API key is already saved. Paste a new key and validate it, or continue with your saved key."
-                : "Paste your Gemini API key (stored in Windows Credential Manager) to validate and enable live streaming AI coaching."}
+                : "Paste your Gemini API key (saved locally in credentials.json) to validate and enable live streaming AI coaching."}
             </p>
             <div style={{ marginBottom: 12 }}>
               <label className="muted">Gemini API Key</label>
@@ -814,7 +837,7 @@ export function OnboardingWizard({
                     if (!val.trim() && hasGeminiKey) {
                       setGeminiVerified(true);
                       setGeminiCheckState("verified");
-                      setGeminiStatus("Using existing Gemini API key in Windows Credential Manager.");
+                      setGeminiStatus("Using existing Gemini API key saved locally (credentials.json).");
                     } else {
                       setGeminiVerified(false);
                       setGeminiSkipped(false);

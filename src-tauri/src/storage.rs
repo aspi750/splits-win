@@ -258,32 +258,315 @@ impl SharedStore {
     }
 }
 
+#[derive(Debug, Clone, Serialize, serde::Deserialize, Default, PartialEq, Eq)]
+pub struct CredentialsFile {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub garmin_personal_api_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gemini_api_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uiserver_auth_token: Option<String>,
+}
+
+static CREDENTIALS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[derive(Debug, Clone, Copy)]
+enum CredentialField {
+    Garmin,
+    Gemini,
+    UIServer,
+}
+
+impl CredentialField {
+    fn from_account(account: &str) -> Self {
+        match account {
+            GARMIN_ACCOUNT => CredentialField::Garmin,
+            GEMINI_ACCOUNT => CredentialField::Gemini,
+            UISERVER_ACCOUNT => CredentialField::UIServer,
+            _ => CredentialField::Gemini,
+        }
+    }
+}
+
 pub struct CredentialStore;
 
 impl CredentialStore {
-    pub fn save_secret(service: &str, account: &str, value: &str) -> Result<(), StorageError> {
-        let entry = keyring::Entry::new(service, account).map_err(|e| StorageError::Keyring(e.to_string()))?;
-        entry.set_password(value.trim()).map_err(|e| StorageError::Keyring(e.to_string()))
+    pub fn default_credentials_path() -> PathBuf {
+        SharedStore::default_base_dir().join("credentials.json")
     }
 
-    pub fn read_secret(service: &str, account: &str) -> Option<String> {
+    fn read_file_unlocked(path: &Path) -> CredentialsFile {
+        let Ok(bytes) = fs::read(path) else {
+            return CredentialsFile::default();
+        };
+        serde_json::from_slice(&bytes).unwrap_or_default()
+    }
+
+    fn write_file_unlocked(path: &Path, creds: &CredentialsFile) -> Result<(), StorageError> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let data = serde_json::to_vec_pretty(creds)?;
+        let tmp_path = path.with_file_name(format!(
+            "{}.tmp",
+            path.file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("credentials.json")
+        ));
+        {
+            let mut file = fs::File::create(&tmp_path)?;
+            file.write_all(&data)?;
+            file.sync_all()?;
+        }
+        if fs::rename(&tmp_path, path).is_err() {
+            if path.exists() {
+                let _ = fs::remove_file(path);
+            }
+            fs::rename(&tmp_path, path)?;
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            if let Ok(user) = std::env::var("USERNAME") {
+                let trimmed = user.trim();
+                if !trimmed.is_empty() {
+                    let grant = format!("{trimmed}:(R,W)");
+                    let _ = std::process::Command::new("icacls")
+                        .arg(path)
+                        .arg("/inheritance:r")
+                        .arg("/grant:r")
+                        .arg(&grant)
+                        .creation_flags(CREATE_NO_WINDOW)
+                        .output();
+                }
+            }
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+        }
+
+        Ok(())
+    }
+
+    fn save_field_at(path: &Path, field: CredentialField, value: &str) -> Result<(), StorageError> {
+        let _guard = CREDENTIALS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut creds = Self::read_file_unlocked(path);
+        let cleaned = value.trim().to_string();
+        let opt = if cleaned.is_empty() { None } else { Some(cleaned) };
+        match field {
+            CredentialField::Garmin => creds.garmin_personal_api_key = opt,
+            CredentialField::Gemini => creds.gemini_api_key = opt,
+            CredentialField::UIServer => creds.uiserver_auth_token = opt,
+        }
+        Self::write_file_unlocked(path, &creds)
+    }
+
+    fn read_field_at(path: &Path, field: CredentialField) -> Option<String> {
+        let _guard = CREDENTIALS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let creds = Self::read_file_unlocked(path);
+        let val = match field {
+            CredentialField::Garmin => creds.garmin_personal_api_key,
+            CredentialField::Gemini => creds.gemini_api_key,
+            CredentialField::UIServer => creds.uiserver_auth_token,
+        };
+        val.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+    }
+
+    fn delete_field_at(path: &Path, field: CredentialField) -> Result<(), StorageError> {
+        let _guard = CREDENTIALS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        if !path.exists() {
+            return Ok(());
+        }
+        let mut creds = Self::read_file_unlocked(path);
+        match field {
+            CredentialField::Garmin => creds.garmin_personal_api_key = None,
+            CredentialField::Gemini => creds.gemini_api_key = None,
+            CredentialField::UIServer => creds.uiserver_auth_token = None,
+        }
+        Self::write_file_unlocked(path, &creds)
+    }
+
+    pub fn delete_credentials_file_at(path: &Path) {
+        let _guard = CREDENTIALS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        if path.exists() {
+            let _ = fs::remove_file(path);
+        }
+        let tmp_path = path.with_file_name(format!(
+            "{}.tmp",
+            path.file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("credentials.json")
+        ));
+        if tmp_path.exists() {
+            let _ = fs::remove_file(tmp_path);
+        }
+    }
+
+    pub fn save_garmin_key_at(path: &Path, value: &str) -> Result<(), StorageError> {
+        Self::save_field_at(path, CredentialField::Garmin, value)
+    }
+
+    pub fn read_garmin_key_at(path: &Path) -> Option<String> {
+        Self::read_field_at(path, CredentialField::Garmin)
+    }
+
+    pub fn delete_garmin_key_at(path: &Path) -> Result<(), StorageError> {
+        Self::delete_field_at(path, CredentialField::Garmin)
+    }
+
+    pub fn save_gemini_key_at(path: &Path, value: &str) -> Result<(), StorageError> {
+        Self::save_field_at(path, CredentialField::Gemini, value)
+    }
+
+    pub fn read_gemini_key_at(path: &Path) -> Option<String> {
+        Self::read_field_at(path, CredentialField::Gemini)
+    }
+
+    pub fn delete_gemini_key_at(path: &Path) -> Result<(), StorageError> {
+        Self::delete_field_at(path, CredentialField::Gemini)
+    }
+
+    pub fn save_uiserver_token_at(path: &Path, value: &str) -> Result<(), StorageError> {
+        Self::save_field_at(path, CredentialField::UIServer, value)
+    }
+
+    pub fn read_uiserver_token_at(path: &Path) -> Option<String> {
+        Self::read_field_at(path, CredentialField::UIServer)
+    }
+
+    pub fn delete_uiserver_token_at(path: &Path) -> Result<(), StorageError> {
+        Self::delete_field_at(path, CredentialField::UIServer)
+    }
+
+    fn read_legacy_keyring(service: &str, account: &str) -> Option<String> {
         let entry = keyring::Entry::new(service, account).ok()?;
-        entry.get_password().ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+        entry
+            .get_password()
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
     }
 
-    pub fn delete_secret(service: &str, account: &str) -> Result<(), StorageError> {
-        let entry = keyring::Entry::new(service, account).map_err(|e| StorageError::Keyring(e.to_string()))?;
-        match entry.delete_credential() {
-            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-            Err(e) => Err(StorageError::Keyring(e.to_string())),
+    fn delete_legacy_keyring(service: &str, account: &str) {
+        if let Ok(entry) = keyring::Entry::new(service, account) {
+            let _ = entry.delete_credential();
+        }
+    }
+
+    pub fn save_garmin_key(value: &str) -> Result<(), StorageError> {
+        let path = Self::default_credentials_path();
+        Self::save_garmin_key_at(&path, value)
+    }
+
+    pub fn read_garmin_key() -> Option<String> {
+        let path = Self::default_credentials_path();
+        if let Some(val) = Self::read_garmin_key_at(&path) {
+            return Some(val);
+        }
+        // One-way legacy migration from Windows Credential Manager into credentials.json
+        for svc in [GARMIN_KEYRING_SERVICE, APP_SERVICE] {
+            if let Some(legacy) = Self::read_legacy_keyring(svc, GARMIN_ACCOUNT) {
+                let _ = Self::save_garmin_key_at(&path, &legacy);
+                Self::delete_legacy_keyring(GARMIN_KEYRING_SERVICE, GARMIN_ACCOUNT);
+                Self::delete_legacy_keyring(APP_SERVICE, GARMIN_ACCOUNT);
+                return Some(legacy);
+            }
+        }
+        None
+    }
+
+    pub fn delete_garmin_key() -> Result<(), StorageError> {
+        let path = Self::default_credentials_path();
+        Self::delete_garmin_key_at(&path)?;
+        Self::delete_legacy_keyring(GARMIN_KEYRING_SERVICE, GARMIN_ACCOUNT);
+        Self::delete_legacy_keyring(APP_SERVICE, GARMIN_ACCOUNT);
+        Ok(())
+    }
+
+    pub fn save_gemini_key(value: &str) -> Result<(), StorageError> {
+        let path = Self::default_credentials_path();
+        Self::save_gemini_key_at(&path, value)
+    }
+
+    pub fn read_gemini_key() -> Option<String> {
+        let path = Self::default_credentials_path();
+        if let Some(val) = Self::read_gemini_key_at(&path) {
+            return Some(val);
+        }
+        if let Some(legacy) = Self::read_legacy_keyring(APP_SERVICE, GEMINI_ACCOUNT) {
+            let _ = Self::save_gemini_key_at(&path, &legacy);
+            Self::delete_legacy_keyring(APP_SERVICE, GEMINI_ACCOUNT);
+            return Some(legacy);
+        }
+        None
+    }
+
+    pub fn delete_gemini_key() -> Result<(), StorageError> {
+        let path = Self::default_credentials_path();
+        Self::delete_gemini_key_at(&path)?;
+        Self::delete_legacy_keyring(APP_SERVICE, GEMINI_ACCOUNT);
+        Ok(())
+    }
+
+    pub fn save_uiserver_token(value: &str) -> Result<(), StorageError> {
+        let path = Self::default_credentials_path();
+        Self::save_uiserver_token_at(&path, value)
+    }
+
+    pub fn read_uiserver_token() -> Option<String> {
+        let path = Self::default_credentials_path();
+        if let Some(val) = Self::read_uiserver_token_at(&path) {
+            return Some(val);
+        }
+        if let Some(legacy) = Self::read_legacy_keyring(APP_SERVICE, UISERVER_ACCOUNT) {
+            let _ = Self::save_uiserver_token_at(&path, &legacy);
+            Self::delete_legacy_keyring(APP_SERVICE, UISERVER_ACCOUNT);
+            return Some(legacy);
+        }
+        None
+    }
+
+    pub fn delete_uiserver_token() -> Result<(), StorageError> {
+        let path = Self::default_credentials_path();
+        Self::delete_uiserver_token_at(&path)?;
+        Self::delete_legacy_keyring(APP_SERVICE, UISERVER_ACCOUNT);
+        Ok(())
+    }
+
+    pub fn save_secret(_service: &str, account: &str, value: &str) -> Result<(), StorageError> {
+        match CredentialField::from_account(account) {
+            CredentialField::Garmin => Self::save_garmin_key(value),
+            CredentialField::Gemini => Self::save_gemini_key(value),
+            CredentialField::UIServer => Self::save_uiserver_token(value),
+        }
+    }
+
+    pub fn read_secret(_service: &str, account: &str) -> Option<String> {
+        match CredentialField::from_account(account) {
+            CredentialField::Garmin => Self::read_garmin_key(),
+            CredentialField::Gemini => Self::read_gemini_key(),
+            CredentialField::UIServer => Self::read_uiserver_token(),
+        }
+    }
+
+    pub fn delete_secret(_service: &str, account: &str) -> Result<(), StorageError> {
+        match CredentialField::from_account(account) {
+            CredentialField::Garmin => Self::delete_garmin_key(),
+            CredentialField::Gemini => Self::delete_gemini_key(),
+            CredentialField::UIServer => Self::delete_uiserver_token(),
         }
     }
 
     pub fn clear_all() -> Result<(), StorageError> {
-        let _ = Self::delete_secret(GARMIN_KEYRING_SERVICE, GARMIN_ACCOUNT);
-        let _ = Self::delete_secret(APP_SERVICE, GARMIN_ACCOUNT);
-        let _ = Self::delete_secret(APP_SERVICE, GEMINI_ACCOUNT);
-        let _ = Self::delete_secret(APP_SERVICE, UISERVER_ACCOUNT);
+        Self::delete_credentials_file_at(&Self::default_credentials_path());
+        Self::delete_legacy_keyring(GARMIN_KEYRING_SERVICE, GARMIN_ACCOUNT);
+        Self::delete_legacy_keyring(APP_SERVICE, GARMIN_ACCOUNT);
+        Self::delete_legacy_keyring(APP_SERVICE, GEMINI_ACCOUNT);
+        Self::delete_legacy_keyring(APP_SERVICE, UISERVER_ACCOUNT);
         Ok(())
     }
 }

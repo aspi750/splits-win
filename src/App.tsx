@@ -29,8 +29,10 @@ import {
 import { OnboardingWizard } from "./components/OnboardingWizard";
 import {
   RACE_DISTANCE_PRESETS,
+  parseValidHrBpm,
   presetDistanceKm,
   presetFromDistanceKm,
+  sanitizeHrInput,
   type ActivityDetailPayload,
   type ActivityRecord,
   type AthleteConfig,
@@ -268,7 +270,7 @@ export default function App() {
   const [confirmCleanSlate, setConfirmCleanSlate] = useState(false);
   const [cleanSlateBusy, setCleanSlateBusy] = useState(false);
 
-  const [appVersion, setAppVersion] = useState<string>("0.2.3.2-beta");
+  const [appVersion, setAppVersion] = useState<string>("0.2.3.3-beta");
   const [availableUpdate, setAvailableUpdate] = useState<Update | null>(null);
   const [updateStatus, setUpdateStatus] = useState<string | null>(null);
   const [updateChecking, setUpdateChecking] = useState(false);
@@ -519,7 +521,7 @@ export default function App() {
         {onboardStep === 2 && (
           <>
             <h2>Connect Your Watch</h2>
-            <p className="muted">Paste your Garmin Connect Personal API Key (stored in Windows Credential Manager).</p>
+            <p className="muted">Paste your Garmin Connect Personal API Key (saved locally in credentials.json).</p>
             <input
               type="password"
               placeholder="Personal API key"
@@ -769,9 +771,39 @@ export default function App() {
     setBusy(true);
     setCoachError(null);
     try {
+      const count = firstUseState.queued_intake_files.length;
+      if (state?.engine_mode !== "gemini_api") {
+        const proposal = await invoke<CoachUpdateProposal>("build_local_profile_proposal");
+        await reload();
+        setMessages((prev) => [
+          ...prev,
+          {
+            role: "user",
+            text: "",
+            hiddenInUI: true,
+            stageLabel: "Stage 2 · Local Baseline Profile",
+          },
+          {
+            role: "assistant",
+            text:
+              count > 0
+                ? `Here is your local baseline **COACH_PROFILE.md** synthesized from your onboarding settings. (${count} uploaded file(s) remain queued until a Gemini API key is configured in Settings.)`
+                : "Here is your local baseline **COACH_PROFILE.md** synthesized from your onboarding settings.",
+            proposals: [proposal],
+          },
+        ]);
+        requestAnimationFrame(() => {
+          requestAnimationFrame(() => {
+            document
+              .getElementById(`proposal-${proposal.id}`)
+              ?.scrollIntoView({ behavior: "smooth", block: "start" });
+          });
+        });
+        return;
+      }
+
       await invoke("advance_first_use_stage", { stage: "profile_approval" });
       await reload();
-      const count = firstUseState.queued_intake_files.length;
       const fileSummary =
         count > 0
           ? `I uploaded ${count} file(s) for intake (${firstUseState.queued_intake_files.map((f) => f.file_name).join(", ")}). `
@@ -784,6 +816,7 @@ export default function App() {
       });
     } catch (err) {
       setCoachError(err instanceof Error ? err.message : String(err));
+    } finally {
       setBusy(false);
     }
   }
@@ -1429,6 +1462,35 @@ export default function App() {
                         ))}
                       </div>
                     )}
+                    {state.engine_mode !== "gemini_api" && (
+                      <div
+                        style={{
+                          padding: 10,
+                          borderRadius: 8,
+                          border: "1px solid var(--border)",
+                          background: "var(--card)",
+                          marginBottom: 10,
+                          display: "flex",
+                          justifyContent: "space-between",
+                          alignItems: "center",
+                          gap: 10,
+                          flexWrap: "wrap",
+                          fontSize: 12.5,
+                        }}
+                      >
+                        <span className="muted">
+                          Gemini API key not configured. Add your key in Settings to synthesize your profile with AI, or continue with a local baseline profile.
+                        </span>
+                        <button
+                          type="button"
+                          className="secondary"
+                          disabled={busy}
+                          onClick={() => setTab("settings")}
+                        >
+                          Configure Gemini Key
+                        </button>
+                      </div>
+                    )}
                     <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
                       <button className="secondary" disabled={busy} onClick={() => void handleStage1UploadFiles()}>
                         <Upload size={13} style={{ marginRight: 5, verticalAlign: "middle" }} />
@@ -1436,7 +1498,7 @@ export default function App() {
                       </button>
                       <button
                         className="primary"
-                        disabled={busy || state.engine_mode !== "gemini_api"}
+                        disabled={busy}
                         onClick={() => void handleContinueToProfileSynthesis()}
                       >
                         {firstUseState.queued_intake_files.length > 0
@@ -1849,7 +1911,7 @@ export default function App() {
               <h3>Garmin Connect API Key</h3>
               <p className="muted" style={{ marginTop: 0, marginBottom: 10 }}>
                 Status:{" "}
-                <strong>{state.has_garmin_key ? "Saved in Windows Credential Manager" : "Not set"}</strong>
+                <strong>{state.has_garmin_key ? "Saved locally (credentials.json)" : "Not set"}</strong>
               </p>
               <div className="key-input-group">
                 <input
@@ -1881,7 +1943,7 @@ export default function App() {
                       setGarminKeyInput("");
                       setGarminVerifyStatus({
                         ok: true,
-                        text: "Connected (HTTP 200) — saved in Windows Credential Manager.",
+                        text: "Connected (HTTP 200) — saved locally (credentials.json).",
                       });
                       await reload();
                     } catch (err) {
@@ -1964,7 +2026,7 @@ export default function App() {
                 </div>
               </div>
               <div className="muted" style={{ marginBottom: 8, marginTop: 6 }}>
-                Gemini API Key (Windows Credential Manager):{" "}
+                Gemini API Key (Saved locally — credentials.json):{" "}
                 <strong>{state.has_gemini_key ? "Saved" : "Not set (Clipboard Packet mode)"}</strong>
               </div>
               <div className="key-input-group">
@@ -1992,7 +2054,7 @@ export default function App() {
                   onClick={async () => {
                     await invoke("save_gemini_key", { key: geminiKeyInput.trim() });
                     setGeminiKeyInput("");
-                    setGeminiVerifyStatus({ ok: true, text: "Saved to Windows Credential Manager." });
+                    setGeminiVerifyStatus({ ok: true, text: "Saved locally (credentials.json)." });
                     await reload();
                   }}
                 >
@@ -2109,7 +2171,8 @@ export default function App() {
                 "Connect IQ ROXFIT/RoxTrack",
               ];
               const setZoneBound = (zone: "z2" | "z3", idx: 0 | 1, raw: string) => {
-                const parsed = raw.trim() ? Number(raw) : null;
+                const cleaned = sanitizeHrInput(raw);
+                const parsed = cleaned ? Number(cleaned) : null;
                 const prev =
                   zone === "z2" ? activeProfile.runner_config.z2_range_bpm : activeProfile.runner_config.z3_range_bpm;
                 const nextPair: [number, number] | null =
@@ -2398,10 +2461,13 @@ export default function App() {
                         <div>
                           <label className="muted">VT1 (bpm)</label>
                           <input
-                            type="number"
+                            type="text"
+                            inputMode="numeric"
+                            maxLength={3}
                             value={activeProfile.runner_config.vt1_bpm ?? draftConfig.specs.vt1CeilingBPM ?? ""}
                             onChange={(e) => {
-                              const v = e.target.value ? Number(e.target.value) : null;
+                              const cleaned = sanitizeHrInput(e.target.value);
+                              const v = cleaned ? Number(cleaned) : null;
                               setDraftConfig({
                                 ...draftConfig,
                                 specs: { ...draftConfig.specs, vt1CeilingBPM: v },
@@ -2416,17 +2482,20 @@ export default function App() {
                         <div>
                           <label className="muted">VT2 (bpm)</label>
                           <input
-                            type="number"
+                            type="text"
+                            inputMode="numeric"
+                            maxLength={3}
                             value={activeProfile.runner_config.vt2_bpm ?? ""}
-                            onChange={(e) =>
+                            onChange={(e) => {
+                              const cleaned = sanitizeHrInput(e.target.value);
                               setDraftProfile({
                                 ...activeProfile,
                                 runner_config: {
                                   ...activeProfile.runner_config,
-                                  vt2_bpm: e.target.value ? Number(e.target.value) : null,
+                                  vt2_bpm: cleaned ? Number(cleaned) : null,
                                 },
-                              })
-                            }
+                              });
+                            }}
                           />
                         </div>
                         <div>
@@ -2448,26 +2517,32 @@ export default function App() {
                         <div>
                           <label className="muted">LTHR (bpm)</label>
                           <input
-                            type="number"
+                            type="text"
+                            inputMode="numeric"
+                            maxLength={3}
                             value={activeProfile.runner_config.lthr_bpm ?? ""}
-                            onChange={(e) =>
+                            onChange={(e) => {
+                              const cleaned = sanitizeHrInput(e.target.value);
                               setDraftProfile({
                                 ...activeProfile,
                                 runner_config: {
                                   ...activeProfile.runner_config,
-                                  lthr_bpm: e.target.value ? Number(e.target.value) : null,
+                                  lthr_bpm: cleaned ? Number(cleaned) : null,
                                 },
-                              })
-                            }
+                              });
+                            }}
                           />
                         </div>
                         <div>
                           <label className="muted">Max HR (bpm)</label>
                           <input
-                            type="number"
+                            type="text"
+                            inputMode="numeric"
+                            maxLength={3}
                             value={activeProfile.runner_config.max_hr_bpm ?? draftConfig.specs.maxHR ?? ""}
                             onChange={(e) => {
-                              const v = e.target.value ? Number(e.target.value) : null;
+                              const cleaned = sanitizeHrInput(e.target.value);
+                              const v = cleaned ? Number(cleaned) : null;
                               setDraftConfig({ ...draftConfig, specs: { ...draftConfig.specs, maxHR: v } });
                               setDraftProfile({
                                 ...activeProfile,
@@ -2479,14 +2554,17 @@ export default function App() {
                         <div>
                           <label className="muted">Resting HR (bpm)</label>
                           <input
-                            type="number"
+                            type="text"
+                            inputMode="numeric"
+                            maxLength={3}
                             value={
                               activeProfile.runner_config.resting_hr_bpm ??
                               draftConfig.specs.restingHRBaseline ??
                               ""
                             }
                             onChange={(e) => {
-                              const v = e.target.value ? Number(e.target.value) : null;
+                              const cleaned = sanitizeHrInput(e.target.value);
+                              const v = cleaned ? Number(cleaned) : null;
                               setDraftConfig({
                                 ...draftConfig,
                                 specs: { ...draftConfig.specs, restingHRBaseline: v },
@@ -2501,7 +2579,9 @@ export default function App() {
                         <div>
                           <label className="muted">Z2 Min (bpm)</label>
                           <input
-                            type="number"
+                            type="text"
+                            inputMode="numeric"
+                            maxLength={3}
                             value={activeProfile.runner_config.z2_range_bpm?.[0] ?? ""}
                             onChange={(e) => setZoneBound("z2", 0, e.target.value)}
                           />
@@ -2509,7 +2589,9 @@ export default function App() {
                         <div>
                           <label className="muted">Z2 Max (bpm)</label>
                           <input
-                            type="number"
+                            type="text"
+                            inputMode="numeric"
+                            maxLength={3}
                             value={activeProfile.runner_config.z2_range_bpm?.[1] ?? ""}
                             onChange={(e) => setZoneBound("z2", 1, e.target.value)}
                           />
@@ -2517,7 +2599,9 @@ export default function App() {
                         <div>
                           <label className="muted">Z3 Min (bpm)</label>
                           <input
-                            type="number"
+                            type="text"
+                            inputMode="numeric"
+                            maxLength={3}
                             value={activeProfile.runner_config.z3_range_bpm?.[0] ?? ""}
                             onChange={(e) => setZoneBound("z3", 0, e.target.value)}
                           />
@@ -2525,7 +2609,9 @@ export default function App() {
                         <div>
                           <label className="muted">Z3 Max (bpm)</label>
                           <input
-                            type="number"
+                            type="text"
+                            inputMode="numeric"
+                            maxLength={3}
                             value={activeProfile.runner_config.z3_range_bpm?.[1] ?? ""}
                             onChange={(e) => setZoneBound("z3", 1, e.target.value)}
                           />
@@ -2696,18 +2782,21 @@ export default function App() {
                           HR-First Governor (enforce Easy HR ceiling)
                         </label>
                         <input
-                          type="number"
+                          type="text"
+                          inputMode="numeric"
+                          maxLength={3}
                           placeholder="Easy HR Ceiling (bpm)"
                           value={draftConfig.medical.easyHRCeilingBPM ?? ""}
-                          onChange={(e) =>
+                          onChange={(e) => {
+                            const cleaned = sanitizeHrInput(e.target.value);
                             setDraftConfig({
                               ...draftConfig,
                               medical: {
                                 ...draftConfig.medical,
-                                easyHRCeilingBPM: e.target.value ? Number(e.target.value) : null,
+                                easyHRCeilingBPM: cleaned ? Number(cleaned) : null,
                               },
-                            })
-                          }
+                            });
+                          }}
                         />
                       </div>
                       <div>
@@ -2754,12 +2843,26 @@ export default function App() {
                     className="primary"
                     onClick={async () => {
                       const parsedPaceSec = parseMmSsOrNull(paceFloorInput, draftConfig.medical.minPaceSecPerKm);
-                      const vt1Ceiling =
-                        activeProfile.runner_config.vt1_bpm ?? draftConfig.specs.vt1CeilingBPM ?? null;
-                      const syncedMaxHr =
-                        activeProfile.runner_config.max_hr_bpm ?? draftConfig.specs.maxHR ?? null;
-                      const syncedRhr =
-                        activeProfile.runner_config.resting_hr_bpm ?? draftConfig.specs.restingHRBaseline ?? null;
+                      const vt1Ceiling = parseValidHrBpm(
+                        activeProfile.runner_config.vt1_bpm ?? draftConfig.specs.vt1CeilingBPM ?? null
+                      );
+                      const validVt2Bpm = parseValidHrBpm(activeProfile.runner_config.vt2_bpm ?? null);
+                      const validLthrBpm = parseValidHrBpm(activeProfile.runner_config.lthr_bpm ?? null);
+                      const syncedMaxHr = parseValidHrBpm(
+                        activeProfile.runner_config.max_hr_bpm ?? draftConfig.specs.maxHR ?? null
+                      );
+                      const syncedRhr = parseValidHrBpm(
+                        activeProfile.runner_config.resting_hr_bpm ?? draftConfig.specs.restingHRBaseline ?? null
+                      );
+                      const validEasyCeiling = parseValidHrBpm(draftConfig.medical.easyHRCeilingBPM ?? null);
+                      const sanitizeZonePair = (
+                        pair: [number, number] | null | undefined
+                      ): [number, number] | null => {
+                        if (!pair) return null;
+                        const lo = parseValidHrBpm(pair[0]);
+                        const hi = parseValidHrBpm(pair[1]);
+                        return lo !== null && hi !== null && lo <= hi ? [lo, hi] : null;
+                      };
 
                       const nextDiscipline: TrainingDiscipline =
                         activeProfile.athlete_type === "hyrox"
@@ -2794,6 +2897,7 @@ export default function App() {
                         },
                         medical: {
                           ...draftConfig.medical,
+                          easyHRCeilingBPM: validEasyCeiling,
                           minPaceSecPerKm: parsedPaceSec,
                         },
                       };
@@ -2804,6 +2908,10 @@ export default function App() {
                           hr_first_governor: updatedConfig.medical.enforceEasyHRCeiling,
                           pace_floor_sec_per_km: parsedPaceSec,
                           vt1_bpm: vt1Ceiling,
+                          vt2_bpm: validVt2Bpm,
+                          lthr_bpm: validLthrBpm,
+                          z2_range_bpm: sanitizeZonePair(activeProfile.runner_config.z2_range_bpm),
+                          z3_range_bpm: sanitizeZonePair(activeProfile.runner_config.z3_range_bpm),
                           vt1_pace_sec_per_km: parseMmSsOrNull(
                             vt1PaceInput,
                             activeProfile.runner_config.vt1_pace_sec_per_km ?? null

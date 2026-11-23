@@ -88,6 +88,19 @@ export function presetFromDistanceKm(
   return "custom";
 }
 
+export function sanitizeHrInput(raw: string): string {
+  return raw.replace(/\D/g, "").slice(0, 3);
+}
+
+export function parseValidHrBpm(raw: string | number | null | undefined): number | null {
+  if (raw === null || raw === undefined) return null;
+  const digits = typeof raw === "number" ? String(Math.round(raw)) : sanitizeHrInput(raw);
+  if (!digits) return null;
+  const n = Number(digits);
+  if (!Number.isFinite(n) || n < 30 || n > 240) return null;
+  return Math.round(n);
+}
+
 export interface HybridProfile {
   division: string | null;
   focusStations: string[];

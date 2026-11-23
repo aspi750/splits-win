@@ -13,7 +13,7 @@ use splits_win_lib::readiness::{ReadinessEngine, ReadinessInput};
 use splits_win_lib::scheduler::{
     is_within_catch_up_window, should_catch_up_briefing, should_send_morning_notification,
 };
-use splits_win_lib::storage::{Database, SharedStore};
+use splits_win_lib::storage::{CredentialStore, Database, SharedStore};
 
 fn make_temp_dir(name: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("splits-win-{name}-{}", uuid::Uuid::new_v4()));
@@ -1555,6 +1555,68 @@ fn v0_2_3_2_reentry_c25k_goals_and_clean_slate_purge() {
     assert!(dir.join("state").exists());
     assert!(dir.join("history").exists());
     assert!(dir.join("attachments").exists());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn v0_2_3_3_credentials_json_atomic_persistence_and_clean_slate_delete() {
+    let dir = make_temp_dir("creds-0233");
+    let cred_path = dir.join("credentials.json");
+
+    // Production path anchors directly to SharedStore base dir
+    assert_eq!(
+        CredentialStore::default_credentials_path(),
+        SharedStore::default_base_dir().join("credentials.json")
+    );
+
+    // 1. Atomic write & immediate read-back for Garmin & Gemini & uiserver keys
+    CredentialStore::save_garmin_key_at(&cred_path, "  garmin-personal-xyz  ").unwrap();
+    assert_eq!(
+        CredentialStore::read_garmin_key_at(&cred_path).as_deref(),
+        Some("garmin-personal-xyz")
+    );
+    assert_eq!(CredentialStore::read_gemini_key_at(&cred_path), None);
+
+    CredentialStore::save_gemini_key_at(&cred_path, "AIzaTestKey123").unwrap();
+    CredentialStore::save_uiserver_token_at(&cred_path, "ui-token-abc").unwrap();
+
+    // 2. Overwriting one key preserves the others and leaves zero .tmp file behind
+    CredentialStore::save_garmin_key_at(&cred_path, "garmin-personal-rotated").unwrap();
+    assert_eq!(
+        CredentialStore::read_garmin_key_at(&cred_path).as_deref(),
+        Some("garmin-personal-rotated")
+    );
+    assert_eq!(
+        CredentialStore::read_gemini_key_at(&cred_path).as_deref(),
+        Some("AIzaTestKey123")
+    );
+    assert_eq!(
+        CredentialStore::read_uiserver_token_at(&cred_path).as_deref(),
+        Some("ui-token-abc")
+    );
+    assert!(!dir.join("credentials.json.tmp").exists());
+
+    let raw = std::fs::read_to_string(&cred_path).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(parsed["garmin_personal_api_key"], "garmin-personal-rotated");
+    assert_eq!(parsed["gemini_api_key"], "AIzaTestKey123");
+    assert_eq!(parsed["uiserver_auth_token"], "ui-token-abc");
+
+    // 3. Individual delete leaves remaining keys intact
+    CredentialStore::delete_gemini_key_at(&cred_path).unwrap();
+    assert_eq!(CredentialStore::read_gemini_key_at(&cred_path), None);
+    assert_eq!(
+        CredentialStore::read_garmin_key_at(&cred_path).as_deref(),
+        Some("garmin-personal-rotated")
+    );
+
+    // 4. Clean-slate purge removes credentials.json and yields None on subsequent reads
+    CredentialStore::delete_credentials_file_at(&cred_path);
+    assert!(!cred_path.exists());
+    assert_eq!(CredentialStore::read_garmin_key_at(&cred_path), None);
+    assert_eq!(CredentialStore::read_gemini_key_at(&cred_path), None);
+    assert_eq!(CredentialStore::read_uiserver_token_at(&cred_path), None);
 
     let _ = std::fs::remove_dir_all(&dir);
 }
