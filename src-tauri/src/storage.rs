@@ -147,6 +147,15 @@ impl SharedStore {
         }
         let path = self.root_dir.join(trimmed);
         if path.exists() {
+            if let (Ok(canon_root), Ok(canon_target)) =
+                (fs::canonicalize(&self.root_dir), fs::canonicalize(&path))
+            {
+                if !canon_target.starts_with(&canon_root) {
+                    return Ok(());
+                }
+            } else {
+                return Ok(());
+            }
             fs::remove_file(path)?;
         }
         Ok(())

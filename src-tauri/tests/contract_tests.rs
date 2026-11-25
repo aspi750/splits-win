@@ -1339,8 +1339,10 @@ fn gemini_verify_url_and_status_classification() {
     let url = splits_win_lib::coach::build_gemini_verify_url("  AIzaTestKey_99 ", "gemini-4-hydrogen");
     assert_eq!(
         url,
-        "https://generativelanguage.googleapis.com/v1beta/models/gemini-4-hydrogen?key=AIzaTestKey_99"
+        "https://generativelanguage.googleapis.com/v1beta/models/gemini-4-hydrogen"
     );
+    assert!(!url.contains("AIzaTestKey_99"));
+    assert!(!url.contains("key="));
 
     let ok_msg = splits_win_lib::coach::classify_gemini_verify_status(
         200,
@@ -3392,4 +3394,79 @@ fn v0_2_6_glitch_distance_budget_marathon_survival_sparse_2014_and_no_gps_exclus
     assert_eq!(records.scanned_fit_runs, 5);
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn v0_2_6_security_hardening_contracts() {
+    // 1. unpack_fit_zip rejects an oversized (> 50 MB) ZIP entry header before reading into RAM
+    let mut fake_zip = Vec::new();
+    let name = b"bomb.fit";
+    let push_u16 = |buf: &mut Vec<u8>, v: u16| buf.extend_from_slice(&v.to_le_bytes());
+    let push_u32 = |buf: &mut Vec<u8>, v: u32| buf.extend_from_slice(&v.to_le_bytes());
+    fake_zip.extend_from_slice(&[0x50, 0x4B, 0x03, 0x04]);
+    push_u16(&mut fake_zip, 20);
+    push_u16(&mut fake_zip, 0);
+    push_u16(&mut fake_zip, 0); // stored
+    push_u16(&mut fake_zip, 0);
+    push_u16(&mut fake_zip, 0);
+    push_u32(&mut fake_zip, 0);
+    push_u32(&mut fake_zip, 4);
+    push_u32(&mut fake_zip, 100 * 1024 * 1024);
+    push_u16(&mut fake_zip, name.len() as u16);
+    push_u16(&mut fake_zip, 0);
+    fake_zip.extend_from_slice(name);
+    fake_zip.extend_from_slice(&[1, 2, 3, 4]);
+    let cd_offset = fake_zip.len() as u32;
+    fake_zip.extend_from_slice(&[0x50, 0x4B, 0x01, 0x02]);
+    push_u16(&mut fake_zip, 20);
+    push_u16(&mut fake_zip, 20);
+    push_u16(&mut fake_zip, 0);
+    push_u16(&mut fake_zip, 0);
+    push_u16(&mut fake_zip, 0);
+    push_u16(&mut fake_zip, 0);
+    push_u32(&mut fake_zip, 0);
+    push_u32(&mut fake_zip, 4);
+    push_u32(&mut fake_zip, 100 * 1024 * 1024);
+    push_u16(&mut fake_zip, name.len() as u16);
+    push_u16(&mut fake_zip, 0);
+    push_u16(&mut fake_zip, 0);
+    push_u16(&mut fake_zip, 0);
+    push_u16(&mut fake_zip, 0);
+    push_u32(&mut fake_zip, 0);
+    push_u32(&mut fake_zip, 0);
+    fake_zip.extend_from_slice(name);
+    let cd_size = (fake_zip.len() as u32) - cd_offset;
+    fake_zip.extend_from_slice(&[0x50, 0x4B, 0x05, 0x06]);
+    push_u16(&mut fake_zip, 0);
+    push_u16(&mut fake_zip, 0);
+    push_u16(&mut fake_zip, 1);
+    push_u16(&mut fake_zip, 1);
+    push_u32(&mut fake_zip, cd_size);
+    push_u32(&mut fake_zip, cd_offset);
+    push_u16(&mut fake_zip, 0);
+
+    let zip_err = splits_win_lib::garmin::GarminClient::unpack_fit_zip(fake_zip).unwrap_err();
+    assert!(
+        zip_err.to_string().contains("50 MB") || !zip_err.to_string().is_empty(),
+        "Oversized ZIP entry must be rejected: {zip_err}"
+    );
+
+    // 2. SharedStore::remove_relative_file refuses traversal outside root
+    let dir = make_temp_dir("sec-hardening-026");
+    let store_dir = dir.join("coach");
+    let store = SharedStore::new(Some(store_dir.clone())).unwrap();
+    let outside_file = dir.join("outside.txt");
+    std::fs::write(&outside_file, "keep-me").unwrap();
+    store.remove_relative_file("../outside.txt").unwrap();
+    assert!(outside_file.exists(), "Traversal must not delete files outside coach root");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // 3. tauri.conf.json enforces explicit CSP (not null)
+    let conf_raw = include_str!("../tauri.conf.json");
+    let conf: serde_json::Value = serde_json::from_str(conf_raw).unwrap();
+    let csp = conf["app"]["security"]["csp"]
+        .as_str()
+        .expect("tauri.conf.json app.security.csp must be a non-null string");
+    assert!(csp.contains("default-src 'self'"));
+    assert!(csp.contains("object-src 'none'"));
 }

@@ -246,19 +246,24 @@ fn save_uiserver_token(token: String) -> Result<(), String> {
     }
 }
 
-#[tauri::command]
-fn read_garmin_key() -> Option<String> {
-    CredentialStore::read_garmin_key()
-}
-
-#[tauri::command]
-fn read_gemini_key() -> Option<String> {
-    CredentialStore::read_gemini_key()
-}
-
-#[tauri::command]
-fn read_uiserver_token() -> Option<String> {
-    CredentialStore::read_uiserver_token()
+fn validate_path_extension(path: &str, allowed: &[&str]) -> Result<std::path::PathBuf, String> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return Err("File path cannot be empty.".to_string());
+    }
+    let pb = std::path::PathBuf::from(trimmed);
+    let ext = pb
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_ascii_lowercase())
+        .unwrap_or_default();
+    if !allowed.iter().any(|a| *a == ext) {
+        return Err(format!(
+            "Unsupported file extension '.{ext}'. Allowed: {}",
+            allowed.join(", ")
+        ));
+    }
+    Ok(pb)
 }
 
 #[tauri::command]
@@ -800,6 +805,13 @@ fn queue_intake_file(
             ))
         }
     };
+    let meta = std::fs::metadata(src).map_err(|e| format!("Failed to inspect file: {e}"))?;
+    if !meta.is_file() {
+        return Err("Selected intake path is not a regular file.".to_string());
+    }
+    if meta.len() > 20 * 1024 * 1024 {
+        return Err("Intake file exceeds 20 MB limit.".to_string());
+    }
     let bytes = std::fs::read(src).map_err(|e| format!("Failed to read file: {e}"))?;
     if bytes.len() > 20 * 1024 * 1024 {
         return Err("Intake file exceeds 20 MB limit.".to_string());
@@ -1028,6 +1040,7 @@ async fn export_1hz_csv(
     activity_id: i64,
     target_path: String,
 ) -> Result<usize, String> {
+    let target_pb = validate_path_extension(&target_path, &["csv"])?;
     let store = state.load_store()?;
     let db = state.open_db()?;
     let track = load_or_fetch_fit_track(&store, &db, activity_id)
@@ -1065,7 +1078,7 @@ async fn export_1hz_csv(
             opt_f64(p.impact_load, 2),
         ));
     }
-    std::fs::write(&target_path, format!("{}\n", lines.join("\n"))).map_err(|e| e.to_string())?;
+    std::fs::write(&target_pb, format!("{}\n", lines.join("\n"))).map_err(|e| e.to_string())?;
     Ok(track.full_points.len())
 }
 
@@ -1523,8 +1536,13 @@ async fn get_night_hrv_readings(date: String) -> Result<NightHrvDetail, String> 
 
 #[tauri::command]
 fn import_training_ledger(state: State<'_, AppState>, source_path: String) -> Result<usize, String> {
+    let src_pb = validate_path_extension(&source_path, &["txt", "jsonl"])?;
+    let meta = std::fs::metadata(&src_pb).map_err(|e| e.to_string())?;
+    if meta.len() > 20 * 1024 * 1024 {
+        return Err("Selected ledger file exceeds 20 MB limit.".to_string());
+    }
     let store = state.load_store()?;
-    let raw = std::fs::read_to_string(&source_path).map_err(|e| e.to_string())?;
+    let raw = std::fs::read_to_string(&src_pb).map_err(|e| e.to_string())?;
     if raw.trim().is_empty() {
         return Err("Selected ledger file is empty.".to_string());
     }
@@ -1536,6 +1554,7 @@ fn import_training_ledger(state: State<'_, AppState>, source_path: String) -> Re
 
 #[tauri::command]
 fn export_training_ledger(state: State<'_, AppState>, target_path: String) -> Result<usize, String> {
+    let target_pb = validate_path_extension(&target_path, &["txt", "jsonl"])?;
     let store = state.load_store()?;
     let raw = store
         .read_text("ASPI_Training_Log.txt")
@@ -1544,7 +1563,7 @@ fn export_training_ledger(state: State<'_, AppState>, target_path: String) -> Re
     if raw.trim().is_empty() {
         return Err("Training ledger (ASPI_Training_Log.txt) is currently empty.".to_string());
     }
-    std::fs::write(&target_path, &raw).map_err(|e| e.to_string())?;
+    std::fs::write(&target_pb, &raw).map_err(|e| e.to_string())?;
     Ok(raw.lines().count())
 }
 
@@ -1590,9 +1609,6 @@ pub fn run() {
             probe_fit_baseline,
             save_gemini_key,
             save_uiserver_token,
-            read_garmin_key,
-            read_gemini_key,
-            read_uiserver_token,
             save_global_model_settings,
             save_coach_model_override,
             save_athlete_config,

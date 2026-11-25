@@ -301,18 +301,13 @@ pub fn consolidate_proposals(proposals: Vec<CoachUpdateProposal>) -> Vec<CoachUp
 }
 
 pub fn build_gemini_verify_url(api_key: &str, model_id: &str) -> String {
-    let trimmed = api_key.trim();
+    let _trimmed = api_key.trim();
     let model = if model_id.trim().is_empty() {
         GEMINI_MODEL_ID
     } else {
         model_id.trim()
     };
-    let mut url = reqwest::Url::parse(&format!(
-        "https://generativelanguage.googleapis.com/v1beta/models/{model}"
-    ))
-    .expect("static Gemini URL must parse");
-    url.query_pairs_mut().append_pair("key", trimmed);
-    url.to_string()
+    format!("https://generativelanguage.googleapis.com/v1beta/models/{model}")
 }
 
 pub fn classify_gemini_verify_status(status: u16, body: &str) -> Result<String, String> {
@@ -374,6 +369,7 @@ pub async fn verify_gemini_api_key(api_key: &str) -> Result<String, String> {
         .map_err(|e| e.to_string())?;
     let resp = client
         .get(&url)
+        .header("x-goog-api-key", trimmed)
         .send()
         .await
         .map_err(|e| format!("Network error: {e}"))?;
@@ -663,10 +659,11 @@ pub async fn run_gemini_coach_turn(
     let resolved = resolve_model(ModelScope::Coach, model_settings);
     let client = Client::new();
     let endpoint = format!(
-        "https://generativelanguage.googleapis.com/v1beta/models/{}:streamGenerateContent?alt=sse&key={api_key}",
+        "https://generativelanguage.googleapis.com/v1beta/models/{}:streamGenerateContent?alt=sse",
         resolved.model_id
     );
 
+    let canon_root = std::fs::canonicalize(store.root()).ok();
     let mut initial_parts: Vec<Value> = vec![json!({ "text": user_prompt })];
     for f in intake_files {
         let rel = f.relative_path.trim().trim_start_matches(['/', '\\']);
@@ -676,6 +673,14 @@ pub async fn run_gemini_coach_turn(
         let full_path = store.root().join(rel);
         if !full_path.exists() {
             continue;
+        }
+        if let Some(ref root) = canon_root {
+            let Ok(canon_file) = std::fs::canonicalize(&full_path) else {
+                continue;
+            };
+            if !canon_file.starts_with(root) {
+                continue;
+            }
         }
         let lower_name = f.file_name.to_lowercase();
         if lower_name.ends_with(".pdf") || f.mime_type == "application/pdf" {
@@ -2640,7 +2645,7 @@ pub async fn generate_daily_briefing(
 
     let system_instruction = sys_parts.join("\n\n");
     let endpoint = format!(
-        "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={api_key}",
+        "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent",
         resolved.model_id
     );
     let body = json!({
@@ -3316,7 +3321,7 @@ pub async fn generate_health_take(
     );
 
     let endpoint = format!(
-        "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={api_key}",
+        "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent",
         resolved.model_id
     );
     let body = json!({

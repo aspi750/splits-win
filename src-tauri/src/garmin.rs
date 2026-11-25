@@ -207,15 +207,29 @@ impl GarminClient {
         Self::unpack_fit_zip(zip_bytes)
     }
 
-    fn unpack_fit_zip(zip_bytes: Vec<u8>) -> Result<Vec<u8>, GarminError> {
+    pub fn unpack_fit_zip(zip_bytes: Vec<u8>) -> Result<Vec<u8>, GarminError> {
+        const MAX_FIT_UNCOMPRESSED_BYTES: u64 = 50 * 1024 * 1024;
         let cursor = Cursor::new(zip_bytes);
         let mut archive = zip::ZipArchive::new(cursor).map_err(|e| GarminError::Zip(e.to_string()))?;
         let archive_len = archive.len();
         for i in 0..archive_len {
-            let mut file = archive.by_index(i).map_err(|e| GarminError::Zip(e.to_string()))?;
+            let file = archive.by_index(i).map_err(|e| GarminError::Zip(e.to_string()))?;
             if file.name().to_lowercase().ends_with(".fit") || archive_len == 1 {
+                if file.size() > MAX_FIT_UNCOMPRESSED_BYTES {
+                    return Err(GarminError::Zip(format!(
+                        "Activity FIT entry exceeds 50 MB uncompressed limit ({} bytes)",
+                        file.size()
+                    )));
+                }
                 let mut out = Vec::new();
-                file.read_to_end(&mut out).map_err(|e| GarminError::Zip(e.to_string()))?;
+                file.take(MAX_FIT_UNCOMPRESSED_BYTES + 1)
+                    .read_to_end(&mut out)
+                    .map_err(|e| GarminError::Zip(e.to_string()))?;
+                if (out.len() as u64) > MAX_FIT_UNCOMPRESSED_BYTES {
+                    return Err(GarminError::Zip(
+                        "Activity FIT entry exceeded 50 MB uncompressed limit while reading".to_string(),
+                    ));
+                }
                 return Ok(out);
             }
         }
