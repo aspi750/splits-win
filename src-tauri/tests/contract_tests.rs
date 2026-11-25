@@ -1915,3 +1915,86 @@ fn v0_2_4_sqlite_migration_briefing_cache_and_theme_mode() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn v0_2_4_1_legacy_v0_2_3_3_upgrade_bootstrap_serializes_cleanly() {
+    let dir = make_temp_dir("upgrade-0233");
+    let store = SharedStore::new(Some(dir.clone())).unwrap();
+    let db_path = dir.join("state").join("splits.sqlite");
+
+    // Seed pre-v0.2.4 (v0.2.3.3) schema for both `days` and `activities`
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE activities (
+                garmin_id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                type_key TEXT NOT NULL,
+                start_iso TEXT NOT NULL,
+                distance_m REAL NOT NULL,
+                duration_sec REAL NOT NULL,
+                moving_duration_sec REAL NOT NULL,
+                elevation_gain_m REAL NOT NULL,
+                average_hr REAL,
+                max_hr REAL,
+                cadence_spm REAL,
+                training_load REAL,
+                shoe_name TEXT
+            );
+            CREATE TABLE days (
+                date TEXT PRIMARY KEY,
+                resting_hr INTEGER,
+                stress_avg INTEGER,
+                body_battery_high INTEGER,
+                body_battery_latest INTEGER,
+                steps INTEGER,
+                step_goal INTEGER,
+                sleep_seconds INTEGER,
+                sleep_score INTEGER,
+                hrv_last_night INTEGER,
+                hrv_status TEXT
+            );
+            INSERT INTO activities (
+                garmin_id, name, type_key, start_iso, distance_m, duration_sec, moving_duration_sec,
+                elevation_gain_m, average_hr, max_hr, cadence_spm, training_load, shoe_name
+            ) VALUES (
+                1001, 'Legacy Easy Run', 'running', '2026-11-24T07:30:00Z', 5000.0, 1800.0, 1790.0,
+                25.0, 136.0, 144.0, 174.0, 42.0, NULL
+            );
+            INSERT INTO days (
+                date, resting_hr, stress_avg, body_battery_high, body_battery_latest,
+                steps, step_goal, sleep_seconds, sleep_score, hrv_last_night, hrv_status
+            ) VALUES (
+                '2026-11-24', 52, NULL, 80, NULL, 4200, 8000, 24000, 81, NULL, NULL
+            );",
+        )
+        .unwrap();
+    }
+
+    let db = Database::open(&db_path).unwrap();
+    let settings = splits_win_lib::storage::AppSettings::default();
+    let val = splits_win_lib::build_bootstrap_state(&store, &db, &settings).unwrap();
+    let json = serde_json::to_string(&val).unwrap();
+    assert!(!json.is_empty());
+
+    let days = val["days"].as_array().expect("days array");
+    assert_eq!(days.len(), 1);
+    assert_eq!(days[0]["date"], "2026-11-24");
+    assert_eq!(days[0]["sleep_seconds"], 24000);
+    assert_eq!(days[0]["sleep_duration_sec"], 24000);
+    assert!(days[0]["body_battery_series"].is_null());
+    assert!(days[0]["sleep_start"].is_null());
+    assert!(days[0]["sleep_end"].is_null());
+    assert!(days[0]["hrv_weekly_avg"].is_null());
+    assert!(days[0]["hrv_baseline_low"].is_null());
+    assert!(days[0]["hrv_baseline_high"].is_null());
+
+    let acts = val["activities"].as_array().expect("activities array");
+    assert_eq!(acts.len(), 1);
+    assert_eq!(acts[0]["garmin_id"], 1001);
+
+    assert!(val["daily_briefing"].is_null());
+    assert_eq!(val["theme_mode"], "system");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

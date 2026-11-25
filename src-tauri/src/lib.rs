@@ -40,17 +40,17 @@ impl AppState {
     }
 }
 
-#[tauri::command]
-fn get_bootstrap_state(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
-    let store = state.load_store()?;
-    let db = state.open_db()?;
+pub fn build_bootstrap_state(
+    store: &SharedStore,
+    db: &Database,
+    settings: &AppSettings,
+) -> Result<serde_json::Value, String> {
     let has_garmin_key = CredentialStore::read_garmin_key().is_some();
     let has_gemini_key = CredentialStore::read_gemini_key().is_some();
     let config = store.load_athlete_config().map_err(|e| e.to_string())?.unwrap_or_default();
-    let readiness: Option<ReadinessState> = store.read_json("readiness_state.json").map_err(|e| e.to_string())?;
+    let readiness: Option<ReadinessState> = store.read_json("readiness_state.json").ok().flatten();
     let activities = db.list_activities(50).map_err(|e| e.to_string())?;
     let days = db.list_days(60).map_err(|e| e.to_string())?;
-    let settings = state.settings.lock().unwrap().clone();
     let profile_md = store.read_text("COACH_PROFILE.md").map_err(|e| e.to_string())?.unwrap_or_default();
     let plan_md = store.read_text("TRAINING_PLAN.md").map_err(|e| e.to_string())?.unwrap_or_default();
     let needs_initial_coach_setup = profile_md.trim().is_empty() || plan_md.trim().is_empty();
@@ -78,6 +78,14 @@ fn get_bootstrap_state(state: State<'_, AppState>) -> Result<serde_json::Value, 
         "daily_briefing": daily_briefing,
         "theme_mode": theme_mode,
     }))
+}
+
+#[tauri::command]
+fn get_bootstrap_state(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+    let store = state.load_store()?;
+    let db = state.open_db()?;
+    let settings = state.settings.lock().unwrap().clone();
+    build_bootstrap_state(&store, &db, &settings)
 }
 
 #[tauri::command]

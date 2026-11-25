@@ -358,7 +358,8 @@ export default function App() {
   const [confirmCleanSlate, setConfirmCleanSlate] = useState(false);
   const [cleanSlateBusy, setCleanSlateBusy] = useState(false);
 
-  const [appVersion, setAppVersion] = useState<string>("0.2.4");
+  const [appVersion, setAppVersion] = useState<string>("0.2.4.1-beta");
+  const [bootstrapError, setBootstrapError] = useState<string | null>(null);
   const [themeMode, setThemeMode] = useState<ThemeMode>(() => {
     try {
       const saved = localStorage.getItem("splits_theme_mode");
@@ -403,64 +404,69 @@ export default function App() {
   }
 
   async function reload() {
-    const data = await invoke<BootstrapState>("get_bootstrap_state");
-    setState(data);
-    setBriefing(data.daily_briefing ?? null);
-    const resolvedTheme: ThemeMode =
-      data.theme_mode === "dark" || data.theme_mode === "light" ? data.theme_mode : "system";
-    applyThemeMode(resolvedTheme);
-    setDraftConfig(data.athlete_config);
-    const loadedProfile: UserProfile = data.user_profile ?? {
-      athlete_type: "runner",
-      onboarding_completed: false,
-      runner_config: {
-        primary_distance: null,
-        hr_first_governor: true,
-        pace_floor_sec_per_km: null,
-        z2_range_bpm: null,
-        z3_range_bpm: null,
-        lthr_bpm: null,
-        vt1_bpm: null,
-        vt2_bpm: null,
-        vt1_pace_sec_per_km: null,
-        vt2_pace_sec_per_km: null,
-        max_hr_bpm: null,
-        resting_hr_bpm: null,
-      },
-      hyrox_config: {
-        division: null,
-        watch_logging_mode: null,
-        target_total_time_sec: null,
-        fresh_1km_pace_sec: null,
-        compromised_1km_target_sec: null,
-        weak_stations: [],
-      },
-    };
-    setDraftProfile(loadedProfile);
-    const sec = data.athlete_config.medical.minPaceSecPerKm;
-    setPaceFloorInput(
-      sec && sec > 0 ? `${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, "0")}` : ""
-    );
-    setVt1PaceInput(formatMmSsOptional(loadedProfile.runner_config.vt1_pace_sec_per_km));
-    setVt2PaceInput(formatMmSsOptional(loadedProfile.runner_config.vt2_pace_sec_per_km));
-    setFresh1kmInput(formatMmSsOptional(loadedProfile.hyrox_config.fresh_1km_pace_sec));
-    setCompromised1kmInput(formatMmSsOptional(loadedProfile.hyrox_config.compromised_1km_target_sec));
-    setHyroxTargetTimeInput(
-      loadedProfile.hyrox_config.target_total_time_sec && loadedProfile.hyrox_config.target_total_time_sec > 0
-        ? formatDuration(loadedProfile.hyrox_config.target_total_time_sec)
-        : ""
-    );
-    setDistancePreset(
-      presetFromDistanceKm(
-        data.athlete_config.objective.raceDistanceKm,
-        data.athlete_config.objective.goalType !== "race"
-      )
-    );
-    setRaceDistanceInput(
-      data.athlete_config.objective.raceDistanceKm && data.athlete_config.objective.raceDistanceKm > 0
-        ? data.athlete_config.objective.raceDistanceKm.toFixed(1)
-        : ""
-    );
+    try {
+      setBootstrapError(null);
+      const data = await invoke<BootstrapState>("get_bootstrap_state");
+      setState(data);
+      setBriefing(data.daily_briefing ?? null);
+      const resolvedTheme: ThemeMode =
+        data.theme_mode === "dark" || data.theme_mode === "light" ? data.theme_mode : "system";
+      applyThemeMode(resolvedTheme);
+      setDraftConfig(data.athlete_config);
+      const loadedProfile: UserProfile = data.user_profile ?? {
+        athlete_type: "runner",
+        onboarding_completed: false,
+        runner_config: {
+          primary_distance: null,
+          hr_first_governor: true,
+          pace_floor_sec_per_km: null,
+          z2_range_bpm: null,
+          z3_range_bpm: null,
+          lthr_bpm: null,
+          vt1_bpm: null,
+          vt2_bpm: null,
+          vt1_pace_sec_per_km: null,
+          vt2_pace_sec_per_km: null,
+          max_hr_bpm: null,
+          resting_hr_bpm: null,
+        },
+        hyrox_config: {
+          division: null,
+          watch_logging_mode: null,
+          target_total_time_sec: null,
+          fresh_1km_pace_sec: null,
+          compromised_1km_target_sec: null,
+          weak_stations: [],
+        },
+      };
+      setDraftProfile(loadedProfile);
+      const sec = data.athlete_config.medical.minPaceSecPerKm;
+      setPaceFloorInput(
+        sec && sec > 0 ? `${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, "0")}` : ""
+      );
+      setVt1PaceInput(formatMmSsOptional(loadedProfile.runner_config.vt1_pace_sec_per_km));
+      setVt2PaceInput(formatMmSsOptional(loadedProfile.runner_config.vt2_pace_sec_per_km));
+      setFresh1kmInput(formatMmSsOptional(loadedProfile.hyrox_config.fresh_1km_pace_sec));
+      setCompromised1kmInput(formatMmSsOptional(loadedProfile.hyrox_config.compromised_1km_target_sec));
+      setHyroxTargetTimeInput(
+        loadedProfile.hyrox_config.target_total_time_sec && loadedProfile.hyrox_config.target_total_time_sec > 0
+          ? formatDuration(loadedProfile.hyrox_config.target_total_time_sec)
+          : ""
+      );
+      setDistancePreset(
+        presetFromDistanceKm(
+          data.athlete_config.objective.raceDistanceKm,
+          data.athlete_config.objective.goalType !== "race"
+        )
+      );
+      setRaceDistanceInput(
+        data.athlete_config.objective.raceDistanceKm && data.athlete_config.objective.raceDistanceKm > 0
+          ? data.athlete_config.objective.raceDistanceKm.toFixed(1)
+          : ""
+      );
+    } catch (err) {
+      setBootstrapError(err instanceof Error ? err.message : String(err));
+    }
   }
 
   async function runUpdateCheck(silent: boolean) {
@@ -582,6 +588,19 @@ export default function App() {
     return out;
   }, [state]);
 
+  const rhrBaseline30d = useMemo(() => {
+    if (!state) return null;
+    const cfgBase = state.athlete_config.specs.restingHRBaseline;
+    if (cfgBase && cfgBase > 0) return cfgBase;
+    const vals = state.days
+      .slice(0, 30)
+      .map((d) => d.resting_hr)
+      .filter((v): v is number => v != null && v > 0)
+      .sort((a, b) => a - b);
+    if (vals.length === 0) return null;
+    return vals[Math.floor(vals.length / 2)];
+  }, [state]);
+
   const todayIsoForEffects = toLocalIsoDate(new Date());
   const todayDayForEffects = state?.days.find((d) => d.date === todayIsoForEffects) ?? state?.days[0];
   const todayHasSleepForEffects =
@@ -663,6 +682,21 @@ export default function App() {
   }, [state?.has_garmin_key, state?.settings.profile_onboarded, tab, todayIsoForEffects]);
 
   if (!state || !draftConfig) {
+    if (bootstrapError) {
+      return (
+        <div className="main">
+          <div className="card" style={{ maxWidth: 560, margin: "40px auto" }}>
+            <h3 style={{ marginTop: 0 }}>Failed to load Splits Coach</h3>
+            <p className="key-status-err" style={{ marginBottom: 14 }}>
+              {bootstrapError}
+            </p>
+            <button className="primary" onClick={() => void reload()}>
+              Retry
+            </button>
+          </div>
+        </div>
+      );
+    }
     return <div className="main">Loading Splits Coach…</div>;
   }
 
@@ -834,18 +868,6 @@ export default function App() {
   const stepsSeriesPoints = recentDaysAsc
     .map((d) => d.steps)
     .filter((v): v is number => v != null && v >= 0);
-
-  const rhrBaseline30d = useMemo(() => {
-    const cfgBase = state.athlete_config.specs.restingHRBaseline;
-    if (cfgBase && cfgBase > 0) return cfgBase;
-    const vals = state.days
-      .slice(0, 30)
-      .map((d) => d.resting_hr)
-      .filter((v): v is number => v != null && v > 0)
-      .sort((a, b) => a - b);
-    if (vals.length === 0) return null;
-    return vals[Math.floor(vals.length / 2)];
-  }, [state]);
 
   const sleepSeconds = todayDay ? (todayDay.sleep_seconds ?? todayDay.sleep_duration_sec ?? null) : null;
   const sleepStartHhMm = extractHhMm(todayDay?.sleep_start);
