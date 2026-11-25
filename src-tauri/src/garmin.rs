@@ -1,8 +1,8 @@
 use crate::models::{
-    default_temp_source, ActivityRecord, AthleteConfig, ClassifiedLap, CompromisedRunAudit,
-    DayRecord, FitBaselineProbe, FitGuardrailAudit, FitLap, FitSplit, FitTrackAnalysis,
-    FitTrackPoint, HyroxDissection, LapKind, WeightEntry, APP_SERVICE, GARMIN_ACCOUNT,
-    GARMIN_KEYRING_SERVICE,
+    default_temp_source, ActivityRecord, AthleteConfig, BodyBatteryPoint, ClassifiedLap,
+    CompromisedRunAudit, DayRecord, FitBaselineProbe, FitGuardrailAudit, FitLap, FitSplit,
+    FitTrackAnalysis, FitTrackPoint, HyroxDissection, LapKind, WeightEntry, APP_SERVICE,
+    GARMIN_ACCOUNT, GARMIN_KEYRING_SERVICE,
 };
 use crate::storage::CredentialStore;
 use chrono::{DateTime, Duration, Local, NaiveDate, NaiveDateTime, TimeZone, Utc};
@@ -13,6 +13,8 @@ use std::io::{Cursor, Read};
 use std::time::{Duration as StdDuration, Instant};
 use thiserror::Error;
 use tokio::sync::Mutex;
+
+pub const WELLNESS_CHUNK_DAYS: i64 = 28;
 
 pub const GARMIN_API_BASE: &str = "https://personal.connectapi.garmin.com";
 const TOKEN_PATH: &str = "/personalapitoken-service/personal-api/personal-api-key/token";
@@ -194,9 +196,10 @@ impl GarminClient {
     }
 
     pub async fn sync_recent(&self, days_back: i64) -> Result<(Vec<ActivityRecord>, Vec<DayRecord>), GarminError> {
-        let now = Utc::now();
-        let start_str = (now - Duration::days(days_back)).format("%Y-%m-%d").to_string();
-        let end_str = now.format("%Y-%m-%d").to_string();
+        let now_utc = Utc::now();
+        let end_date = Local::now().date_naive().max(now_utc.date_naive());
+        let start_date = end_date - Duration::days(days_back.max(1));
+        let start_str = start_date.format("%Y-%m-%d").to_string();
 
         // 1. Activities
         let act_bytes = self
@@ -213,7 +216,7 @@ impl GarminClient {
                 garmin_id: dto.activity_id,
                 name: dto.activity_name.unwrap_or_default(),
                 type_key: dto.activity_type.and_then(|t| t.type_key).unwrap_or_else(|| "other".to_string()),
-                start_iso: dto.start_time_local.unwrap_or_else(|| now.to_rfc3339()),
+                start_iso: dto.start_time_local.unwrap_or_else(|| now_utc.to_rfc3339()),
                 distance_m: dto.distance.unwrap_or(0.0),
                 duration_sec: dto.duration.unwrap_or(0.0),
                 moving_duration_sec: dto.moving_duration.or(dto.duration).unwrap_or(0.0),
@@ -230,75 +233,8 @@ impl GarminClient {
             });
         }
 
-        // 2. Daily summaries + Sleep + HRV
-        let mut days_map: HashMap<String, DayRecord> = HashMap::new();
-
-        if let Ok(sum_bytes) = self
-            .get_bytes(
-                "/usersummary-service/v2/dailysummaries",
-                &[("startDate", &start_str), ("endDate", &end_str)],
-                "application/json",
-            )
-            .await
-        {
-            if let Ok(summaries) = serde_json::from_slice::<DailySummariesDTO>(&sum_bytes) {
-                for d in summaries.data {
-                    if let Some(date) = d.calendar_date {
-                        let entry = days_map.entry(date.clone()).or_insert_with(|| empty_day(&date));
-                        entry.resting_hr = d.heart_rate.and_then(|h| h.resting_value);
-                        entry.stress_avg = d.stress.and_then(|s| s.avg_level);
-                        if let Some(bb) = d.body_battery {
-                            entry.body_battery_high = bb.max_value;
-                            entry.body_battery_latest = bb.latest_value;
-                        }
-                        if let Some(steps) = d.movement.and_then(|m| m.steps) {
-                            entry.steps = steps.count.or(steps.value);
-                            entry.step_goal = steps.goal;
-                        }
-                    }
-                }
-            }
-        }
-
-        if let Ok(sleep_bytes) = self
-            .get_bytes(
-                "/sleep-service/sleep/dailySleepSummariesByDate",
-                &[("startDate", &start_str), ("endDate", &end_str)],
-                "application/json",
-            )
-            .await
-        {
-            if let Ok(sleeps) = serde_json::from_slice::<Vec<SleepDTO>>(&sleep_bytes) {
-                for s in sleeps {
-                    if let Some(date) = s.calendar_date {
-                        let entry = days_map.entry(date.clone()).or_insert_with(|| empty_day(&date));
-                        entry.sleep_seconds = s.sleep_time_seconds;
-                        entry.sleep_score = s.sleep_scores.and_then(|sc| sc.overall).and_then(|o| o.value);
-                    }
-                }
-            }
-        }
-
-        if let Ok(hrv_bytes) = self
-            .get_bytes(
-                &format!("/hrv-service/hrv/daily/{start_str}/{end_str}"),
-                &[],
-                "application/json",
-            )
-            .await
-        {
-            if let Ok(hrv) = serde_json::from_slice::<HRVRangeDTO>(&hrv_bytes) {
-                for h in hrv.hrv_summaries.unwrap_or_default() {
-                    if let Some(date) = h.calendar_date {
-                        let entry = days_map.entry(date.clone()).or_insert_with(|| empty_day(&date));
-                        entry.hrv_last_night = h.last_night_avg;
-                        entry.hrv_status = h.status;
-                    }
-                }
-            }
-        }
-
-        let days: Vec<DayRecord> = days_map.into_values().collect();
+        // 2. Daily summaries + Sleep + HRV + Steps + Body Battery (chunked <= 28 days per call)
+        let days = self.sync_wellness_range(start_date, end_date).await;
         Ok((activities, days))
     }
 
@@ -312,7 +248,7 @@ impl GarminClient {
             return self.sync_recent(35).await;
         }
 
-        let now = Utc::now();
+        let now_utc = Utc::now();
         let mut activities = Vec::new();
         let mut start = 0usize;
         const PAGE_SIZE: usize = 100;
@@ -338,7 +274,7 @@ impl GarminClient {
                         .activity_type
                         .and_then(|t| t.type_key)
                         .unwrap_or_else(|| "other".to_string()),
-                    start_iso: dto.start_time_local.unwrap_or_else(|| now.to_rfc3339()),
+                    start_iso: dto.start_time_local.unwrap_or_else(|| now_utc.to_rfc3339()),
                     distance_m: dto.distance.unwrap_or(0.0),
                     duration_sec: dto.duration.unwrap_or(0.0),
                     moving_duration_sec: dto.moving_duration.or(dto.duration).unwrap_or(0.0),
@@ -360,16 +296,20 @@ impl GarminClient {
             start += PAGE_SIZE;
         }
 
-        // 365-day wellness backfill in 35-day chunks
+        // 365-day wellness backfill in 28-day chunks (Garmin Personal API limit)
+        let end_date = Local::now().date_naive().max(now_utc.date_naive());
+        let earliest = end_date - Duration::days(364);
+        let days = self.sync_wellness_range(earliest, end_date).await;
+        Ok((activities, days))
+    }
+
+    async fn sync_wellness_range(&self, earliest: NaiveDate, end_date: NaiveDate) -> Vec<DayRecord> {
         let mut days_map: HashMap<String, DayRecord> = HashMap::new();
-        let mut chunk_end = now;
-        let earliest = now - Duration::days(365);
-        while chunk_end > earliest {
-            let chunk_start = (chunk_end - Duration::days(35)).max(earliest);
+        for (chunk_start, chunk_end) in chunk_date_range(earliest, end_date, WELLNESS_CHUNK_DAYS) {
             let s_str = chunk_start.format("%Y-%m-%d").to_string();
             let e_str = chunk_end.format("%Y-%m-%d").to_string();
 
-            if let Ok(sum_bytes) = self
+            match self
                 .get_bytes(
                     "/usersummary-service/v2/dailysummaries",
                     &[("startDate", &s_str), ("endDate", &e_str)],
@@ -377,26 +317,11 @@ impl GarminClient {
                 )
                 .await
             {
-                if let Ok(summaries) = serde_json::from_slice::<DailySummariesDTO>(&sum_bytes) {
-                    for d in summaries.data {
-                        if let Some(date) = d.calendar_date {
-                            let entry = days_map.entry(date.clone()).or_insert_with(|| empty_day(&date));
-                            entry.resting_hr = d.heart_rate.and_then(|h| h.resting_value);
-                            entry.stress_avg = d.stress.and_then(|s| s.avg_level);
-                            if let Some(bb) = d.body_battery {
-                                entry.body_battery_high = bb.max_value;
-                                entry.body_battery_latest = bb.latest_value;
-                            }
-                            if let Some(steps) = d.movement.and_then(|m| m.steps) {
-                                entry.steps = steps.count.or(steps.value);
-                                entry.step_goal = steps.goal;
-                            }
-                        }
-                    }
-                }
+                Ok(bytes) => parse_daily_summaries_json(&bytes, &mut days_map),
+                Err(err) => eprintln!("Garmin dailysummaries skipped ({s_str}..{e_str}): {err}"),
             }
 
-            if let Ok(sleep_bytes) = self
+            match self
                 .get_bytes(
                     "/sleep-service/sleep/dailySleepSummariesByDate",
                     &[("startDate", &s_str), ("endDate", &e_str)],
@@ -404,18 +329,11 @@ impl GarminClient {
                 )
                 .await
             {
-                if let Ok(sleeps) = serde_json::from_slice::<Vec<SleepDTO>>(&sleep_bytes) {
-                    for s in sleeps {
-                        if let Some(date) = s.calendar_date {
-                            let entry = days_map.entry(date.clone()).or_insert_with(|| empty_day(&date));
-                            entry.sleep_seconds = s.sleep_time_seconds;
-                            entry.sleep_score = s.sleep_scores.and_then(|sc| sc.overall).and_then(|o| o.value);
-                        }
-                    }
-                }
+                Ok(bytes) => parse_sleep_summaries_json(&bytes, &mut days_map),
+                Err(err) => eprintln!("Garmin sleep skipped ({s_str}..{e_str}): {err}"),
             }
 
-            if let Ok(hrv_bytes) = self
+            match self
                 .get_bytes(
                     &format!("/hrv-service/hrv/daily/{s_str}/{e_str}"),
                     &[],
@@ -423,22 +341,78 @@ impl GarminClient {
                 )
                 .await
             {
-                if let Ok(hrv) = serde_json::from_slice::<HRVRangeDTO>(&hrv_bytes) {
-                    for h in hrv.hrv_summaries.unwrap_or_default() {
-                        if let Some(date) = h.calendar_date {
-                            let entry = days_map.entry(date.clone()).or_insert_with(|| empty_day(&date));
-                            entry.hrv_last_night = h.last_night_avg;
-                            entry.hrv_status = h.status;
-                        }
-                    }
-                }
+                Ok(bytes) => parse_hrv_range_json(&bytes, &mut days_map),
+                Err(err) => eprintln!("Garmin HRV skipped ({s_str}..{e_str}): {err}"),
             }
 
-            chunk_end = chunk_start - Duration::days(1);
+            match self
+                .get_bytes(
+                    &format!("/usersummary-service/stats/steps/daily/{s_str}/{e_str}"),
+                    &[],
+                    "application/json",
+                )
+                .await
+            {
+                Ok(bytes) => parse_steps_json(&bytes, &mut days_map),
+                Err(err) => eprintln!("Garmin steps skipped ({s_str}..{e_str}): {err}"),
+            }
         }
 
-        let days: Vec<DayRecord> = days_map.into_values().collect();
-        Ok((activities, days))
+        // Intraday Body Battery curve for the most recent 3 days (96 chunks/day ~ every 15 min / 6 min)
+        let bb_start = (end_date - Duration::days(2)).max(earliest);
+        let bb_s_str = bb_start.format("%Y-%m-%d").to_string();
+        let bb_e_str = end_date.format("%Y-%m-%d").to_string();
+        match self
+            .get_bytes(
+                "/wellness-service/wellness/bodyBattery/reports/daily",
+                &[
+                    ("startDate", &bb_s_str),
+                    ("endDate", &bb_e_str),
+                    ("chunks", "96"),
+                ],
+                "application/json",
+            )
+            .await
+        {
+            Ok(bytes) => parse_body_battery_days_json(&bytes, &mut days_map),
+            Err(err) => eprintln!("Garmin bodyBattery intraday skipped ({bb_s_str}..{bb_e_str}): {err}"),
+        }
+
+        let mut days: Vec<DayRecord> = days_map.into_values().collect();
+        days.sort_by(|a, b| b.date.cmp(&a.date));
+        days
+    }
+
+    pub async fn fetch_today_body_battery(&self) -> Result<Option<DayRecord>, GarminError> {
+        let today = Local::now().date_naive();
+        let today_str = today.format("%Y-%m-%d").to_string();
+        let mut days_map: HashMap<String, DayRecord> = HashMap::new();
+
+        let bb_bytes = self
+            .get_bytes(
+                "/wellness-service/wellness/bodyBattery/reports/daily",
+                &[
+                    ("startDate", &today_str),
+                    ("endDate", &today_str),
+                    ("chunks", "96"),
+                ],
+                "application/json",
+            )
+            .await?;
+        parse_body_battery_days_json(&bb_bytes, &mut days_map);
+
+        if let Ok(sum_bytes) = self
+            .get_bytes(
+                "/usersummary-service/v2/dailysummaries",
+                &[("startDate", &today_str), ("endDate", &today_str)],
+                "application/json",
+            )
+            .await
+        {
+            parse_daily_summaries_json(&sum_bytes, &mut days_map);
+        }
+
+        Ok(days_map.remove(&today_str))
     }
 
     /// Lightweight metadata-only fetch for a single activity (`/activity-service/activity/{activityId}`)
@@ -672,19 +646,428 @@ pub fn parse_weight_range_json(bytes: &[u8]) -> Vec<WeightEntry> {
     entries
 }
 
+pub fn chunk_date_range(
+    start: NaiveDate,
+    end: NaiveDate,
+    max_days_inclusive: i64,
+) -> Vec<(NaiveDate, NaiveDate)> {
+    if end < start {
+        return Vec::new();
+    }
+    let span = max_days_inclusive.max(1);
+    let mut chunks = Vec::new();
+    let mut chunk_end = end;
+    while chunk_end >= start {
+        let chunk_start = (chunk_end - Duration::days(span - 1)).max(start);
+        chunks.push((chunk_start, chunk_end));
+        if chunk_start <= start {
+            break;
+        }
+        chunk_end = chunk_start - Duration::days(1);
+    }
+    chunks
+}
+
+fn json_opt_i32(val: Option<&serde_json::Value>) -> Option<i32> {
+    let v = val?;
+    if v.is_null() {
+        return None;
+    }
+    if let Some(n) = v.as_i64() {
+        return i32::try_from(n).ok();
+    }
+    if let Some(n) = v.as_u64() {
+        return i32::try_from(n).ok();
+    }
+    if let Some(f) = v.as_f64().filter(|x| x.is_finite()) {
+        return Some(f.round() as i32);
+    }
+    if let Some(s) = v.as_str() {
+        let trimmed = s.trim();
+        if let Ok(i) = trimmed.parse::<i32>() {
+            return Some(i);
+        }
+        if let Some(f) = trimmed.parse::<f64>().ok().filter(|x| x.is_finite()) {
+            return Some(f.round() as i32);
+        }
+    }
+    None
+}
+
+fn json_opt_f64(val: Option<&serde_json::Value>) -> Option<f64> {
+    let v = val?;
+    if v.is_null() {
+        return None;
+    }
+    if let Some(f) = v.as_f64().filter(|x| x.is_finite()) {
+        return Some(f);
+    }
+    v.as_str()
+        .and_then(|s| s.trim().parse::<f64>().ok())
+        .filter(|x| x.is_finite())
+}
+
+fn json_opt_nonempty_str(val: Option<&serde_json::Value>) -> Option<String> {
+    val.and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+fn format_garmin_local_timestamp(val: Option<&serde_json::Value>) -> Option<String> {
+    let v = val?;
+    if v.is_null() {
+        return None;
+    }
+    if let Some(num) = v.as_f64().filter(|x| x.is_finite() && *x > 0.0) {
+        let ms = if num > 10_000_000_000.0 {
+            num.round() as i64
+        } else {
+            (num * 1000.0).round() as i64
+        };
+        if let Some(dt) = DateTime::<Utc>::from_timestamp_millis(ms) {
+            return Some(dt.format("%Y-%m-%dT%H:%M:%S").to_string());
+        }
+    }
+    if let Some(s) = v.as_str() {
+        let trimmed = s.trim();
+        if trimmed.len() >= 19 {
+            let normalized = trimmed[..19].replace(' ', "T");
+            if NaiveDateTime::parse_from_str(&normalized, "%Y-%m-%dT%H:%M:%S").is_ok() {
+                return Some(normalized);
+            }
+        }
+    }
+    None
+}
+
+fn format_garmin_gmt_to_local_timestamp(val: Option<&serde_json::Value>) -> Option<String> {
+    let v = val?;
+    if v.is_null() {
+        return None;
+    }
+    if let Some(num) = v.as_f64().filter(|x| x.is_finite() && *x > 0.0) {
+        let ms = if num > 10_000_000_000.0 {
+            num.round() as i64
+        } else {
+            (num * 1000.0).round() as i64
+        };
+        if let Some(dt) = DateTime::<Utc>::from_timestamp_millis(ms) {
+            return Some(dt.with_timezone(&Local).format("%Y-%m-%dT%H:%M:%S").to_string());
+        }
+    }
+    if let Some(s) = v.as_str() {
+        let trimmed = s.trim();
+        if let Ok(dt) = DateTime::parse_from_rfc3339(trimmed) {
+            return Some(dt.with_timezone(&Local).format("%Y-%m-%dT%H:%M:%S").to_string());
+        }
+        if trimmed.len() >= 19 {
+            let prefix = trimmed[..19].replace(' ', "T");
+            if let Ok(ndt) = NaiveDateTime::parse_from_str(&prefix, "%Y-%m-%dT%H:%M:%S") {
+                let dt = DateTime::<Utc>::from_naive_utc_and_offset(ndt, Utc);
+                return Some(dt.with_timezone(&Local).format("%Y-%m-%dT%H:%M:%S").to_string());
+            }
+        }
+    }
+    None
+}
+
+pub fn parse_daily_summaries_json(bytes: &[u8], days_map: &mut HashMap<String, DayRecord>) {
+    let Ok(val) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+        return;
+    };
+    let items: &[serde_json::Value] = if let Some(arr) = val.get("data").and_then(|v| v.as_array()) {
+        arr.as_slice()
+    } else if let Some(arr) = val.as_array() {
+        arr.as_slice()
+    } else {
+        return;
+    };
+
+    for d in items {
+        let Some(date) = json_opt_nonempty_str(d.get("calendarDate")) else {
+            continue;
+        };
+        let entry = days_map.entry(date.clone()).or_insert_with(|| empty_day(&date));
+        if let Some(rhr) = json_opt_i32(d.pointer("/heartRate/restingValue")).filter(|&v| v > 0) {
+            entry.resting_hr = Some(rhr);
+        }
+        if let Some(stress) = json_opt_i32(d.pointer("/stress/avgLevel")).filter(|&v| v >= 0) {
+            entry.stress_avg = Some(stress);
+        }
+        if let Some(bb) = d.get("bodyBattery") {
+            if let Some(max_v) = json_opt_i32(bb.get("maxValue")).or_else(|| json_opt_i32(bb.get("max"))) {
+                entry.body_battery_high = Some(max_v);
+            }
+            if let Some(min_v) = json_opt_i32(bb.get("minValue")).or_else(|| json_opt_i32(bb.get("min"))) {
+                entry.body_battery_low = Some(min_v);
+            }
+            if let Some(ch_v) = json_opt_i32(bb.get("chargedValue")).or_else(|| json_opt_i32(bb.get("charged"))) {
+                entry.body_battery_charged = Some(ch_v);
+            }
+            if let Some(dr_v) = json_opt_i32(bb.get("drainedValue")).or_else(|| json_opt_i32(bb.get("drained"))) {
+                entry.body_battery_drained = Some(dr_v);
+            }
+            if let Some(lat_v) = json_opt_i32(bb.get("latestValue")).or_else(|| json_opt_i32(bb.get("mostRecentValue"))) {
+                entry.body_battery_latest = Some(lat_v);
+            }
+        }
+        if let Some(steps_obj) = d.pointer("/movement/steps") {
+            if let Some(steps) = json_opt_i32(steps_obj.get("count")).or_else(|| json_opt_i32(steps_obj.get("value"))) {
+                entry.steps = Some(steps);
+            }
+            if let Some(goal) = json_opt_i32(steps_obj.get("goal")) {
+                entry.step_goal = Some(goal);
+            }
+        }
+    }
+}
+
+pub fn parse_sleep_summaries_json(bytes: &[u8], days_map: &mut HashMap<String, DayRecord>) {
+    let Ok(val) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+        return;
+    };
+    let single_slice: [serde_json::Value; 1];
+    let items: &[serde_json::Value] = if let Some(arr) = val.as_array() {
+        arr.as_slice()
+    } else if let Some(arr) = val.get("data").and_then(|v| v.as_array()) {
+        arr.as_slice()
+    } else if let Some(arr) = val.get("dailySleepSummaries").and_then(|v| v.as_array()) {
+        arr.as_slice()
+    } else if val.is_object() {
+        single_slice = [val];
+        &single_slice
+    } else {
+        return;
+    };
+
+    for outer in items {
+        let dto = outer
+            .get("dailySleepDTO")
+            .filter(|v| v.is_object())
+            .unwrap_or(outer);
+        let Some(date) = json_opt_nonempty_str(dto.get("calendarDate"))
+            .or_else(|| json_opt_nonempty_str(outer.get("calendarDate")))
+        else {
+            continue;
+        };
+        let Some(sleep_sec) = json_opt_i32(dto.get("sleepTimeSeconds"))
+            .or_else(|| json_opt_i32(outer.get("sleepTimeSeconds")))
+            .filter(|&s| s > 0)
+        else {
+            continue;
+        };
+
+        let score = json_opt_i32(dto.pointer("/sleepScores/overall/value"))
+            .or_else(|| json_opt_i32(outer.pointer("/sleepScores/overall/value")))
+            .or_else(|| json_opt_i32(dto.pointer("/sleepScores/overall")))
+            .or_else(|| json_opt_i32(outer.pointer("/sleepScores/overall")))
+            .or_else(|| json_opt_i32(dto.get("sleepScore")))
+            .or_else(|| json_opt_i32(outer.get("sleepScore")))
+            .or_else(|| json_opt_i32(dto.get("overallSleepScore")))
+            .or_else(|| json_opt_i32(outer.get("overallSleepScore")));
+
+        let deep = json_opt_i32(dto.get("deepSleepSeconds")).or_else(|| json_opt_i32(outer.get("deepSleepSeconds")));
+        let light = json_opt_i32(dto.get("lightSleepSeconds")).or_else(|| json_opt_i32(outer.get("lightSleepSeconds")));
+        let rem = json_opt_i32(dto.get("remSleepSeconds")).or_else(|| json_opt_i32(outer.get("remSleepSeconds")));
+        let awake = json_opt_i32(dto.get("awakeSleepSeconds")).or_else(|| json_opt_i32(outer.get("awakeSleepSeconds")));
+
+        let sleep_start = format_garmin_local_timestamp(dto.get("sleepStartTimestampLocal"))
+            .or_else(|| format_garmin_local_timestamp(outer.get("sleepStartTimestampLocal")))
+            .or_else(|| format_garmin_gmt_to_local_timestamp(dto.get("sleepStartTimestampGMT")))
+            .or_else(|| format_garmin_gmt_to_local_timestamp(outer.get("sleepStartTimestampGMT")));
+        let sleep_end = format_garmin_local_timestamp(dto.get("sleepEndTimestampLocal"))
+            .or_else(|| format_garmin_local_timestamp(outer.get("sleepEndTimestampLocal")))
+            .or_else(|| format_garmin_gmt_to_local_timestamp(dto.get("sleepEndTimestampGMT")))
+            .or_else(|| format_garmin_gmt_to_local_timestamp(outer.get("sleepEndTimestampGMT")));
+
+        let entry = days_map.entry(date.clone()).or_insert_with(|| empty_day(&date));
+        // Guard against shorter naps or partial records overwriting the main night's sleep
+        if let Some(existing_sec) = entry.sleep_seconds.filter(|&s| s > sleep_sec) {
+            let _ = existing_sec;
+            if entry.sleep_score.is_none() {
+                entry.sleep_score = score;
+            }
+            continue;
+        }
+
+        entry.sleep_seconds = Some(sleep_sec);
+        entry.sleep_duration_sec = Some(sleep_sec);
+        if score.is_some() {
+            entry.sleep_score = score;
+        }
+        if sleep_start.is_some() {
+            entry.sleep_start = sleep_start;
+        }
+        if sleep_end.is_some() {
+            entry.sleep_end = sleep_end;
+        }
+        if deep.is_some() {
+            entry.sleep_deep_sec = deep;
+        }
+        if light.is_some() {
+            entry.sleep_light_sec = light;
+        }
+        if rem.is_some() {
+            entry.sleep_rem_sec = rem;
+        }
+        if awake.is_some() {
+            entry.sleep_awake_sec = awake;
+        }
+    }
+}
+
+pub fn parse_hrv_range_json(bytes: &[u8], days_map: &mut HashMap<String, DayRecord>) {
+    let Ok(val) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+        return;
+    };
+    let items: &[serde_json::Value] = if let Some(arr) = val.get("hrvSummaries").and_then(|v| v.as_array()) {
+        arr.as_slice()
+    } else if let Some(arr) = val.as_array() {
+        arr.as_slice()
+    } else {
+        return;
+    };
+
+    for h in items {
+        let Some(date) = json_opt_nonempty_str(h.get("calendarDate")) else {
+            continue;
+        };
+        let entry = days_map.entry(date.clone()).or_insert_with(|| empty_day(&date));
+        if let Some(v) = json_opt_i32(h.get("lastNightAvg")) {
+            entry.hrv_last_night = Some(v);
+        }
+        if let Some(v) = json_opt_i32(h.get("weeklyAvg")) {
+            entry.hrv_weekly_avg = Some(v);
+        }
+        if let Some(status) = json_opt_nonempty_str(h.get("status")) {
+            entry.hrv_status = Some(status);
+        }
+        if let Some(baseline) = h.get("baseline") {
+            if let Some(low) = json_opt_i32(baseline.get("balancedLow")) {
+                entry.hrv_baseline_low = Some(low);
+            }
+            if let Some(high) = json_opt_i32(baseline.get("balancedUpper"))
+                .or_else(|| json_opt_i32(baseline.get("balancedHigh")))
+            {
+                entry.hrv_baseline_high = Some(high);
+            }
+        }
+    }
+}
+
+pub fn parse_steps_json(bytes: &[u8], days_map: &mut HashMap<String, DayRecord>) {
+    let Ok(val) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+        return;
+    };
+    let Some(items) = val.as_array() else {
+        return;
+    };
+    for s in items {
+        let Some(date) = json_opt_nonempty_str(s.get("calendarDate")) else {
+            continue;
+        };
+        let entry = days_map.entry(date.clone()).or_insert_with(|| empty_day(&date));
+        if let Some(steps) = json_opt_i32(s.get("totalSteps")) {
+            entry.steps = Some(steps);
+        }
+        if let Some(goal) = json_opt_i32(s.get("stepGoal")) {
+            entry.step_goal = Some(goal);
+        }
+    }
+}
+
+pub fn parse_body_battery_days_json(bytes: &[u8], days_map: &mut HashMap<String, DayRecord>) {
+    let Ok(val) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+        return;
+    };
+    let single_slice: [serde_json::Value; 1];
+    let items: &[serde_json::Value] = if let Some(arr) = val.as_array() {
+        arr.as_slice()
+    } else if val.is_object() {
+        single_slice = [val];
+        &single_slice
+    } else {
+        return;
+    };
+
+    for item in items {
+        let Some(date) = json_opt_nonempty_str(item.get("date"))
+            .or_else(|| json_opt_nonempty_str(item.get("calendarDate")))
+        else {
+            continue;
+        };
+        let entry = days_map.entry(date.clone()).or_insert_with(|| empty_day(&date));
+
+        if let Some(ch) = json_opt_i32(item.get("charged")).or_else(|| json_opt_i32(item.get("chargedValue"))) {
+            entry.body_battery_charged = Some(ch);
+        }
+        if let Some(dr) = json_opt_i32(item.get("drained")).or_else(|| json_opt_i32(item.get("drainedValue"))) {
+            entry.body_battery_drained = Some(dr);
+        }
+
+        let arr_opt = item
+            .get("bodyBatteryValuesArray")
+            .or_else(|| item.get("bodyBatteryValueArray"))
+            .and_then(|v| v.as_array());
+        if let Some(raw_points) = arr_opt {
+            let mut points: Vec<BodyBatteryPoint> = Vec::new();
+            for pair in raw_points {
+                let Some(pair_arr) = pair.as_array() else {
+                    continue;
+                };
+                if pair_arr.len() < 2 {
+                    continue;
+                }
+                let Some(ts_raw) = json_opt_f64(pair_arr.first()) else {
+                    continue;
+                };
+                let Some(lvl) = json_opt_i32(pair_arr.get(1)) else {
+                    continue;
+                };
+                if !(0..=100).contains(&lvl) {
+                    continue;
+                }
+                let ts_ms = if ts_raw > 10_000_000_000.0 {
+                    ts_raw.round() as i64
+                } else {
+                    (ts_raw * 1000.0).round() as i64
+                };
+                points.push(BodyBatteryPoint {
+                    timestamp_ms: ts_ms,
+                    level: lvl,
+                });
+            }
+            points.sort_by_key(|p| p.timestamp_ms);
+            points.dedup_by_key(|p| p.timestamp_ms);
+            if !points.is_empty() {
+                if let Some(last) = points.last() {
+                    entry.body_battery_latest = Some(last.level);
+                }
+                if let Some(pts_max) = points.iter().map(|p| p.level).max() {
+                    entry.body_battery_high = Some(
+                        entry
+                            .body_battery_high
+                            .map_or(pts_max, |cur| cur.max(pts_max)),
+                    );
+                }
+                if let Some(pts_min) = points.iter().map(|p| p.level).min() {
+                    entry.body_battery_low = Some(
+                        entry
+                            .body_battery_low
+                            .map_or(pts_min, |cur| cur.min(pts_min)),
+                    );
+                }
+                entry.body_battery_series = Some(points);
+            }
+        }
+    }
+}
+
 fn empty_day(date: &str) -> DayRecord {
     DayRecord {
         date: date.to_string(),
-        resting_hr: None,
-        stress_avg: None,
-        body_battery_high: None,
-        body_battery_latest: None,
-        steps: None,
-        step_goal: None,
-        sleep_seconds: None,
-        sleep_score: None,
-        hrv_last_night: None,
-        hrv_status: None,
+        ..Default::default()
     }
 }
 
@@ -736,84 +1119,6 @@ struct ActivityDetailDTO {
 #[serde(rename_all = "camelCase")]
 struct ActivityTypeDTO {
     type_key: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct DailySummariesDTO {
-    data: Vec<DailySummaryDayDTO>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct DailySummaryDayDTO {
-    calendar_date: Option<String>,
-    heart_rate: Option<DailyHeartRateSummaryDTO>,
-    stress: Option<DailyStressDTO>,
-    body_battery: Option<DailyBodyBatteryDTO>,
-    movement: Option<DailyMovementDTO>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct DailyHeartRateSummaryDTO {
-    resting_value: Option<i32>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct DailyStressDTO {
-    avg_level: Option<i32>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct DailyBodyBatteryDTO {
-    max_value: Option<i32>,
-    latest_value: Option<i32>,
-}
-
-#[derive(Debug, Deserialize)]
-struct DailyMovementDTO {
-    steps: Option<DailyStepsInnerDTO>,
-}
-
-#[derive(Debug, Deserialize)]
-struct DailyStepsInnerDTO {
-    count: Option<i32>,
-    value: Option<i32>,
-    goal: Option<i32>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct SleepDTO {
-    calendar_date: Option<String>,
-    sleep_time_seconds: Option<i32>,
-    sleep_scores: Option<SleepScoresDTO>,
-}
-
-#[derive(Debug, Deserialize)]
-struct SleepScoresDTO {
-    overall: Option<SleepScoreOverallDTO>,
-}
-
-#[derive(Debug, Deserialize)]
-struct SleepScoreOverallDTO {
-    value: Option<i32>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct HRVRangeDTO {
-    hrv_summaries: Option<Vec<HRVSummaryDTO>>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct HRVSummaryDTO {
-    calendar_date: Option<String>,
-    last_night_avg: Option<i32>,
-    status: Option<String>,
 }
 
 // MARK: - .fit Track Decoding, Splits, Cardiac Decoupling & Guardrail Audit

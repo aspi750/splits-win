@@ -6,7 +6,7 @@ pub mod readiness;
 pub mod scheduler;
 pub mod storage;
 
-use chrono::Utc;
+use chrono::{Local, Utc};
 use models::*;
 use readiness::{ReadinessEngine, ReadinessInput};
 use std::path::PathBuf;
@@ -57,6 +57,9 @@ fn get_bootstrap_state(state: State<'_, AppState>) -> Result<serde_json::Value, 
     let user_profile = db.get_user_profile().unwrap_or_default();
     let model_settings = db.load_model_settings().unwrap_or_default();
     let first_use_state = store.load_first_use_state().unwrap_or_default();
+    let today_local = Local::now().format("%Y-%m-%d").to_string();
+    let daily_briefing = db.get_daily_briefing(&today_local).ok().flatten();
+    let theme_mode = db.get_theme_mode().unwrap_or_else(|_| "system".to_string());
 
     Ok(serde_json::json!({
         "has_garmin_key": has_garmin_key,
@@ -72,6 +75,8 @@ fn get_bootstrap_state(state: State<'_, AppState>) -> Result<serde_json::Value, 
         "needs_initial_coach_setup": needs_initial_coach_setup,
         "model_settings": model_settings,
         "first_use_state": first_use_state,
+        "daily_briefing": daily_briefing,
+        "theme_mode": theme_mode,
     }))
 }
 
@@ -970,6 +975,178 @@ async fn export_1hz_csv(
 }
 
 #[tauri::command]
+fn set_theme_mode(state: State<'_, AppState>, mode: String) -> Result<String, String> {
+    let db = state.open_db()?;
+    db.set_theme_mode(&mode).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn get_plan_file(state: State<'_, AppState>) -> Result<PlanFile, String> {
+    let store = state.load_store()?;
+    if let Some(plan) = store.read_json::<PlanFile>("plan.json").map_err(|e| e.to_string())? {
+        return Ok(plan);
+    }
+    let db = state.open_db()?;
+    let config = store.load_athlete_config().map_err(|e| e.to_string())?.unwrap_or_default();
+    let activities = db.list_activities(500).map_err(|e| e.to_string())?;
+    let summary = coach::analyze_training_history(&activities, &config, Utc::now());
+    Ok(coach::starter_plan_file(&config, &summary))
+}
+
+#[tauri::command]
+fn save_plan_envelope(
+    state: State<'_, AppState>,
+    mesocycle_phase: String,
+    max_weekly_km: f64,
+    max_single_run_km: f64,
+    min_hours_between_runs: f64,
+    walk_hr_cap_bpm: Option<i32>,
+    session_hr_cap_bpm: Option<i32>,
+) -> Result<serde_json::Value, String> {
+    if !max_weekly_km.is_finite() || max_weekly_km <= 0.0 {
+        return Err("Weekly distance cap must be greater than 0 km.".to_string());
+    }
+    if !max_single_run_km.is_finite() || max_single_run_km <= 0.0 {
+        return Err("Max single run distance must be greater than 0 km.".to_string());
+    }
+    if !min_hours_between_runs.is_finite() || min_hours_between_runs < 0.0 {
+        return Err("Minimum hours between runs cannot be negative.".to_string());
+    }
+
+    let store = state.load_store()?;
+    let db = state.open_db()?;
+    let mut config = store.load_athlete_config().map_err(|e| e.to_string())?.unwrap_or_default();
+    let activities = db.list_activities(200).map_err(|e| e.to_string())?;
+    let days = db.list_days(60).map_err(|e| e.to_string())?;
+    let gear: Option<GearInventoryFile> = store.read_json("gear_inventory.json").map_err(|e| e.to_string())?;
+
+    let mut plan = match store.read_json::<PlanFile>("plan.json").map_err(|e| e.to_string())? {
+        Some(p) => p,
+        None => {
+            let summary = coach::analyze_training_history(&activities, &config, Utc::now());
+            coach::starter_plan_file(&config, &summary)
+        }
+    };
+
+    let trimmed_phase = mesocycle_phase.trim();
+    if !trimmed_phase.is_empty() {
+        plan.envelope.mesocycle_phase = trimmed_phase.to_string();
+    }
+    plan.envelope.max_weekly_km = (max_weekly_km * 100.0).round() / 100.0;
+    plan.envelope.max_single_run_km = (max_single_run_km * 100.0).round() / 100.0;
+    plan.envelope.min_hours_between_runs = (min_hours_between_runs * 10.0).round() / 10.0;
+    plan.envelope.walk_hr_cap_bpm = walk_hr_cap_bpm.filter(|&v| v > 0);
+    plan.revision += 1;
+    plan.updated_at = Utc::now().to_rfc3339();
+    plan.updated_by = "user_envelope_editor".to_string();
+
+    if min_hours_between_runs > 0.0 {
+        config.medical.min_rest_hours_between_runs = Some(min_hours_between_runs.round() as i32);
+    }
+    let today_utc = Utc::now().format("%Y-%m-%d").to_string();
+    let today_local = Local::now().format("%Y-%m-%d").to_string();
+    if let Some(cap) = session_hr_cap_bpm.filter(|&v| v > 0) {
+        config.specs.vt1_ceiling_bpm = Some(cap);
+        if config.medical.enforce_easy_hr_ceiling {
+            config.medical.easy_hr_ceiling_bpm = Some(cap);
+        }
+        for s in &mut plan.sessions {
+            if s.date == today_utc || s.date == today_local {
+                s.hr_cap_bpm = cap;
+            }
+        }
+    }
+
+    store.save_athlete_config(&config).map_err(|e| e.to_string())?;
+    store.write_json_atomic("plan.json", &plan).map_err(|e| e.to_string())?;
+
+    let output = ReadinessEngine::evaluate(ReadinessInput {
+        now: Utc::now(),
+        athlete_config: &config,
+        activities: &activities,
+        days: &days,
+        plan: Some(&plan),
+        gear_inventory: gear.as_ref(),
+    });
+    output.persist(store.root()).map_err(|e| e.to_string())?;
+
+    Ok(serde_json::json!({
+        "plan": plan,
+        "readiness_state": output.readiness_state,
+        "athlete_config": config,
+    }))
+}
+
+#[tauri::command]
+async fn refresh_today_body_battery(state: State<'_, AppState>) -> Result<Option<DayRecord>, String> {
+    if CredentialStore::read_garmin_key().is_none() {
+        return Ok(None);
+    }
+    let client = garmin::GarminClient::new(None);
+    let updated_day = client
+        .fetch_today_body_battery()
+        .await
+        .map_err(|e| e.to_string())?;
+    let Some(day) = updated_day else {
+        return Ok(None);
+    };
+    let db = state.open_db()?;
+    db.upsert_day(&day).map_err(|e| e.to_string())?;
+    let merged = db
+        .list_days(14)
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .find(|d| d.date == day.date);
+    Ok(merged.or(Some(day)))
+}
+
+#[tauri::command]
+async fn get_or_generate_daily_briefing(
+    state: State<'_, AppState>,
+    force_refresh: Option<bool>,
+) -> Result<DailyBriefingRecord, String> {
+    let store = state.load_store()?;
+    let db = state.open_db()?;
+    let today = Local::now().date_naive();
+    let today_str = today.format("%Y-%m-%d").to_string();
+    let days = db.list_days(60).map_err(|e| e.to_string())?;
+    let now_has_sleep = days
+        .iter()
+        .find(|d| d.date == today_str)
+        .and_then(|d| d.sleep_seconds.or(d.sleep_duration_sec))
+        .map_or(false, |s| s > 0);
+
+    if !force_refresh.unwrap_or(false) {
+        if let Some(cached) = db.get_daily_briefing(&today_str).map_err(|e| e.to_string())? {
+            if cached.had_sleep || !now_has_sleep {
+                return Ok(cached);
+            }
+        }
+    }
+
+    let api_key = CredentialStore::read_gemini_key()
+        .ok_or_else(|| "Gemini API key required to generate morning briefing.".to_string())?;
+    let config = store.load_athlete_config().map_err(|e| e.to_string())?.unwrap_or_default();
+    let activities = db.list_activities(100).map_err(|e| e.to_string())?;
+    let readiness: Option<ReadinessState> = store.read_json("readiness_state.json").ok().flatten();
+    let model_settings = db.load_model_settings().unwrap_or_default();
+
+    let briefing = coach::generate_daily_briefing(
+        &api_key,
+        &store,
+        &config,
+        &activities,
+        &days,
+        readiness.as_ref(),
+        &model_settings,
+        today,
+    )
+    .await?;
+    db.upsert_daily_briefing(&briefing).map_err(|e| e.to_string())?;
+    Ok(briefing)
+}
+
+#[tauri::command]
 fn import_training_ledger(state: State<'_, AppState>, source_path: String) -> Result<usize, String> {
     let store = state.load_store()?;
     let raw = std::fs::read_to_string(&source_path).map_err(|e| e.to_string())?;
@@ -1066,6 +1243,11 @@ pub fn run() {
             export_1hz_csv,
             import_training_ledger,
             export_training_ledger,
+            get_or_generate_daily_briefing,
+            refresh_today_body_battery,
+            get_plan_file,
+            save_plan_envelope,
+            set_theme_mode,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Splits Coach");

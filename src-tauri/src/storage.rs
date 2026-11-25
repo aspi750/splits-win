@@ -616,12 +616,36 @@ impl Database {
                 stress_avg INTEGER,
                 body_battery_high INTEGER,
                 body_battery_latest INTEGER,
+                body_battery_low INTEGER,
+                body_battery_charged INTEGER,
+                body_battery_drained INTEGER,
+                body_battery_series_json TEXT,
                 steps INTEGER,
                 step_goal INTEGER,
                 sleep_seconds INTEGER,
+                sleep_duration_sec INTEGER,
                 sleep_score INTEGER,
+                sleep_start TEXT,
+                sleep_end TEXT,
+                sleep_deep_sec INTEGER,
+                sleep_light_sec INTEGER,
+                sleep_rem_sec INTEGER,
+                sleep_awake_sec INTEGER,
                 hrv_last_night INTEGER,
-                hrv_status TEXT
+                hrv_status TEXT,
+                hrv_weekly_avg INTEGER,
+                hrv_baseline_low INTEGER,
+                hrv_baseline_high INTEGER
+            );
+            CREATE TABLE IF NOT EXISTS briefings (
+                date TEXT PRIMARY KEY,
+                headline TEXT NOT NULL,
+                body TEXT NOT NULL,
+                action_cue TEXT NOT NULL,
+                model_id TEXT NOT NULL,
+                thinking_level TEXT NOT NULL,
+                had_sleep INTEGER NOT NULL DEFAULT 0,
+                generated_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS fit_tracks (
                 garmin_id INTEGER PRIMARY KEY,
@@ -655,6 +679,25 @@ impl Database {
         let _ = conn.execute("ALTER TABLE activities ADD COLUMN post_run_context_json TEXT", []);
         let _ = conn.execute("ALTER TABLE activities ADD COLUMN fit_temp_source TEXT", []);
         let _ = conn.execute("ALTER TABLE activities ADD COLUMN garmin_notes TEXT", []);
+
+        for col_sql in [
+            "ALTER TABLE days ADD COLUMN sleep_duration_sec INTEGER",
+            "ALTER TABLE days ADD COLUMN sleep_start TEXT",
+            "ALTER TABLE days ADD COLUMN sleep_end TEXT",
+            "ALTER TABLE days ADD COLUMN sleep_deep_sec INTEGER",
+            "ALTER TABLE days ADD COLUMN sleep_light_sec INTEGER",
+            "ALTER TABLE days ADD COLUMN sleep_rem_sec INTEGER",
+            "ALTER TABLE days ADD COLUMN sleep_awake_sec INTEGER",
+            "ALTER TABLE days ADD COLUMN body_battery_low INTEGER",
+            "ALTER TABLE days ADD COLUMN body_battery_charged INTEGER",
+            "ALTER TABLE days ADD COLUMN body_battery_drained INTEGER",
+            "ALTER TABLE days ADD COLUMN body_battery_series_json TEXT",
+            "ALTER TABLE days ADD COLUMN hrv_weekly_avg INTEGER",
+            "ALTER TABLE days ADD COLUMN hrv_baseline_low INTEGER",
+            "ALTER TABLE days ADD COLUMN hrv_baseline_high INTEGER",
+        ] {
+            let _ = conn.execute(col_sql, []);
+        }
 
         let _ = conn.execute(
             "INSERT OR IGNORE INTO settings (key, value) VALUES ('global_model_id', ?1)",
@@ -1005,26 +1048,71 @@ impl Database {
     }
 
     pub fn upsert_day(&self, day: &DayRecord) -> Result<(), StorageError> {
+        let sleep_sec = day.sleep_seconds.or(day.sleep_duration_sec);
+        let bb_series_json = day
+            .body_battery_series
+            .as_ref()
+            .filter(|v| !v.is_empty())
+            .and_then(|v| serde_json::to_string(v).ok());
         self.conn.lock().unwrap().execute(
             "INSERT INTO days (
                 date, resting_hr, stress_avg, body_battery_high, body_battery_latest,
-                steps, step_goal, sleep_seconds, sleep_score, hrv_last_night, hrv_status
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                body_battery_low, body_battery_charged, body_battery_drained, body_battery_series_json,
+                steps, step_goal, sleep_seconds, sleep_duration_sec, sleep_score,
+                sleep_start, sleep_end, sleep_deep_sec, sleep_light_sec, sleep_rem_sec, sleep_awake_sec,
+                hrv_last_night, hrv_status, hrv_weekly_avg, hrv_baseline_low, hrv_baseline_high
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)
             ON CONFLICT(date) DO UPDATE SET
                 resting_hr=COALESCE(excluded.resting_hr, days.resting_hr),
                 stress_avg=COALESCE(excluded.stress_avg, days.stress_avg),
                 body_battery_high=COALESCE(excluded.body_battery_high, days.body_battery_high),
                 body_battery_latest=COALESCE(excluded.body_battery_latest, days.body_battery_latest),
+                body_battery_low=COALESCE(excluded.body_battery_low, days.body_battery_low),
+                body_battery_charged=COALESCE(excluded.body_battery_charged, days.body_battery_charged),
+                body_battery_drained=COALESCE(excluded.body_battery_drained, days.body_battery_drained),
+                body_battery_series_json=COALESCE(excluded.body_battery_series_json, days.body_battery_series_json),
                 steps=COALESCE(excluded.steps, days.steps),
                 step_goal=COALESCE(excluded.step_goal, days.step_goal),
                 sleep_seconds=COALESCE(excluded.sleep_seconds, days.sleep_seconds),
+                sleep_duration_sec=COALESCE(excluded.sleep_duration_sec, days.sleep_duration_sec),
                 sleep_score=COALESCE(excluded.sleep_score, days.sleep_score),
+                sleep_start=COALESCE(excluded.sleep_start, days.sleep_start),
+                sleep_end=COALESCE(excluded.sleep_end, days.sleep_end),
+                sleep_deep_sec=COALESCE(excluded.sleep_deep_sec, days.sleep_deep_sec),
+                sleep_light_sec=COALESCE(excluded.sleep_light_sec, days.sleep_light_sec),
+                sleep_rem_sec=COALESCE(excluded.sleep_rem_sec, days.sleep_rem_sec),
+                sleep_awake_sec=COALESCE(excluded.sleep_awake_sec, days.sleep_awake_sec),
                 hrv_last_night=COALESCE(excluded.hrv_last_night, days.hrv_last_night),
-                hrv_status=COALESCE(excluded.hrv_status, days.hrv_status)",
+                hrv_status=COALESCE(excluded.hrv_status, days.hrv_status),
+                hrv_weekly_avg=COALESCE(excluded.hrv_weekly_avg, days.hrv_weekly_avg),
+                hrv_baseline_low=COALESCE(excluded.hrv_baseline_low, days.hrv_baseline_low),
+                hrv_baseline_high=COALESCE(excluded.hrv_baseline_high, days.hrv_baseline_high)",
             params![
-                day.date, day.resting_hr, day.stress_avg, day.body_battery_high,
-                day.body_battery_latest, day.steps, day.step_goal, day.sleep_seconds,
-                day.sleep_score, day.hrv_last_night, day.hrv_status
+                day.date,
+                day.resting_hr,
+                day.stress_avg,
+                day.body_battery_high,
+                day.body_battery_latest,
+                day.body_battery_low,
+                day.body_battery_charged,
+                day.body_battery_drained,
+                bb_series_json,
+                day.steps,
+                day.step_goal,
+                sleep_sec,
+                sleep_sec,
+                day.sleep_score,
+                day.sleep_start,
+                day.sleep_end,
+                day.sleep_deep_sec,
+                day.sleep_light_sec,
+                day.sleep_rem_sec,
+                day.sleep_awake_sec,
+                day.hrv_last_night,
+                day.hrv_status,
+                day.hrv_weekly_avg,
+                day.hrv_baseline_low,
+                day.hrv_baseline_high
             ],
         )?;
         Ok(())
@@ -1034,25 +1122,118 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT date, resting_hr, stress_avg, body_battery_high, body_battery_latest,
-                    steps, step_goal, sleep_seconds, sleep_score, hrv_last_night, hrv_status
+                    body_battery_low, body_battery_charged, body_battery_drained, body_battery_series_json,
+                    steps, step_goal, sleep_seconds, sleep_duration_sec, sleep_score,
+                    sleep_start, sleep_end, sleep_deep_sec, sleep_light_sec, sleep_rem_sec, sleep_awake_sec,
+                    hrv_last_night, hrv_status, hrv_weekly_avg, hrv_baseline_low, hrv_baseline_high
              FROM days ORDER BY date DESC LIMIT ?1",
         )?;
         let rows = stmt.query_map(params![limit as i64], |r| {
+            let bb_series_str: Option<String> = r.get(8)?;
+            let s1: Option<i32> = r.get(11)?;
+            let s2: Option<i32> = r.get(12)?;
+            let sleep_sec = s1.or(s2);
             Ok(DayRecord {
                 date: r.get(0)?,
                 resting_hr: r.get(1)?,
                 stress_avg: r.get(2)?,
                 body_battery_high: r.get(3)?,
                 body_battery_latest: r.get(4)?,
-                steps: r.get(5)?,
-                step_goal: r.get(6)?,
-                sleep_seconds: r.get(7)?,
-                sleep_score: r.get(8)?,
-                hrv_last_night: r.get(9)?,
-                hrv_status: r.get(10)?,
+                body_battery_low: r.get(5)?,
+                body_battery_charged: r.get(6)?,
+                body_battery_drained: r.get(7)?,
+                body_battery_series: bb_series_str
+                    .and_then(|s| serde_json::from_str::<Vec<BodyBatteryPoint>>(&s).ok())
+                    .filter(|v| !v.is_empty()),
+                steps: r.get(9)?,
+                step_goal: r.get(10)?,
+                sleep_seconds: sleep_sec,
+                sleep_duration_sec: sleep_sec,
+                sleep_score: r.get(13)?,
+                sleep_start: r.get(14)?,
+                sleep_end: r.get(15)?,
+                sleep_deep_sec: r.get(16)?,
+                sleep_light_sec: r.get(17)?,
+                sleep_rem_sec: r.get(18)?,
+                sleep_awake_sec: r.get(19)?,
+                hrv_last_night: r.get(20)?,
+                hrv_status: r.get(21)?,
+                hrv_weekly_avg: r.get(22)?,
+                hrv_baseline_low: r.get(23)?,
+                hrv_baseline_high: r.get(24)?,
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn get_daily_briefing(&self, date: &str) -> Result<Option<DailyBriefingRecord>, StorageError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT date, headline, body, action_cue, model_id, thinking_level, had_sleep, generated_at
+             FROM briefings WHERE date = ?1 LIMIT 1",
+        )?;
+        let mut rows = stmt.query_map(params![date], |r| {
+            let had_sleep_int: i64 = r.get(6)?;
+            Ok(DailyBriefingRecord {
+                date: r.get(0)?,
+                headline: r.get(1)?,
+                body: r.get(2)?,
+                action_cue: r.get(3)?,
+                model_id: r.get(4)?,
+                thinking_level: r.get(5)?,
+                had_sleep: had_sleep_int != 0,
+                generated_at: r.get(7)?,
+            })
+        })?;
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn upsert_daily_briefing(&self, briefing: &DailyBriefingRecord) -> Result<(), StorageError> {
+        self.conn.lock().unwrap().execute(
+            "INSERT INTO briefings (
+                date, headline, body, action_cue, model_id, thinking_level, had_sleep, generated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(date) DO UPDATE SET
+                headline = excluded.headline,
+                body = excluded.body,
+                action_cue = excluded.action_cue,
+                model_id = excluded.model_id,
+                thinking_level = excluded.thinking_level,
+                had_sleep = excluded.had_sleep,
+                generated_at = excluded.generated_at",
+            params![
+                briefing.date,
+                briefing.headline,
+                briefing.body,
+                briefing.action_cue,
+                briefing.model_id,
+                briefing.thinking_level,
+                if briefing.had_sleep { 1i64 } else { 0i64 },
+                briefing.generated_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_theme_mode(&self) -> Result<String, StorageError> {
+        match self.get_setting("theme_mode")?.as_deref() {
+            Some("dark") => Ok("dark".to_string()),
+            Some("light") => Ok("light".to_string()),
+            _ => Ok("system".to_string()),
+        }
+    }
+
+    pub fn set_theme_mode(&self, mode: &str) -> Result<String, StorageError> {
+        let normalized = match mode.trim().to_ascii_lowercase().as_str() {
+            "dark" => "dark",
+            "light" => "light",
+            _ => "system",
+        };
+        self.set_setting("theme_mode", Some(normalized))?;
+        Ok(normalized.to_string())
     }
 
     pub fn get_activity(&self, garmin_id: i64) -> Result<Option<ActivityRecord>, StorageError> {

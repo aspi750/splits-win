@@ -1139,18 +1139,64 @@ impl ActivityRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BodyBatteryPoint {
+    pub timestamp_ms: i64,
+    pub level: i32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct DayRecord {
     pub date: String,
     pub resting_hr: Option<i32>,
     pub stress_avg: Option<i32>,
     pub body_battery_high: Option<i32>,
     pub body_battery_latest: Option<i32>,
+    #[serde(default)]
+    pub body_battery_low: Option<i32>,
+    #[serde(default)]
+    pub body_battery_charged: Option<i32>,
+    #[serde(default)]
+    pub body_battery_drained: Option<i32>,
+    #[serde(default)]
+    pub body_battery_series: Option<Vec<BodyBatteryPoint>>,
     pub steps: Option<i32>,
     pub step_goal: Option<i32>,
     pub sleep_seconds: Option<i32>,
+    #[serde(default)]
+    pub sleep_duration_sec: Option<i32>,
     pub sleep_score: Option<i32>,
+    #[serde(default)]
+    pub sleep_start: Option<String>,
+    #[serde(default)]
+    pub sleep_end: Option<String>,
+    #[serde(default)]
+    pub sleep_deep_sec: Option<i32>,
+    #[serde(default)]
+    pub sleep_light_sec: Option<i32>,
+    #[serde(default)]
+    pub sleep_rem_sec: Option<i32>,
+    #[serde(default)]
+    pub sleep_awake_sec: Option<i32>,
     pub hrv_last_night: Option<i32>,
     pub hrv_status: Option<String>,
+    #[serde(default)]
+    pub hrv_weekly_avg: Option<i32>,
+    #[serde(default)]
+    pub hrv_baseline_low: Option<i32>,
+    #[serde(default)]
+    pub hrv_baseline_high: Option<i32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DailyBriefingRecord {
+    pub date: String,
+    pub headline: String,
+    pub body: String,
+    pub action_cue: String,
+    pub model_id: String,
+    pub thinking_level: String,
+    pub had_sleep: bool,
+    pub generated_at: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

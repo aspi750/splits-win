@@ -264,18 +264,77 @@ export interface ActivityRecord {
   garmin_notes?: string | null;
 }
 
+export type ThemeMode = "system" | "dark" | "light";
+
+export interface BodyBatteryPoint {
+  timestamp_ms: number;
+  level: number;
+}
+
 export interface DayRecord {
   date: string;
   resting_hr: number | null;
   stress_avg: number | null;
   body_battery_high: number | null;
   body_battery_latest: number | null;
+  body_battery_low: number | null;
+  body_battery_charged: number | null;
+  body_battery_drained: number | null;
+  body_battery_series: BodyBatteryPoint[] | null;
   steps: number | null;
   step_goal: number | null;
   sleep_seconds: number | null;
+  sleep_duration_sec: number | null;
   sleep_score: number | null;
+  sleep_start: string | null;
+  sleep_end: string | null;
+  sleep_deep_sec: number | null;
+  sleep_light_sec: number | null;
+  sleep_rem_sec: number | null;
+  sleep_awake_sec: number | null;
   hrv_last_night: number | null;
   hrv_status: string | null;
+  hrv_weekly_avg: number | null;
+  hrv_baseline_low: number | null;
+  hrv_baseline_high: number | null;
+}
+
+export interface DailyBriefingRecord {
+  date: string;
+  headline: string;
+  body: string;
+  action_cue: string;
+  model_id: string;
+  thinking_level: string;
+  had_sleep: boolean;
+  generated_at: string;
+}
+
+export interface PlanEnvelope {
+  max_weekly_km: number;
+  max_single_run_km: number;
+  mesocycle_phase: string;
+  min_hours_between_runs: number;
+  walk_hr_cap_bpm: number | null;
+}
+
+export interface PlanFile {
+  version: number;
+  revision: number;
+  updated_at: string;
+  updated_by: string;
+  covers: { from: string; to: string };
+  status: string;
+  envelope: PlanEnvelope;
+  sessions: Array<{
+    id: string;
+    date: string;
+    type: string;
+    target: { duration_min: number[]; distance_km: number[] };
+    hr_cap_bpm: number;
+    shoe_constraints: string[];
+    alternatives: string[];
+  }>;
 }
 
 export interface BootstrapState {
@@ -296,6 +355,8 @@ export interface BootstrapState {
   needs_initial_coach_setup?: boolean;
   model_settings?: ModelSettings;
   first_use_state?: FirstUseFlowState;
+  daily_briefing?: DailyBriefingRecord | null;
+  theme_mode?: ThemeMode;
 }
 
 export interface CoachProfileThresholds {

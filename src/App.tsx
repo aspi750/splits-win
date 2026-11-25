@@ -37,15 +37,20 @@ import {
   type ActivityRecord,
   type AthleteConfig,
   type AthleteType,
+  type BodyBatteryPoint,
   type BootstrapState,
   type CoachUpdateProposal,
+  type DailyBriefingRecord,
+  type DayRecord,
   type ExecutionMode,
   type FirstUseStage,
   type FitTrackPoint,
   type GoalType,
   type ModelSettings,
+  type PlanFile,
   type PostRunContext,
   type RaceDistancePreset,
+  type ThemeMode,
   type ThinkingLevel,
   type TrainingDiscipline,
   type UserProfile,
@@ -71,7 +76,90 @@ const GEMINI_MODEL_OPTIONS = [
 ];
 
 function shortModelName(id: string): string {
-  return GEMINI_MODEL_OPTIONS.find((m) => m.id === id)?.short ?? id;
+  const known = GEMINI_MODEL_OPTIONS.find((m) => m.id === id)?.short;
+  if (known) return known;
+  if (id === "gemini-3-flash-preview") return "3 Flash";
+  if (id === "gemini-3.1-flash-lite-preview") return "3.1 Flash-Lite";
+  return id;
+}
+
+function toLocalIsoDate(d: Date): string {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+
+function formatTodayHeading(date = new Date()): string {
+  return date.toLocaleDateString(undefined, {
+    weekday: "long",
+    month: "long",
+    day: "numeric",
+  });
+}
+
+function formatSleepDuration(sec: number | null | undefined): string {
+  if (!sec || !Number.isFinite(sec) || sec <= 0) return "–";
+  const mins = Math.round(sec / 60);
+  if (mins >= 60) {
+    return `${Math.floor(mins / 60)} h ${mins % 60} min`;
+  }
+  return `${mins} min`;
+}
+
+function formatStageCompact(sec: number | null | undefined): string {
+  if (!sec || !Number.isFinite(sec) || sec <= 0) return "0m";
+  const mins = Math.round(sec / 60);
+  if (mins >= 60) {
+    return `${Math.floor(mins / 60)}h ${mins % 60}m`;
+  }
+  return `${mins}m`;
+}
+
+function extractHhMm(iso: string | null | undefined): string | null {
+  if (!iso) return null;
+  const trimmed = iso.trim();
+  const tIdx = trimmed.indexOf("T");
+  if (tIdx >= 0 && trimmed.length >= tIdx + 6) {
+    const hhmm = trimmed.slice(tIdx + 1, tIdx + 6);
+    if (/^\d{2}:\d{2}$/.test(hhmm)) return hhmm;
+  }
+  if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}/.test(trimmed)) {
+    return trimmed.slice(11, 16);
+  }
+  return null;
+}
+
+function formatHrvStatus(status: string | null | undefined): {
+  label: string;
+  tone: "green" | "amber" | "red";
+} | null {
+  if (!status || !status.trim()) return null;
+  const upper = status.trim().toUpperCase();
+  const label = upper
+    .split(/[_\s]+/)
+    .map((w) => w.charAt(0) + w.slice(1).toLowerCase())
+    .join(" ");
+  if (upper === "BALANCED" || upper === "OPTIMAL" || upper === "GOOD") {
+    return { label, tone: "green" };
+  }
+  if (upper === "LOW" || upper === "POOR" || upper === "STRAINED") {
+    return { label, tone: "red" };
+  }
+  return { label, tone: "amber" };
+}
+
+function stressDescriptor(level: number | null | undefined): string {
+  if (level == null || level < 0) return "No reading";
+  if (level <= 25) return "Rest";
+  if (level <= 50) return "Low";
+  if (level <= 75) return "Medium";
+  return "High";
+}
+
+function formatPhaseLabel(phase: string | null | undefined): string {
+  if (!phase || !phase.trim()) return "base";
+  return phase.replace(/_/g, " ");
 }
 
 function thinkingLabel(level: ThinkingLevel): string {
@@ -270,7 +358,29 @@ export default function App() {
   const [confirmCleanSlate, setConfirmCleanSlate] = useState(false);
   const [cleanSlateBusy, setCleanSlateBusy] = useState(false);
 
-  const [appVersion, setAppVersion] = useState<string>("0.2.3.3-beta");
+  const [appVersion, setAppVersion] = useState<string>("0.2.4");
+  const [themeMode, setThemeMode] = useState<ThemeMode>(() => {
+    try {
+      const saved = localStorage.getItem("splits_theme_mode");
+      return saved === "dark" || saved === "light" ? saved : "system";
+    } catch {
+      return "system";
+    }
+  });
+  const [briefing, setBriefing] = useState<DailyBriefingRecord | null>(null);
+  const [briefingBusy, setBriefingBusy] = useState(false);
+  const [briefingError, setBriefingError] = useState<string | null>(null);
+  const briefingAttemptedRef = useRef<string | null>(null);
+  const bbRefreshAttemptedRef = useRef<string | null>(null);
+  const [envelopeModalOpen, setEnvelopeModalOpen] = useState(false);
+  const [envelopeBusy, setEnvelopeBusy] = useState(false);
+  const [envelopeError, setEnvelopeError] = useState<string | null>(null);
+  const [envPhase, setEnvPhase] = useState("aerobic_reentry");
+  const [envMaxWeeklyKm, setEnvMaxWeeklyKm] = useState("18.0");
+  const [envMaxSingleKm, setEnvMaxSingleKm] = useState("6.0");
+  const [envMinHours, setEnvMinHours] = useState("48");
+  const [envWalkHrCap, setEnvWalkHrCap] = useState("110");
+  const [envSessionHrCap, setEnvSessionHrCap] = useState("142");
   const [availableUpdate, setAvailableUpdate] = useState<Update | null>(null);
   const [updateStatus, setUpdateStatus] = useState<string | null>(null);
   const [updateChecking, setUpdateChecking] = useState(false);
@@ -278,9 +388,27 @@ export default function App() {
   const [updateReadyToRestart, setUpdateReadyToRestart] = useState(false);
   const [updateProgress, setUpdateProgress] = useState<{ downloaded: number; total: number | null } | null>(null);
 
+  function applyThemeMode(mode: ThemeMode) {
+    setThemeMode(mode);
+    try {
+      localStorage.setItem("splits_theme_mode", mode);
+    } catch {
+      // ignore storage restrictions
+    }
+    if (mode === "dark" || mode === "light") {
+      document.documentElement.dataset.theme = mode;
+    } else {
+      delete document.documentElement.dataset.theme;
+    }
+  }
+
   async function reload() {
     const data = await invoke<BootstrapState>("get_bootstrap_state");
     setState(data);
+    setBriefing(data.daily_briefing ?? null);
+    const resolvedTheme: ThemeMode =
+      data.theme_mode === "dark" || data.theme_mode === "light" ? data.theme_mode : "system";
+    applyThemeMode(resolvedTheme);
     setDraftConfig(data.athlete_config);
     const loadedProfile: UserProfile = data.user_profile ?? {
       athlete_type: "runner",
@@ -441,7 +569,7 @@ export default function App() {
     for (let i = 6; i >= 0; i--) {
       const d = new Date(now);
       d.setDate(now.getDate() - i);
-      const key = d.toISOString().slice(0, 10);
+      const key = toLocalIsoDate(d);
       const dayActs = state.activities.filter(
         (a) => a.start_iso.slice(0, 10) === key && a.type_key.toLowerCase().includes("run")
       );
@@ -453,6 +581,86 @@ export default function App() {
     }
     return out;
   }, [state]);
+
+  const todayIsoForEffects = toLocalIsoDate(new Date());
+  const todayDayForEffects = state?.days.find((d) => d.date === todayIsoForEffects) ?? state?.days[0];
+  const todayHasSleepForEffects =
+    (todayDayForEffects?.sleep_seconds ?? todayDayForEffects?.sleep_duration_sec ?? 0) > 0;
+
+  useEffect(() => {
+    if (
+      !state ||
+      tab !== "today" ||
+      !state.has_gemini_key ||
+      state.settings.profile_onboarded === false
+    ) {
+      return;
+    }
+    if (
+      briefing &&
+      briefing.date === todayIsoForEffects &&
+      (briefing.had_sleep || !todayHasSleepForEffects)
+    ) {
+      return;
+    }
+    const attemptKey = `${todayIsoForEffects}:${todayHasSleepForEffects ? "1" : "0"}`;
+    if (briefingAttemptedRef.current === attemptKey) {
+      return;
+    }
+    briefingAttemptedRef.current = attemptKey;
+    let cancelled = false;
+    setBriefingBusy(true);
+    setBriefingError(null);
+    void invoke<DailyBriefingRecord>("get_or_generate_daily_briefing", { forceRefresh: false })
+      .then((res) => {
+        if (!cancelled) {
+          setBriefing(res);
+        }
+      })
+      .catch((err) => {
+        if (!cancelled) {
+          setBriefingError(err instanceof Error ? err.message : String(err));
+        }
+      })
+      .finally(() => {
+        if (!cancelled) {
+          setBriefingBusy(false);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [state, tab, todayIsoForEffects, todayHasSleepForEffects, briefing]);
+
+  useEffect(() => {
+    if (!state?.has_garmin_key || tab !== "today" || state.settings.profile_onboarded === false) {
+      return;
+    }
+    if (bbRefreshAttemptedRef.current === todayIsoForEffects) {
+      return;
+    }
+    bbRefreshAttemptedRef.current = todayIsoForEffects;
+    let cancelled = false;
+    void invoke<DayRecord | null>("refresh_today_body_battery")
+      .then((updated) => {
+        if (cancelled || !updated) return;
+        setState((prev) => {
+          if (!prev) return prev;
+          const idx = prev.days.findIndex((d) => d.date === updated.date);
+          const nextDays =
+            idx >= 0
+              ? prev.days.map((d, i) => (i === idx ? updated : d))
+              : [updated, ...prev.days];
+          return { ...prev, days: nextDays };
+        });
+      })
+      .catch(() => {
+        // Silent background Body Battery refresh failure does not block Today view
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [state?.has_garmin_key, state?.settings.profile_onboarded, tab, todayIsoForEffects]);
 
   if (!state || !draftConfig) {
     return <div className="main">Loading Splits Coach…</div>;
@@ -603,9 +811,135 @@ export default function App() {
   }
 
   const r = state.readiness_state;
-  const todayDay = state.days[0];
+  const todayIso = toLocalIsoDate(new Date());
+  const todayDay = state.days.find((d) => d.date === todayIso) ?? state.days[0];
   const latestRun = state.activities.find((a) => a.type_key.toLowerCase().includes("run")) ?? state.activities[0];
   const pillClass = !r ? "amber" : !r.gatekeeper.run_permitted ? "red" : r.gatekeeper.caution_flags.length > 0 ? "amber" : "green";
+
+  const recentDaysAsc = [...state.days].slice(0, 14).reverse();
+  const hrvValues7d = [...state.days]
+    .slice(0, 7)
+    .reverse()
+    .map((d) => d.hrv_last_night)
+    .filter((v): v is number => v != null && v > 0);
+  const hrvSeriesPoints = recentDaysAsc
+    .map((d) => d.hrv_last_night)
+    .filter((v): v is number => v != null && v > 0);
+  const rhrSeriesPoints = recentDaysAsc
+    .map((d) => d.resting_hr)
+    .filter((v): v is number => v != null && v > 0);
+  const stressSeriesPoints = recentDaysAsc
+    .map((d) => d.stress_avg)
+    .filter((v): v is number => v != null && v >= 0);
+  const stepsSeriesPoints = recentDaysAsc
+    .map((d) => d.steps)
+    .filter((v): v is number => v != null && v >= 0);
+
+  const rhrBaseline30d = useMemo(() => {
+    const cfgBase = state.athlete_config.specs.restingHRBaseline;
+    if (cfgBase && cfgBase > 0) return cfgBase;
+    const vals = state.days
+      .slice(0, 30)
+      .map((d) => d.resting_hr)
+      .filter((v): v is number => v != null && v > 0)
+      .sort((a, b) => a - b);
+    if (vals.length === 0) return null;
+    return vals[Math.floor(vals.length / 2)];
+  }, [state]);
+
+  const sleepSeconds = todayDay ? (todayDay.sleep_seconds ?? todayDay.sleep_duration_sec ?? null) : null;
+  const sleepStartHhMm = extractHhMm(todayDay?.sleep_start);
+  const sleepEndHhMm = extractHhMm(todayDay?.sleep_end);
+  const sleepStageTotal =
+    (todayDay?.sleep_deep_sec ?? 0) +
+    (todayDay?.sleep_light_sec ?? 0) +
+    (todayDay?.sleep_rem_sec ?? 0) +
+    (todayDay?.sleep_awake_sec ?? 0);
+  const hrvStatusBadge = formatHrvStatus(todayDay?.hrv_status);
+  const hrv7dAvg =
+    todayDay?.hrv_weekly_avg ??
+    (hrvValues7d.length > 0
+      ? Math.round(hrvValues7d.reduce((a, b) => a + b, 0) / hrvValues7d.length)
+      : null);
+
+  async function handleRegenerateBriefing() {
+    setBriefingBusy(true);
+    setBriefingError(null);
+    try {
+      const fresh = await invoke<DailyBriefingRecord>("get_or_generate_daily_briefing", {
+        forceRefresh: true,
+      });
+      setBriefing(fresh);
+    } catch (err) {
+      setBriefingError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBriefingBusy(false);
+    }
+  }
+
+  async function openEditEnvelopeModal() {
+    setEnvelopeError(null);
+    setEnvelopeBusy(true);
+    setEnvelopeModalOpen(true);
+    try {
+      const plan = await invoke<PlanFile>("get_plan_file");
+      setEnvPhase(plan.envelope.mesocycle_phase || "aerobic_reentry");
+      setEnvMaxWeeklyKm(String(plan.envelope.max_weekly_km));
+      setEnvMaxSingleKm(String(plan.envelope.max_single_run_km));
+      setEnvMinHours(String(plan.envelope.min_hours_between_runs));
+      setEnvWalkHrCap(
+        plan.envelope.walk_hr_cap_bpm != null ? String(plan.envelope.walk_hr_cap_bpm) : "110"
+      );
+      const sessionHr =
+        r?.prescription_summary.hr_ceiling_bpm ??
+        state?.athlete_config.specs.vt1CeilingBPM ??
+        state?.athlete_config.medical.easyHRCeilingBPM ??
+        142;
+      setEnvSessionHrCap(String(sessionHr));
+    } catch (err) {
+      setEnvelopeError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setEnvelopeBusy(false);
+    }
+  }
+
+  async function saveEnvelopeEdits() {
+    const maxWeekly = Number(envMaxWeeklyKm);
+    const maxSingle = Number(envMaxSingleKm);
+    const minHours = Number(envMinHours);
+    const walkHr = parseOptionalNum(envWalkHrCap);
+    const sessionHr = parseOptionalNum(envSessionHrCap);
+    if (!Number.isFinite(maxWeekly) || maxWeekly <= 0) {
+      setEnvelopeError("Weekly cap must be greater than 0 km.");
+      return;
+    }
+    if (!Number.isFinite(maxSingle) || maxSingle <= 0) {
+      setEnvelopeError("Single-run cap must be greater than 0 km.");
+      return;
+    }
+    if (!Number.isFinite(minHours) || minHours < 0) {
+      setEnvelopeError("Minimum hours between runs cannot be negative.");
+      return;
+    }
+    setEnvelopeBusy(true);
+    setEnvelopeError(null);
+    try {
+      await invoke("save_plan_envelope", {
+        mesocyclePhase: envPhase,
+        maxWeeklyKm: maxWeekly,
+        maxSingleRunKm: maxSingle,
+        minHoursBetweenRuns: minHours,
+        walkHrCapBpm: walkHr ? Math.round(walkHr) : null,
+        sessionHrCapBpm: sessionHr ? Math.round(sessionHr) : null,
+      });
+      await reload();
+      setEnvelopeModalOpen(false);
+    } catch (err) {
+      setEnvelopeError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setEnvelopeBusy(false);
+    }
+  }
 
   const modelSettings: ModelSettings = state.model_settings ?? {
     global_model_id: "gemini-4-hydrogen",
@@ -1050,13 +1384,23 @@ export default function App() {
         )}
         {tab === "today" && (
           <>
+            <div className="today-header">
+              <h2 className="today-title">Today</h2>
+              <span className="today-subtitle">{formatTodayHeading()}</span>
+            </div>
+
             <div className="card">
               <div className="card-header">
-                <div>
+                <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
                   <strong>Coach Readiness</strong>
-                  <div className="muted">{r ? `${r.date} · ${r.updated_by}` : "Not computed yet"}</div>
+                  {r && (
+                    <span className="phase-badge">
+                      {formatPhaseLabel(r.plan_context.mesocycle_phase)}
+                    </span>
+                  )}
+                  <span className="muted">{r ? r.date : "Not computed yet"}</span>
                 </div>
-                <div style={{ display: "flex", gap: 8 }}>
+                <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
                   {latestRun && (
                     <button
                       className="secondary"
@@ -1066,6 +1410,13 @@ export default function App() {
                       <Sparkles size={14} /> Analyze Latest Run
                     </button>
                   )}
+                  <button
+                    className="secondary"
+                    style={{ display: "flex", alignItems: "center", gap: 5 }}
+                    onClick={() => void openEditEnvelopeModal()}
+                  >
+                    <SquarePen size={14} /> Edit Envelope
+                  </button>
                   <button
                     className="secondary"
                     onClick={async () => {
@@ -1079,20 +1430,397 @@ export default function App() {
               </div>
               {r ? (
                 <div>
-                  <span className={`pill ${pillClass}`}>{r.prescription_summary.decision}</span>
-                  <div style={{ marginTop: 10 }}>
-                    <strong>{r.prescription_summary.distance_km.toFixed(1)} km</strong> · HR ceiling{" "}
-                    <strong>{r.prescription_summary.hr_ceiling_bpm} bpm</strong> ·{" "}
-                    {r.prescription_summary.shoe_platform}
+                  <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+                    <span className={`pill ${pillClass}`}>{r.prescription_summary.decision}</span>
+                    <span style={{ fontSize: 14 }}>
+                      <strong>{r.prescription_summary.distance_km.toFixed(1)} km</strong>
+                      {r.prescription_summary.duration_mins > 0
+                        ? ` (${r.prescription_summary.duration_mins} min)`
+                        : ""}{" "}
+                      · HR ceiling <strong>{r.prescription_summary.hr_ceiling_bpm} bpm</strong> ·{" "}
+                      {r.prescription_summary.shoe_platform}
+                    </span>
                   </div>
-                  <div className="muted" style={{ marginTop: 6 }}>
-                    7-day rolling: {r.gatekeeper.rolling_7d_km.toFixed(1)} km ({r.gatekeeper.rolling_7d_runs} runs) ·
-                    Remaining budget: {r.gatekeeper.remaining_weekly_budget_km.toFixed(1)} km
-                  </div>
+
+                  {r.gatekeeper.hard_blocks.length > 0 && (
+                    <div className="readiness-callout red">
+                      {r.gatekeeper.hard_blocks.map((msg, i) => (
+                        <div key={i}>{msg}</div>
+                      ))}
+                    </div>
+                  )}
+                  {r.gatekeeper.caution_flags.length > 0 && (
+                    <div className="readiness-callout amber">
+                      {r.gatekeeper.caution_flags.map((msg, i) => (
+                        <div key={i}>{msg}</div>
+                      ))}
+                    </div>
+                  )}
+
+                  {(() => {
+                    const usedKm = r.gatekeeper.rolling_7d_km;
+                    const remKm = r.gatekeeper.remaining_weekly_budget_km;
+                    const maxKm = Math.max(0.1, usedKm + remKm);
+                    const pct = Math.min(100, Math.max(0, (usedKm / maxKm) * 100));
+                    const barClass =
+                      !r.gatekeeper.run_permitted
+                        ? "red"
+                        : pct >= 85
+                        ? "amber"
+                        : "";
+                    return (
+                      <div className="envelope-section">
+                        <div className="envelope-top">
+                          <strong>Weekly Envelope</strong>
+                          <span className="muted">
+                            {usedKm.toFixed(1)} / {maxKm.toFixed(1)} km used ({r.gatekeeper.rolling_7d_runs}{" "}
+                            {r.gatekeeper.rolling_7d_runs === 1 ? "run" : "runs"}) ·{" "}
+                            <strong>{remKm.toFixed(1)} km</strong> left · Today max{" "}
+                            <strong>{r.gatekeeper.effective_today_max_km.toFixed(1)} km</strong>
+                          </span>
+                        </div>
+                        <div className="envelope-bar-track">
+                          <div
+                            className={`envelope-bar-fill ${barClass}`}
+                            style={{ width: `${pct.toFixed(1)}%` }}
+                          />
+                        </div>
+                      </div>
+                    );
+                  })()}
+
+                  {(r.shoe_eligibility.eligible_run_shoes.length > 0 ||
+                    r.shoe_eligibility.gated_shoes.length > 0 ||
+                    r.shoe_eligibility.blocked_shoes.length > 0) && (
+                    <div className="footwear-row">
+                      <span className="muted" style={{ fontSize: 12 }}>Footwear:</span>
+                      {r.shoe_eligibility.eligible_run_shoes.map((shoe) => (
+                        <span key={`el-${shoe}`} className="shoe-chip eligible">
+                          {shoe}
+                        </span>
+                      ))}
+                      {r.shoe_eligibility.gated_shoes.map((shoe) => (
+                        <span key={`gt-${shoe}`} className="shoe-chip">
+                          {shoe} (gated)
+                        </span>
+                      ))}
+                      {r.shoe_eligibility.blocked_shoes.map((shoe) => (
+                        <span key={`bl-${shoe}`} className="shoe-chip blocked">
+                          {shoe} (blocked)
+                        </span>
+                      ))}
+                    </div>
+                  )}
                 </div>
               ) : (
-                <div className="muted">Click Recompute to evaluate local readiness from your synced history.</div>
+                <div className="muted">
+                  Click Recompute to evaluate local readiness from your synced history.
+                </div>
               )}
+            </div>
+
+            <div className="card briefing-card">
+              <div className="card-header" style={{ marginBottom: 8 }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+                  <strong>Your day</strong>
+                  {briefing && (
+                    <span className="phase-badge">
+                      {shortModelName(briefing.model_id)}
+                    </span>
+                  )}
+                </div>
+                {state.has_gemini_key && (
+                  <button
+                    className="secondary"
+                    style={{ display: "flex", alignItems: "center", gap: 5, fontSize: 12.5, padding: "5px 10px" }}
+                    disabled={briefingBusy}
+                    onClick={() => void handleRegenerateBriefing()}
+                  >
+                    <RefreshCw size={13} />
+                    {briefingBusy ? "Updating…" : "Regenerate"}
+                  </button>
+                )}
+              </div>
+              {!state.has_gemini_key ? (
+                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, flexWrap: "wrap" }}>
+                  <span className="muted">
+                    Add a Gemini API key in Settings to generate your personalized morning briefing.
+                  </span>
+                  <button className="secondary" onClick={() => setTab("settings")}>
+                    Open Settings
+                  </button>
+                </div>
+              ) : briefingBusy && !briefing ? (
+                <div className="muted">Preparing your morning briefing…</div>
+              ) : briefing ? (
+                <div>
+                  <div className="briefing-headline">{briefing.headline}</div>
+                  <div className="briefing-body">
+                    {briefing.body
+                      .split(/\n{2,}/)
+                      .map((p) => p.trim())
+                      .filter(Boolean)
+                      .map((para, i) => (
+                        <p key={i}>{para}</p>
+                      ))}
+                  </div>
+                  {briefing.action_cue.trim() && (
+                    <div className="action-cue-box">
+                      <div className="action-cue-label">Action cue</div>
+                      <div style={{ fontSize: 13.5, fontWeight: 500 }}>{briefing.action_cue}</div>
+                    </div>
+                  )}
+                  {briefingError && (
+                    <div className="key-status-err" style={{ marginTop: 8 }}>
+                      {briefingError}
+                    </div>
+                  )}
+                </div>
+              ) : briefingError ? (
+                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, flexWrap: "wrap" }}>
+                  <span className="key-status-err">{briefingError}</span>
+                  <button className="secondary" onClick={() => void handleRegenerateBriefing()}>
+                    Retry
+                  </button>
+                </div>
+              ) : (
+                <div className="muted">No morning briefing generated yet. Click Regenerate to create one.</div>
+              )}
+            </div>
+
+            <div className="biometrics-grid">
+              {/* 1. Sleep Card */}
+              <div className="bio-card">
+                <div className="bio-card-head">
+                  <span className="bio-card-label">Sleep</span>
+                  {todayDay?.sleep_score != null && (
+                    <span
+                      className={`pill ${
+                        todayDay.sleep_score >= 80
+                          ? "green"
+                          : todayDay.sleep_score >= 60
+                          ? "amber"
+                          : "red"
+                      }`}
+                    >
+                      score {todayDay.sleep_score}
+                    </span>
+                  )}
+                </div>
+                <div>
+                  <div className="bio-card-val">
+                    {formatSleepDuration(sleepSeconds)}
+                  </div>
+                </div>
+                {sleepStageTotal > 0 ? (
+                  <div>
+                    <div className="sleep-stage-bar" aria-label="Sleep stages">
+                      {(todayDay?.sleep_deep_sec ?? 0) > 0 && (
+                        <div
+                          className="sleep-stage-seg"
+                          style={{
+                            width: `${((todayDay!.sleep_deep_sec! / sleepStageTotal) * 100).toFixed(1)}%`,
+                            background: "#6366F1",
+                          }}
+                          title={`Deep ${formatStageCompact(todayDay?.sleep_deep_sec)}`}
+                        />
+                      )}
+                      {(todayDay?.sleep_light_sec ?? 0) > 0 && (
+                        <div
+                          className="sleep-stage-seg"
+                          style={{
+                            width: `${((todayDay!.sleep_light_sec! / sleepStageTotal) * 100).toFixed(1)}%`,
+                            background: "#38BDF8",
+                          }}
+                          title={`Light ${formatStageCompact(todayDay?.sleep_light_sec)}`}
+                        />
+                      )}
+                      {(todayDay?.sleep_rem_sec ?? 0) > 0 && (
+                        <div
+                          className="sleep-stage-seg"
+                          style={{
+                            width: `${((todayDay!.sleep_rem_sec! / sleepStageTotal) * 100).toFixed(1)}%`,
+                            background: "#A855F7",
+                          }}
+                          title={`REM ${formatStageCompact(todayDay?.sleep_rem_sec)}`}
+                        />
+                      )}
+                      {(todayDay?.sleep_awake_sec ?? 0) > 0 && (
+                        <div
+                          className="sleep-stage-seg"
+                          style={{
+                            width: `${((todayDay!.sleep_awake_sec! / sleepStageTotal) * 100).toFixed(1)}%`,
+                            background: "#F472B6",
+                          }}
+                          title={`Awake ${formatStageCompact(todayDay?.sleep_awake_sec)}`}
+                        />
+                      )}
+                    </div>
+                    <div className="sleep-stage-legend" style={{ marginTop: 7 }}>
+                      <span>
+                        <span className="sleep-dot" style={{ background: "#6366F1" }} />
+                        Deep {formatStageCompact(todayDay?.sleep_deep_sec)}
+                      </span>
+                      <span>
+                        <span className="sleep-dot" style={{ background: "#38BDF8" }} />
+                        Light {formatStageCompact(todayDay?.sleep_light_sec)}
+                      </span>
+                      <span>
+                        <span className="sleep-dot" style={{ background: "#A855F7" }} />
+                        REM {formatStageCompact(todayDay?.sleep_rem_sec)}
+                      </span>
+                      <span>
+                        <span className="sleep-dot" style={{ background: "#F472B6" }} />
+                        Awake {formatStageCompact(todayDay?.sleep_awake_sec)}
+                      </span>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="bio-subtext">Sleep stages appear after morning watch sync.</div>
+                )}
+                <div className="bio-footer">
+                  <span>
+                    {sleepStartHhMm && sleepEndHhMm
+                      ? `${sleepStartHhMm} – ${sleepEndHhMm}`
+                      : "Window unavailable"}
+                  </span>
+                  {todayDay?.date && <span>{todayDay.date}</span>}
+                </div>
+              </div>
+
+              {/* 2. HRV Card */}
+              <div className="bio-card">
+                <div className="bio-card-head">
+                  <span className="bio-card-label">HRV</span>
+                  {hrvStatusBadge && (
+                    <span className={`pill ${hrvStatusBadge.tone}`}>{hrvStatusBadge.label}</span>
+                  )}
+                </div>
+                <div>
+                  <div className="bio-card-val">
+                    {todayDay?.hrv_last_night ?? "–"}
+                    {todayDay?.hrv_last_night != null && <span className="bio-card-unit">ms</span>}
+                  </div>
+                  <div className="bio-subtext">
+                    {hrv7dAvg != null ? `7d avg ${hrv7dAvg} ms` : "No 7d avg"}
+                    {todayDay?.hrv_baseline_low != null && todayDay?.hrv_baseline_high != null
+                      ? ` · Balanced ${todayDay.hrv_baseline_low}–${todayDay.hrv_baseline_high} ms`
+                      : ""}
+                  </div>
+                </div>
+                <SparklineSvg
+                  values={hrvSeriesPoints}
+                  color="#52B788"
+                  bandLow={todayDay?.hrv_baseline_low ?? null}
+                  bandHigh={todayDay?.hrv_baseline_high ?? null}
+                  unit="ms"
+                />
+                <div className="bio-footer">
+                  <span>Overnight status</span>
+                  <span>{hrvSeriesPoints.length > 0 ? `${hrvSeriesPoints.length}d trend` : "No history"}</span>
+                </div>
+              </div>
+
+              {/* 3. Energy (Body Battery) Card */}
+              <div className="bio-card">
+                <div className="bio-card-head">
+                  <span className="bio-card-label">Energy · Body Battery</span>
+                  {todayDay?.body_battery_high != null && (
+                    <span className="phase-badge">Peak {todayDay.body_battery_high}</span>
+                  )}
+                </div>
+                <div>
+                  <div className="bio-card-val">
+                    {todayDay?.body_battery_latest ?? todayDay?.body_battery_high ?? "–"}
+                    {(todayDay?.body_battery_latest != null || todayDay?.body_battery_high != null) && (
+                      <span className="bio-card-unit">
+                        {todayDay?.body_battery_latest != null ? "now" : "high"}
+                      </span>
+                    )}
+                  </div>
+                </div>
+                <BodyBatteryChartSvg
+                  series={todayDay?.body_battery_series ?? null}
+                  fallbackLevel={todayDay?.body_battery_latest ?? todayDay?.body_battery_high ?? null}
+                />
+                <div className="bio-footer">
+                  <span>
+                    High {todayDay?.body_battery_high ?? "–"} · Low {todayDay?.body_battery_low ?? "–"}
+                  </span>
+                  <span>
+                    +{todayDay?.body_battery_charged ?? "–"} / -{todayDay?.body_battery_drained ?? "–"}
+                  </span>
+                </div>
+              </div>
+
+              {/* 4. Resting Heart Rate Card */}
+              <div className="bio-card">
+                <div className="bio-card-head">
+                  <span className="bio-card-label">Resting Heart Rate</span>
+                  {todayDay?.resting_hr != null && rhrBaseline30d != null && (
+                    <span
+                      className={`pill ${
+                        todayDay.resting_hr - rhrBaseline30d >= 5
+                          ? "red"
+                          : todayDay.resting_hr - rhrBaseline30d >= 2
+                          ? "amber"
+                          : "green"
+                      }`}
+                    >
+                      {todayDay.resting_hr - rhrBaseline30d >= 0 ? "+" : ""}
+                      {todayDay.resting_hr - rhrBaseline30d} vs {rhrBaseline30d}
+                    </span>
+                  )}
+                </div>
+                <div className="bio-card-val">
+                  {todayDay?.resting_hr ?? "–"}
+                  {todayDay?.resting_hr != null && <span className="bio-card-unit">bpm</span>}
+                </div>
+                <SparklineSvg values={rhrSeriesPoints} color="#E06C75" unit="bpm" />
+                <div className="bio-footer">
+                  <span>30d median {rhrBaseline30d != null ? `${rhrBaseline30d} bpm` : "–"}</span>
+                  <span>{rhrSeriesPoints.length}d curve</span>
+                </div>
+              </div>
+
+              {/* 5. Stress Card */}
+              <div className="bio-card">
+                <div className="bio-card-head">
+                  <span className="bio-card-label">Stress</span>
+                  <span className="phase-badge">{stressDescriptor(todayDay?.stress_avg)}</span>
+                </div>
+                <div className="bio-card-val">
+                  {todayDay?.stress_avg != null ? todayDay.stress_avg : "–"}
+                  {todayDay?.stress_avg != null && <span className="bio-card-unit">avg</span>}
+                </div>
+                <SparklineSvg values={stressSeriesPoints} color="#E9A84C" unit="" />
+                <div className="bio-footer">
+                  <span>All-day Garmin stress</span>
+                  <span>{stressSeriesPoints.length}d curve</span>
+                </div>
+              </div>
+
+              {/* 6. Steps Card */}
+              <div className="bio-card">
+                <div className="bio-card-head">
+                  <span className="bio-card-label">Steps</span>
+                  {todayDay?.step_goal != null && todayDay.step_goal > 0 && (
+                    <span className="phase-badge">Goal {todayDay.step_goal.toLocaleString()}</span>
+                  )}
+                </div>
+                <div className="bio-card-val">
+                  {todayDay?.steps != null ? todayDay.steps.toLocaleString() : "–"}
+                </div>
+                <SparklineSvg values={stepsSeriesPoints} color="#38BDF8" unit="steps" />
+                <div className="bio-footer">
+                  <span>
+                    {todayDay?.steps != null && todayDay?.step_goal
+                      ? `${Math.min(999, Math.round((todayDay.steps / todayDay.step_goal) * 100))}% of daily goal`
+                      : "Daily movement"}
+                  </span>
+                  <span>{stepsSeriesPoints.length}d curve</span>
+                </div>
+              </div>
             </div>
 
             <div className="card">
@@ -1106,24 +1834,170 @@ export default function App() {
               <WeeklyVolumeChart bars={weeklyBars} />
             </div>
 
-            <div className="grid">
+            {state.activities.length > 0 && (
               <div className="card">
-                <div className="muted">Resting Heart Rate</div>
-                <div className="metric-val">{todayDay?.resting_hr ?? "–"} bpm</div>
+                <div className="card-header">
+                  <strong>Recent Activities</strong>
+                  <button className="secondary" onClick={() => setTab("activities")}>
+                    View all
+                  </button>
+                </div>
+                {state.activities.slice(0, 4).map((a) => (
+                  <div
+                    key={a.garmin_id}
+                    onClick={() => {
+                      setTab("activities");
+                      void openActivityDetail(a);
+                    }}
+                    style={{
+                      display: "flex",
+                      justifyContent: "space-between",
+                      padding: "9px 4px",
+                      borderBottom: "1px solid var(--border)",
+                      cursor: "pointer",
+                    }}
+                  >
+                    <div>
+                      <strong>{a.name || a.type_key}</strong>
+                      <div className="muted">
+                        {a.start_iso.slice(0, 10)} · {a.type_key.replace(/_/g, " ")}
+                      </div>
+                    </div>
+                    <div style={{ textAlign: "right" }}>
+                      <div>{(a.distance_m / 1000).toFixed(2)} km</div>
+                      <div className="muted">
+                        {a.average_hr ? `${Math.round(a.average_hr)} bpm` : formatDuration(a.moving_duration_sec || a.duration_sec)}
+                      </div>
+                    </div>
+                  </div>
+                ))}
               </div>
-              <div className="card">
-                <div className="muted">Overnight HRV</div>
-                <div className="metric-val">{todayDay?.hrv_last_night ?? "–"} ms</div>
+            )}
+
+            {envelopeModalOpen && (
+              <div className="modal-backdrop" onClick={() => !envelopeBusy && setEnvelopeModalOpen(false)}>
+                <div className="modal-sheet" onClick={(e) => e.stopPropagation()}>
+                  <div className="card-header" style={{ marginBottom: 10 }}>
+                    <div>
+                      <h3 style={{ margin: 0 }}>Edit Training Envelope</h3>
+                      <div className="muted" style={{ fontSize: 12 }}>
+                        Updates `plan.json` guardrails and immediately recomputes Coach Readiness.
+                      </div>
+                    </div>
+                  </div>
+
+                  <div style={{ marginBottom: 10 }}>
+                    <label className="muted" style={{ fontSize: 12 }}>Mesocycle Phase</label>
+                    <div className="phase-preset-row">
+                      {[
+                        "aerobic_reentry",
+                        "sesamoid_return_reentry",
+                        "aerobic_base_build",
+                        "build",
+                        "recovery",
+                        "taper",
+                      ].map((preset) => (
+                        <button
+                          key={preset}
+                          type="button"
+                          className={`phase-preset-chip ${envPhase === preset ? "active" : ""}`}
+                          onClick={() => setEnvPhase(preset)}
+                        >
+                          {preset.replace(/_/g, " ")}
+                        </button>
+                      ))}
+                    </div>
+                    <input
+                      value={envPhase}
+                      onChange={(e) => setEnvPhase(e.target.value)}
+                      placeholder="aerobic_reentry"
+                    />
+                  </div>
+
+                  <div className="form-row">
+                    <div>
+                      <label className="muted" style={{ fontSize: 12 }}>Weekly Distance Cap (km)</label>
+                      <input
+                        type="number"
+                        step="0.5"
+                        min="1"
+                        value={envMaxWeeklyKm}
+                        onChange={(e) => setEnvMaxWeeklyKm(e.target.value)}
+                      />
+                    </div>
+                    <div>
+                      <label className="muted" style={{ fontSize: 12 }}>Max Single Run (km)</label>
+                      <input
+                        type="number"
+                        step="0.5"
+                        min="0.5"
+                        value={envMaxSingleKm}
+                        onChange={(e) => setEnvMaxSingleKm(e.target.value)}
+                      />
+                    </div>
+                  </div>
+
+                  <div className="form-row">
+                    <div>
+                      <label className="muted" style={{ fontSize: 12 }}>Min Rest Between Runs (hrs)</label>
+                      <input
+                        type="number"
+                        step="1"
+                        min="0"
+                        value={envMinHours}
+                        onChange={(e) => setEnvMinHours(e.target.value)}
+                      />
+                    </div>
+                    <div>
+                      <label className="muted" style={{ fontSize: 12 }}>Walk HR Cap (bpm)</label>
+                      <input
+                        type="number"
+                        min="60"
+                        max="200"
+                        value={envWalkHrCap}
+                        onChange={(e) => setEnvWalkHrCap(e.target.value)}
+                      />
+                    </div>
+                  </div>
+
+                  <div style={{ marginBottom: 12 }}>
+                    <label className="muted" style={{ fontSize: 12 }}>Easy / Session HR Ceiling (bpm)</label>
+                    <input
+                      type="number"
+                      min="80"
+                      max="220"
+                      value={envSessionHrCap}
+                      onChange={(e) => setEnvSessionHrCap(e.target.value)}
+                    />
+                  </div>
+
+                  {envelopeError && (
+                    <div className="key-status-err" style={{ marginBottom: 10 }}>
+                      {envelopeError}
+                    </div>
+                  )}
+
+                  <div style={{ display: "flex", justifyContent: "flex-end", gap: 8 }}>
+                    <button
+                      type="button"
+                      className="secondary"
+                      disabled={envelopeBusy}
+                      onClick={() => setEnvelopeModalOpen(false)}
+                    >
+                      Cancel
+                    </button>
+                    <button
+                      type="button"
+                      className="primary"
+                      disabled={envelopeBusy}
+                      onClick={() => void saveEnvelopeEdits()}
+                    >
+                      {envelopeBusy ? "Saving…" : "Save & Recompute"}
+                    </button>
+                  </div>
+                </div>
               </div>
-              <div className="card">
-                <div className="muted">Sleep Score</div>
-                <div className="metric-val">{todayDay?.sleep_score ?? "–"}</div>
-              </div>
-              <div className="card">
-                <div className="muted">Steps</div>
-                <div className="metric-val">{todayDay?.steps?.toLocaleString() ?? "–"}</div>
-              </div>
-            </div>
+            )}
           </>
         )}
 
@@ -1863,6 +2737,36 @@ export default function App() {
 
         {tab === "settings" && (
           <>
+            <div className="card">
+              <div className="card-header" style={{ marginBottom: 8 }}>
+                <div>
+                  <h3 style={{ margin: 0 }}>Appearance</h3>
+                  <div className="muted" style={{ fontSize: 12.5 }}>
+                    Matches Windows light or dark mode by default, or pins a theme.
+                  </div>
+                </div>
+                <div className="theme-segmented" role="radiogroup" aria-label="Theme mode">
+                  {(["system", "dark", "light"] as ThemeMode[]).map((mode) => (
+                    <button
+                      key={mode}
+                      type="button"
+                      className={`theme-seg-btn ${themeMode === mode ? "active" : ""}`}
+                      onClick={async () => {
+                        applyThemeMode(mode);
+                        try {
+                          await invoke("set_theme_mode", { mode });
+                        } catch {
+                          // Local theme preference still applies immediately
+                        }
+                      }}
+                    >
+                      {mode.charAt(0).toUpperCase() + mode.slice(1)}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            </div>
+
             <div className="card">
               <h3>Execution Mode</h3>
               <div style={{ display: "flex", gap: 10, marginBottom: 10 }}>
@@ -3089,6 +3993,11 @@ export default function App() {
                         setCoachError(null);
                         setStatusMsg(null);
                         setConfirmCleanSlate(false);
+                        setBriefing(null);
+                        setBriefingError(null);
+                        briefingAttemptedRef.current = null;
+                        bbRefreshAttemptedRef.current = null;
+                        applyThemeMode("system");
                         setOnboardingKey((k) => k + 1);
                         await reload();
                         setShowOnboarding(true);
@@ -3926,5 +4835,152 @@ function FitDualChart({ points }: { points: FitTrackPoint[] }) {
       <text x={8} y={14} fontSize="11" fill="var(--red)">HR (bpm)</text>
       <text x={80} y={14} fontSize="11" fill="var(--accent)">Pace (/km)</text>
     </svg>
+  );
+}
+
+function SparklineSvg({
+  values,
+  color,
+  bandLow,
+  bandHigh,
+  unit,
+}: {
+  values: number[];
+  color: string;
+  bandLow?: number | null;
+  bandHigh?: number | null;
+  unit?: string;
+}) {
+  if (values.length < 2) {
+    return (
+      <div
+        style={{
+          height: 36,
+          display: "flex",
+          alignItems: "center",
+          fontSize: 11.5,
+          color: "var(--muted)",
+        }}
+      >
+        {values.length === 1
+          ? `Latest: ${values[0]}${unit ? ` ${unit}` : ""}`
+          : "Waiting for multi-day trend"}
+      </div>
+    );
+  }
+  const w = 220;
+  const h = 40;
+  const pad = 4;
+  const allVals = [...values];
+  if (bandLow != null) allVals.push(bandLow);
+  if (bandHigh != null) allVals.push(bandHigh);
+  const min = Math.min(...allVals);
+  const max = Math.max(...allVals);
+  const span = Math.max(1e-3, max - min);
+  const toY = (v: number) => h - pad - ((v - min) / span) * (h - pad * 2);
+
+  const pts = values.map((v, i) => {
+    const x = pad + (i / (values.length - 1)) * (w - pad * 2);
+    const y = toY(v);
+    return { x, y };
+  });
+  const lineD = pts
+    .map((p, i) => `${i === 0 ? "M" : "L"}${p.x.toFixed(1)},${p.y.toFixed(1)}`)
+    .join(" ");
+  const areaD = `${lineD} L${pts[pts.length - 1].x.toFixed(1)},${(h - pad).toFixed(1)} L${pts[0].x.toFixed(1)},${(h - pad).toFixed(1)} Z`;
+
+  const bandTop = bandHigh != null ? toY(bandHigh) : null;
+  const bandBottom = bandLow != null ? toY(bandLow) : null;
+  const last = pts[pts.length - 1];
+
+  return (
+    <svg viewBox={`0 0 ${w} ${h}`} className="bio-sparkline" style={{ height: 40 }}>
+      {bandTop != null && bandBottom != null && bandBottom >= bandTop && (
+        <rect
+          x={pad}
+          y={bandTop}
+          width={w - pad * 2}
+          height={Math.max(2, bandBottom - bandTop)}
+          rx={2}
+          fill={color}
+          opacity={0.14}
+        />
+      )}
+      <path d={areaD} fill={color} opacity={0.14} />
+      <path d={lineD} fill="none" stroke={color} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+      <circle cx={last.x} cy={last.y} r="3" fill={color} />
+    </svg>
+  );
+}
+
+function BodyBatteryChartSvg({
+  series,
+  fallbackLevel,
+}: {
+  series: BodyBatteryPoint[] | null;
+  fallbackLevel: number | null;
+}) {
+  if (!series || series.length < 2) {
+    const pct = fallbackLevel != null ? Math.min(100, Math.max(0, fallbackLevel)) : 0;
+    return (
+      <div>
+        <div className="envelope-bar-track" style={{ height: 8, marginTop: 6, marginBottom: 4 }}>
+          <div className="envelope-bar-fill" style={{ width: `${pct}%` }} />
+        </div>
+        <div className="bio-subtext">
+          {fallbackLevel != null ? "Intraday curve syncs on next refresh" : "No Body Battery synced yet"}
+        </div>
+      </div>
+    );
+  }
+
+  const w = 240;
+  const h = 54;
+  const padX = 4;
+  const padY = 5;
+  const minTs = series[0].timestamp_ms;
+  const maxTs = series[series.length - 1].timestamp_ms;
+  const tsSpan = Math.max(1, maxTs - minTs);
+
+  const pts = series.map((p) => {
+    const x = padX + ((p.timestamp_ms - minTs) / tsSpan) * (w - padX * 2);
+    const clamped = Math.min(100, Math.max(0, p.level));
+    const y = h - padY - (clamped / 100) * (h - padY * 2);
+    return { x, y };
+  });
+  const lineD = pts
+    .map((p, i) => `${i === 0 ? "M" : "L"}${p.x.toFixed(1)},${p.y.toFixed(1)}`)
+    .join(" ");
+  const areaD = `${lineD} L${pts[pts.length - 1].x.toFixed(1)},${(h - padY).toFixed(1)} L${pts[0].x.toFixed(1)},${(h - padY).toFixed(1)} Z`;
+  const last = pts[pts.length - 1];
+
+  return (
+    <div>
+      <svg viewBox={`0 0 ${w} ${h}`} className="bio-sparkline" style={{ height: 52 }}>
+        <defs>
+          <linearGradient id="bbAreaGrad" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stopColor="var(--accent-primary)" stopOpacity="0.34" />
+            <stop offset="100%" stopColor="var(--accent-primary)" stopOpacity="0.03" />
+          </linearGradient>
+        </defs>
+        <line x1={padX} y1={h / 2} x2={w - padX} y2={h / 2} stroke="var(--border)" strokeDasharray="3 3" strokeWidth="1" />
+        <path d={areaD} fill="url(#bbAreaGrad)" />
+        <path
+          d={lineD}
+          fill="none"
+          stroke="var(--accent-primary)"
+          strokeWidth="2"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+        />
+        <circle cx={last.x} cy={last.y} r="4.5" fill="var(--accent-primary)" opacity={0.25} />
+        <circle cx={last.x} cy={last.y} r="2.6" fill="var(--accent-primary)" />
+      </svg>
+      <div className="bio-subtext" style={{ display: "flex", justifyContent: "space-between", fontSize: 10.5 }}>
+        <span>00:00</span>
+        <span>12:00</span>
+        <span>now</span>
+      </div>
+    </div>
   );
 }

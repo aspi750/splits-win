@@ -1014,7 +1014,15 @@ fn execute_tool(
         }
         "get_wellness_history" => {
             let count = args["days"].as_u64().unwrap_or(14).min(60) as usize;
-            let slice: Vec<&DayRecord> = days.iter().take(count).collect();
+            let slice: Vec<DayRecord> = days
+                .iter()
+                .take(count)
+                .map(|d| {
+                    let mut slim = d.clone();
+                    slim.body_battery_series = None;
+                    slim
+                })
+                .collect();
             json!({ "count": slice.len(), "days": slice })
         }
         "get_readiness_and_plan" => {
@@ -2248,4 +2256,497 @@ pub fn append_training_ledger_entry(
         .write_text_atomic("ASPI_Training_Log.txt", &updated)
         .map_err(|e| e.to_string())?;
     Ok(updated.lines().count())
+}
+
+pub fn without_dashes(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '—' {
+            while out.ends_with(' ') {
+                out.pop();
+            }
+            while chars.peek() == Some(&' ') {
+                chars.next();
+            }
+            if !out.is_empty() && chars.peek().is_some() {
+                out.push_str(", ");
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out.replace("**", "")
+}
+
+fn format_hours_minutes_text(seconds: i32) -> String {
+    let minutes = (seconds.max(0) + 30) / 60;
+    if minutes >= 60 {
+        format!("{} h {} min", minutes / 60, minutes % 60)
+    } else {
+        format!("{minutes} min")
+    }
+}
+
+pub fn build_daily_briefing_facts(
+    config: &AthleteConfig,
+    activities: &[ActivityRecord],
+    days: &[DayRecord],
+    readiness: Option<&ReadinessState>,
+    today_date: NaiveDate,
+) -> String {
+    let today_str = today_date.format("%Y-%m-%d").to_string();
+    let yesterday_str = (today_date - Duration::days(1)).format("%Y-%m-%d").to_string();
+    let two_weeks_ago_str = (today_date - Duration::days(14)).format("%Y-%m-%d").to_string();
+
+    let today_day = days.iter().find(|d| d.date == today_str);
+    let before: Vec<&DayRecord> = days
+        .iter()
+        .filter(|d| d.date >= two_weeks_ago_str && d.date < today_str)
+        .collect();
+
+    let avg_i32 = |vals: Vec<i32>| -> Option<i32> {
+        if vals.is_empty() {
+            None
+        } else {
+            Some((vals.iter().sum::<i32>() as f64 / vals.len() as f64).round() as i32)
+        }
+    };
+
+    let mut lines = vec![format!(
+        "Today is {}.",
+        today_date.format("%A, %B %-d")
+    )];
+    let mut tired: Vec<String> = Vec::new();
+    let mut fresh: Vec<String> = Vec::new();
+
+    if let Some(d) = today_day {
+        if let Some(sleep_sec) = d.sleep_seconds.or(d.sleep_duration_sec).filter(|&s| s > 0) {
+            let mut line = format!("Last night: slept {}", format_hours_minutes_text(sleep_sec));
+            if let Some(score) = d.sleep_score {
+                line.push_str(&format!(", sleep score {score} out of 100"));
+                if score < 60 {
+                    tired.push("poor sleep score".to_string());
+                } else if score >= 80 {
+                    fresh.push("good sleep score".to_string());
+                }
+            }
+            if let Some(usual) = avg_i32(
+                before
+                    .iter()
+                    .filter_map(|x| x.sleep_seconds.or(x.sleep_duration_sec))
+                    .collect(),
+            ) {
+                let diff_min = (sleep_sec - usual) / 60;
+                if diff_min >= 30 {
+                    line.push_str(&format!(", {diff_min} min more than usual"));
+                    fresh.push("a long night's sleep".to_string());
+                } else if diff_min <= -30 {
+                    line.push_str(&format!(", {} min less than usual", -diff_min));
+                    if diff_min <= -45 {
+                        tired.push("short sleep".to_string());
+                    }
+                } else {
+                    line.push_str(", about their usual");
+                }
+            }
+            lines.push(format!("{line}."));
+        } else {
+            lines.push("Last night's sleep hasn't synced yet.".to_string());
+        }
+
+        if let Some(hrv) = d.hrv_last_night {
+            let mut line = format!("Overnight HRV {hrv} ms");
+            if let (Some(low), Some(high)) = (d.hrv_baseline_low, d.hrv_baseline_high) {
+                if hrv < low {
+                    line.push_str(&format!(", below their normal range of {low}–{high}"));
+                    tired.push("HRV below normal".to_string());
+                } else if hrv > high {
+                    line.push_str(&format!(", above their normal range of {low}–{high}"));
+                    fresh.push("HRV above normal".to_string());
+                } else {
+                    line.push_str(&format!(", inside their normal range of {low}–{high}"));
+                    fresh.push("HRV in its normal range".to_string());
+                }
+            }
+            if let Some(ref status) = d.hrv_status {
+                let lower = status.to_lowercase();
+                if lower.contains("low") || lower.contains("unbalanced") {
+                    line.push_str(&format!("; the 7-day HRV status is {lower}"));
+                    if !tired.iter().any(|t| t == "HRV below normal") {
+                        tired.push(format!("HRV status {lower}"));
+                    }
+                }
+            }
+            lines.push(format!("{line}."));
+        }
+
+        let rhr_samples: Vec<(DateTime<Utc>, Option<i32>)> = days
+            .iter()
+            .filter_map(|x| {
+                NaiveDate::parse_from_str(&x.date, "%Y-%m-%d")
+                    .ok()
+                    .and_then(|nd| nd.and_hms_opt(12, 0, 0))
+                    .map(|ndt| (DateTime::<Utc>::from_naive_utc_and_offset(ndt, Utc), x.resting_hr))
+            })
+            .collect();
+        let ref_dt = today_date
+            .and_hms_opt(12, 0, 0)
+            .map(|ndt| DateTime::<Utc>::from_naive_utc_and_offset(ndt, Utc))
+            .unwrap_or_else(Utc::now);
+        let baseline_rhr = config
+            .effective_resting_hr_baseline(&rhr_samples, ref_dt)
+            .or_else(|| avg_i32(before.iter().filter_map(|x| x.resting_hr).collect()));
+        if let (Some(rhr), Some(usual)) = (d.resting_hr, baseline_rhr) {
+            let diff = rhr - usual;
+            let desc = if diff >= 3 {
+                tired.push("resting heart rate up".to_string());
+                format!("{diff} above their usual {usual}")
+            } else if diff <= -2 {
+                fresh.push("resting heart rate normal".to_string());
+                format!("{} below their usual {usual}", -diff)
+            } else {
+                fresh.push("resting heart rate normal".to_string());
+                format!("about their usual {usual}")
+            };
+            lines.push(format!("Resting heart rate {rhr} bpm, {desc}."));
+        }
+
+        if let Some(high) = d.body_battery_high {
+            let usual = avg_i32(before.iter().filter_map(|x| x.body_battery_high).collect());
+            let mut line = format!("Energy level (0 to 100) peaked at {high}");
+            if let Some(now_bb) = d.body_battery_latest {
+                line.push_str(&format!(" ({now_bb} now)"));
+            }
+            if let Some(u) = usual {
+                if high >= u + 8 {
+                    line.push_str(&format!(", higher than usual ({u})"));
+                } else if high <= u - 8 {
+                    line.push_str(&format!(", lower than usual ({u})"));
+                } else {
+                    line.push_str(", about usual");
+                }
+                if high <= u - 10 || high < 40 {
+                    tired.push("low energy level".to_string());
+                } else if high >= 75 {
+                    fresh.push("energy level well charged".to_string());
+                }
+            } else if high >= 75 {
+                fresh.push("energy level well charged".to_string());
+            } else if high < 40 {
+                tired.push("low energy level".to_string());
+            }
+            lines.push(format!("{line}."));
+        }
+    } else {
+        lines.push("Last night's wellness data hasn't synced yet.".to_string());
+    }
+
+    let describe_act = |a: &ActivityRecord| -> String {
+        let mut s = if a.name.trim().is_empty() {
+            a.type_key.replace('_', " ")
+        } else {
+            a.name.trim().to_string()
+        };
+        if a.distance_m > 50.0 {
+            s.push_str(&format!(" of {:.2} km", a.distance_m / 1000.0));
+        }
+        let dur = if a.moving_duration_sec > 0.0 {
+            a.moving_duration_sec
+        } else {
+            a.duration_sec
+        };
+        s.push_str(&format!(" ({})", format_duration(dur)));
+        s
+    };
+
+    let todays: Vec<String> = activities
+        .iter()
+        .filter(|a| a.start_iso.starts_with(&today_str))
+        .map(describe_act)
+        .collect();
+    let yesterdays: Vec<String> = activities
+        .iter()
+        .filter(|a| a.start_iso.starts_with(&yesterday_str))
+        .map(describe_act)
+        .collect();
+    if yesterdays.is_empty() {
+        lines.push("Yesterday: no training.".to_string());
+    } else {
+        lines.push(format!("Yesterday: {}.", yesterdays.join(", ")));
+    }
+    if !todays.is_empty() {
+        lines.push(format!("Already done today: {}.", todays.join(", ")));
+    }
+
+    let week_start_str = (today_date - Duration::days(7)).format("%Y-%m-%d").to_string();
+    let base_start_str = (today_date - Duration::days(35)).format("%Y-%m-%d").to_string();
+    let load_week: f64 = activities
+        .iter()
+        .filter(|a| {
+            let d = a.start_iso.get(..10).unwrap_or("");
+            d >= week_start_str.as_str() && d < today_str.as_str()
+        })
+        .filter_map(|a| a.training_load)
+        .sum();
+    let usual_load: f64 = activities
+        .iter()
+        .filter(|a| {
+            let d = a.start_iso.get(..10).unwrap_or("");
+            d >= base_start_str.as_str() && d < week_start_str.as_str()
+        })
+        .filter_map(|a| a.training_load)
+        .sum::<f64>()
+        / 4.0;
+    if usual_load > 1.0 {
+        let ratio = load_week / usual_load;
+        let pct = ((ratio - 1.0).abs() * 100.0).round() as i32;
+        if ratio >= 1.15 {
+            lines.push(format!(
+                "Training over the last 7 days: {pct}% more than a usual week (a big week)."
+            ));
+            if ratio >= 1.3 {
+                tired.push("a much bigger week than usual".to_string());
+            }
+        } else if ratio <= 0.85 {
+            lines.push(format!(
+                "Training over the last 7 days: {pct}% less than a usual week (a light week)."
+            ));
+            fresh.push("a light week".to_string());
+        } else {
+            lines.push("Training over the last 7 days: about a usual week.".to_string());
+        }
+    }
+
+    let last_night_in = today_day
+        .map(|d| d.sleep_seconds.or(d.sleep_duration_sec).is_some() || d.hrv_last_night.is_some())
+        .unwrap_or(false);
+    let (verdict, plan_line) = if !last_night_in {
+        (
+            "unknown, last night's data hasn't synced from their watch yet",
+            "No call on recovery yet; go by feel until the watch syncs.",
+        )
+    } else if tired.is_empty() {
+        (
+            "well recovered",
+            "Cleared within your configured training envelope and heart rate ceiling.",
+        )
+    } else if tired.len() <= 2 {
+        (
+            "partly recovered",
+            "Keep it easy today: stay within your easy aerobic ceiling, or rest if legs feel flat.",
+        )
+    } else {
+        (
+            "not well recovered",
+            "Take a rest day today, or something very light like a gentle walk.",
+        )
+    };
+    let mut verdict_line = format!("Recovery verdict: {verdict}.");
+    if !tired.is_empty() {
+        verdict_line.push_str(&format!(" Against: {}.", tired.join(", ")));
+    }
+    if !fresh.is_empty() {
+        verdict_line.push_str(&format!(" For: {}.", fresh.join(", ")));
+    }
+    lines.push(verdict_line);
+    lines.push(format!("Recommendation: {plan_line}"));
+
+    if let Some(r) = readiness {
+        let total_budget = r.gatekeeper.rolling_7d_km + r.gatekeeper.remaining_weekly_budget_km;
+        lines.push(format!(
+            "Authoritative readiness gatekeeper: decision={} (run_permitted={}), distance={:.1} km, duration={} min, HR ceiling={} bpm, shoe={}, phase={}, weekly envelope={:.1}/{:.1} km used ({:.1} km left, today max {:.1} km).",
+            r.prescription_summary.decision,
+            r.gatekeeper.run_permitted,
+            r.prescription_summary.distance_km,
+            r.prescription_summary.duration_mins,
+            r.prescription_summary.hr_ceiling_bpm,
+            r.prescription_summary.shoe_platform,
+            r.plan_context.mesocycle_phase,
+            r.gatekeeper.rolling_7d_km,
+            total_budget,
+            r.gatekeeper.remaining_weekly_budget_km,
+            r.gatekeeper.effective_today_max_km
+        ));
+        if !r.gatekeeper.hard_blocks.is_empty() {
+            lines.push(format!("Hard blocks: {}", r.gatekeeper.hard_blocks.join("; ")));
+        }
+        if !r.gatekeeper.caution_flags.is_empty() {
+            lines.push(format!("Caution flags: {}", r.gatekeeper.caution_flags.join("; ")));
+        }
+    }
+
+    lines.join("\n")
+}
+
+pub async fn generate_daily_briefing(
+    api_key: &str,
+    store: &SharedStore,
+    config: &AthleteConfig,
+    activities: &[ActivityRecord],
+    days: &[DayRecord],
+    readiness: Option<&ReadinessState>,
+    model_settings: &ModelSettings,
+    today_date: NaiveDate,
+) -> Result<DailyBriefingRecord, String> {
+    let resolved = resolve_model(ModelScope::Background, model_settings);
+    let today_str = today_date.format("%Y-%m-%d").to_string();
+    let today_day = days.iter().find(|d| d.date == today_str);
+    let had_sleep = today_day
+        .and_then(|d| d.sleep_seconds.or(d.sleep_duration_sec))
+        .map_or(false, |s| s > 0);
+
+    let facts = build_daily_briefing_facts(config, activities, days, readiness, today_date);
+    let name = config.specs.display_name.trim();
+    let greeting = if name.is_empty() {
+        "You are a witty, upbeat running buddy and coach writing someone's morning briefing inside Splits Coach.".to_string()
+    } else {
+        format!("You are {name}'s witty, upbeat running buddy and coach writing their morning briefing inside Splits Coach. Address them warmly.")
+    };
+
+    let mut sys_parts = vec![
+        format!(
+            "{greeting}\nUse metric units (km, min/km, bpm, kg). Never override an authoritative gatekeeper hard block or running prohibition. Never invent numbers not present in the facts. Never use em dashes (—); use commas or full stops instead. Return valid JSON matching the schema: headline, body, action_cue."
+        ),
+        format!("=== ATHLETE CONFIG ===\n{}", config.prompt_summary(None)),
+    ];
+    if let Ok(Some(profile_md)) = store.read_text("COACH_PROFILE.md") {
+        let trimmed = profile_md.trim();
+        if !trimmed.is_empty() {
+            sys_parts.push(format!(
+                "=== COACH_PROFILE.md ===\n{}",
+                trimmed.chars().take(3000).collect::<String>()
+            ));
+        }
+    }
+    if let Ok(Some(plan_md)) = store.read_text("TRAINING_PLAN.md") {
+        let trimmed = plan_md.trim();
+        if !trimmed.is_empty() {
+            sys_parts.push(format!(
+                "=== TRAINING_PLAN.md ===\n{}",
+                trimmed.chars().take(3000).collect::<String>()
+            ));
+        }
+    }
+    sys_parts.push(
+        "Morning briefing format:\n- headline: one short punchy line (under 10 words, one relevant emoji) matching the recovery verdict.\n- body: 2-3 short paragraphs (1-2 sentences each, under 90 words total, plain text without markdown lists or bold).\n  1) Overnight recovery & biometrics against usual baseline with a light comparison.\n  2) Yesterday's training (or rest) and recent 7-day trend.\n  3) Today's clear call aligned with the gatekeeper decision.\n- action_cue: one crisp, concrete next step (respecting HR ceiling, distance cap, or rest rule)."
+            .to_string(),
+    );
+    #[cfg(feature = "beta-coach")]
+    sys_parts.push(
+        "BETA COACH PERSONA DIRECTIVE: Keep every physiological metric and gatekeeper constraint 100% accurate while adding dry, deadpan wit."
+            .to_string(),
+    );
+
+    let system_instruction = sys_parts.join("\n\n");
+    let endpoint = format!(
+        "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={api_key}",
+        resolved.model_id
+    );
+    let body = json!({
+        "systemInstruction": { "parts": [{ "text": system_instruction }] },
+        "contents": [{ "role": "user", "parts": [{ "text": facts }] }],
+        "generationConfig": {
+            "temperature": 0.4,
+            "maxOutputTokens": 4096,
+            "thinkingConfig": { "thinkingLevel": resolved.thinking_level.as_str() },
+            "responseMimeType": "application/json",
+            "responseSchema": {
+                "type": "OBJECT",
+                "properties": {
+                    "headline": { "type": "STRING", "description": "Short headline under 10 words with one relevant emoji." },
+                    "body": { "type": "STRING", "description": "2-3 concise paragraphs grounded strictly in the supplied telemetry." },
+                    "action_cue": { "type": "STRING", "description": "One concrete next step respecting the athlete's guardrails." }
+                },
+                "required": ["headline", "body", "action_cue"]
+            }
+        }
+    });
+
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let resp = client
+        .post(&endpoint)
+        .header("x-goog-api-key", api_key)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("Network error: {e}"))?;
+
+    if !resp.status().is_success() {
+        let code = resp.status();
+        if code.as_u16() == 429 {
+            return Err("Gemini rate limit reached (HTTP 429). Please wait a moment before trying again.".to_string());
+        }
+        let text = resp.text().await.unwrap_or_default();
+        return Err(format!("Gemini API error ({code}): {text}"));
+    }
+
+    let envelope: Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("Failed to decode Gemini briefing response: {e}"))?;
+
+    if let Some(usage) = envelope.get("usageMetadata") {
+        let entry = CoachUsageEntry {
+            timestamp: Utc::now().to_rfc3339(),
+            profile: "DAILY_BRIEFING".to_string(),
+            model: resolved.model_id.clone(),
+            prompt_tokens: usage["promptTokenCount"].as_i64().unwrap_or(0) as i32,
+            candidates_tokens: usage["candidatesTokenCount"].as_i64().unwrap_or(0) as i32,
+            thoughts_tokens: usage["thoughtsTokenCount"].as_i64().unwrap_or(0) as i32,
+            total_tokens: usage["totalTokenCount"].as_i64().unwrap_or(0) as i32,
+            finish_reason: envelope["candidates"][0]["finishReason"]
+                .as_str()
+                .unwrap_or("STOP")
+                .to_string(),
+        };
+        let _ = store.append_usage_log(&entry);
+    }
+
+    let parts = envelope["candidates"][0]["content"]["parts"]
+        .as_array()
+        .ok_or_else(|| "Gemini returned no briefing candidate parts.".to_string())?;
+    let raw_text = parts
+        .iter()
+        .filter(|p| p["thought"].as_bool() != Some(true))
+        .filter_map(|p| p["text"].as_str())
+        .map(str::trim)
+        .find(|s| !s.is_empty())
+        .ok_or_else(|| "Gemini returned empty briefing text.".to_string())?;
+
+    let mut clean = raw_text.trim();
+    if let Some(rest) = clean.strip_prefix("```json") {
+        clean = rest.trim();
+    } else if let Some(rest) = clean.strip_prefix("```") {
+        clean = rest.trim();
+    }
+    if let Some(rest) = clean.strip_suffix("```") {
+        clean = rest.trim();
+    }
+
+    let parsed: Value = serde_json::from_str(clean)
+        .map_err(|e| format!("Failed to parse structured daily briefing JSON: {e}"))?;
+
+    let headline = without_dashes(
+        parsed["headline"]
+            .as_str()
+            .unwrap_or("Today's readiness")
+            .trim(),
+    );
+    let body = without_dashes(parsed["body"].as_str().unwrap_or("").trim());
+    let action_cue = without_dashes(parsed["action_cue"].as_str().unwrap_or("").trim());
+
+    Ok(DailyBriefingRecord {
+        date: today_str,
+        headline,
+        body,
+        action_cue,
+        model_id: resolved.model_id,
+        thinking_level: resolved.thinking_level.as_str().to_string(),
+        had_sleep,
+        generated_at: Utc::now().to_rfc3339(),
+    })
 }

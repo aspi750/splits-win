@@ -1,13 +1,17 @@
-use chrono::{Duration, TimeZone, Utc};
+use chrono::{Duration, NaiveDate, TimeZone, Utc};
 use splits_win_lib::coach::{
     analyze_training_history, append_forensic_section, append_training_ledger_entry,
-    apply_coach_proposal, apply_post_run_context_tool_update, compact_history_markdown,
-    fetch_1hz_window_from_track, format_user_profile_context, replacing_section,
-    slice_fit_track_by_km, starter_coach_profile_markdown, starter_plan_file,
-    starter_training_plan_markdown, CoachPacketBuilder,
+    apply_coach_proposal, apply_post_run_context_tool_update, build_daily_briefing_facts,
+    compact_history_markdown, fetch_1hz_window_from_track, format_user_profile_context,
+    replacing_section, slice_fit_track_by_km, starter_coach_profile_markdown,
+    starter_plan_file, starter_training_plan_markdown, without_dashes, CoachPacketBuilder,
 };
 use splits_win_lib::forensic_extractor::extract_forensic_telemetry;
-use splits_win_lib::garmin::{analyze_fit_points, dissect_hyrox_laps, parse_weight_range_json};
+use splits_win_lib::garmin::{
+    analyze_fit_points, chunk_date_range, dissect_hyrox_laps, parse_body_battery_days_json,
+    parse_daily_summaries_json, parse_hrv_range_json, parse_sleep_summaries_json,
+    parse_steps_json, parse_weight_range_json,
+};
 use splits_win_lib::models::*;
 use splits_win_lib::readiness::{ReadinessEngine, ReadinessInput};
 use splits_win_lib::scheduler::{
@@ -154,6 +158,7 @@ fn test_readiness_engine_green_red_amber_and_persistence() {
         sleep_score: Some(82),
         hrv_last_night: Some(64),
         hrv_status: Some("BALANCED".to_string()),
+        ..Default::default()
     };
 
     // GREEN
@@ -370,6 +375,7 @@ fn test_stage2_2_hybrid_hyrox_spacing_and_compromised_run_audit() {
             sleep_score: Some(84),
             hrv_last_night: Some(55),
             hrv_status: Some("BALANCED".to_string()),
+            ..Default::default()
         });
     }
 
@@ -1466,6 +1472,7 @@ fn v0_2_3_2_reentry_c25k_goals_and_clean_slate_purge() {
         sleep_score: Some(84),
         hrv_last_night: Some(62),
         hrv_status: Some("BALANCED".to_string()),
+        ..Default::default()
     };
 
     let mut c25k_cfg = AthleteConfig::default();
@@ -1617,6 +1624,294 @@ fn v0_2_3_3_credentials_json_atomic_persistence_and_clean_slate_delete() {
     assert_eq!(CredentialStore::read_garmin_key_at(&cred_path), None);
     assert_eq!(CredentialStore::read_gemini_key_at(&cred_path), None);
     assert_eq!(CredentialStore::read_uiserver_token_at(&cred_path), None);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn v0_2_4_garmin_sleep_2026_11_25_and_tolerant_decoding() {
+    let start_ms = NaiveDate::from_ymd_opt(2026, 11, 25)
+        .unwrap()
+        .and_hms_opt(0, 14, 0)
+        .unwrap()
+        .and_utc()
+        .timestamp_millis();
+    let end_ms = NaiveDate::from_ymd_opt(2026, 11, 25)
+        .unwrap()
+        .and_hms_opt(7, 20, 0)
+        .unwrap()
+        .and_utc()
+        .timestamp_millis();
+
+    let payload = serde_json::json!([
+        {
+            "dailySleepDTO": {
+                "calendarDate": "2026-11-25",
+                "sleepTimeSeconds": 25560,
+                "deepSleepSeconds": 5100,
+                "lightSleepSeconds": 13500,
+                "remSleepSeconds": 6200,
+                "awakeSleepSeconds": 760,
+                "sleepStartTimestampLocal": start_ms,
+                "sleepEndTimestampLocal": end_ms,
+                "sleepScores": {
+                    "overall": { "value": 91 }
+                }
+            }
+        },
+        {
+            // Shorter afternoon nap should NOT overwrite main sleep
+            "calendarDate": "2026-11-25",
+            "sleepTimeSeconds": 1800,
+            "deepSleepSeconds": 300,
+            "sleepScores": { "overall": 60 }
+        },
+        {
+            // Zero-second placeholder should be ignored
+            "calendarDate": "2026-11-24",
+            "sleepTimeSeconds": 0,
+            "sleepScores": { "overall": { "value": 0 } }
+        },
+        {
+            // Tolerant float & top-level DTO fallback
+            "calendarDate": "2026-11-23",
+            "sleepTimeSeconds": 26100.0,
+            "deepSleepSeconds": 4800.0,
+            "lightSleepSeconds": 14400.0,
+            "remSleepSeconds": 6300.0,
+            "awakeSleepSeconds": 600.0,
+            "sleepStartTimestampLocal": "2026-11-22 23:45:00",
+            "sleepEndTimestampLocal": "2026-11-23 07:00:00",
+            "sleepScores": { "overall": 86.0 }
+        }
+    ]);
+
+    let mut days = std::collections::HashMap::new();
+    parse_sleep_summaries_json(serde_json::to_vec(&payload).unwrap().as_slice(), &mut days);
+
+    assert!(!days.contains_key("2026-11-24"));
+
+    let d25 = days.get("2026-11-25").expect("2026-11-25 sleep present");
+    assert_eq!(d25.sleep_seconds, Some(25560));
+    assert_eq!(d25.sleep_duration_sec, Some(25560));
+    assert_eq!(d25.sleep_score, Some(91));
+    assert_eq!(d25.sleep_start.as_deref(), Some("2026-11-25T00:14:00"));
+    assert_eq!(d25.sleep_end.as_deref(), Some("2026-11-25T07:20:00"));
+    assert_eq!(d25.sleep_deep_sec, Some(5100));
+    assert_eq!(d25.sleep_light_sec, Some(13500));
+    assert_eq!(d25.sleep_rem_sec, Some(6200));
+    assert_eq!(d25.sleep_awake_sec, Some(760));
+
+    let d23 = days.get("2026-11-23").expect("2026-11-23 sleep present");
+    assert_eq!(d23.sleep_seconds, Some(26100));
+    assert_eq!(d23.sleep_score, Some(86));
+    assert_eq!(d23.sleep_start.as_deref(), Some("2026-11-22T23:45:00"));
+    assert_eq!(d23.sleep_end.as_deref(), Some("2026-11-23T07:00:00"));
+
+    // Verify SQLite persistence and readback
+    let dir = make_temp_dir("sleep-persist-024");
+    let db = Database::open(&dir.join("splits.sqlite")).unwrap();
+    db.upsert_day(d25).unwrap();
+    db.upsert_day(d23).unwrap();
+    let loaded = db.list_days(10).unwrap();
+    let loaded_25 = loaded.iter().find(|d| d.date == "2026-11-25").unwrap();
+    assert_eq!(loaded_25.sleep_score, Some(91));
+    assert_eq!(loaded_25.sleep_duration_sec, Some(25560));
+    assert_eq!(loaded_25.sleep_start.as_deref(), Some("2026-11-25T00:14:00"));
+    assert_eq!(loaded_25.sleep_end.as_deref(), Some("2026-11-25T07:20:00"));
+    assert_eq!(loaded_25.sleep_deep_sec, Some(5100));
+    assert_eq!(loaded_25.sleep_light_sec, Some(13500));
+    assert_eq!(loaded_25.sleep_rem_sec, Some(6200));
+    assert_eq!(loaded_25.sleep_awake_sec, Some(760));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn v0_2_4_body_battery_hrv_baseline_and_28d_chunking() {
+    // 1. Garmin 28-day window chunking
+    let start = NaiveDate::from_ymd_opt(2026, 10, 21).unwrap();
+    let end = NaiveDate::from_ymd_opt(2026, 11, 25).unwrap();
+    let chunks = chunk_date_range(start, end, 28);
+    assert_eq!(chunks.len(), 2);
+    for (cs, ce) in &chunks {
+        assert!((*ce - *cs).num_days() + 1 <= 28);
+    }
+    assert_eq!(chunks[0], (NaiveDate::from_ymd_opt(2026, 10, 29).unwrap(), end));
+    assert_eq!(chunks[1], (start, NaiveDate::from_ymd_opt(2026, 10, 28).unwrap()));
+
+    // 2. Daily summaries + Body Battery intraday + HRV + Steps decoding & SQLite merge
+    let mut days = std::collections::HashMap::new();
+    let daily_json = serde_json::json!([
+        {
+            "calendarDate": "2026-11-25",
+            "heartRate": { "restingValue": 49 },
+            "stress": { "avgLevel": 24 },
+            "bodyBattery": { "maxValue": 91, "minValue": 29, "chargedValue": 65, "drainedValue": 38, "latestValue": 70 },
+            "movement": { "steps": { "count": 4820, "goal": 8000 } }
+        },
+        {
+            "calendarDate": "2026-11-24",
+            "stress": { "avgLevel": -1 }
+        }
+    ]);
+    parse_daily_summaries_json(&serde_json::to_vec(&daily_json).unwrap(), &mut days);
+    assert_eq!(days.get("2026-11-24").unwrap().stress_avg, None);
+
+    let bb_json = serde_json::json!([
+        {
+            "date": "2026-11-25",
+            "charged": 66,
+            "drained": 39,
+            "bodyBatteryValuesArray": [
+                [1795564800000_i64, 42],
+                [1795565700000_i64, null],
+                [1795586400000_i64, 92],
+                [1795600800000_i64, 69]
+            ]
+        }
+    ]);
+    parse_body_battery_days_json(&serde_json::to_vec(&bb_json).unwrap(), &mut days);
+
+    let hrv_json = serde_json::json!({
+        "hrvSummaries": [
+            {
+                "calendarDate": "2026-11-25",
+                "lastNightAvg": 68,
+                "weeklyAvg": 64,
+                "status": "BALANCED",
+                "baseline": { "balancedLow": 55, "balancedUpper": 74 }
+            }
+        ]
+    });
+    parse_hrv_range_json(&serde_json::to_vec(&hrv_json).unwrap(), &mut days);
+
+    let steps_json = serde_json::json!([
+        { "calendarDate": "2026-11-25", "totalSteps": 5120, "stepGoal": 8500 }
+    ]);
+    parse_steps_json(&serde_json::to_vec(&steps_json).unwrap(), &mut days);
+
+    let d = days.get("2026-11-25").unwrap();
+    assert_eq!(d.body_battery_high, Some(92));
+    assert_eq!(d.body_battery_low, Some(29));
+    assert_eq!(d.body_battery_latest, Some(69));
+    assert_eq!(d.body_battery_charged, Some(66));
+    assert_eq!(d.body_battery_drained, Some(39));
+    assert_eq!(d.body_battery_series.as_ref().map(|v| v.len()), Some(3));
+    assert_eq!(d.hrv_last_night, Some(68));
+    assert_eq!(d.hrv_weekly_avg, Some(64));
+    assert_eq!(d.hrv_baseline_low, Some(55));
+    assert_eq!(d.hrv_baseline_high, Some(74));
+    assert_eq!(d.hrv_status.as_deref(), Some("BALANCED"));
+    assert_eq!(d.steps, Some(5120));
+    assert_eq!(d.step_goal, Some(8500));
+
+    let dir = make_temp_dir("bb-hrv-024");
+    let db = Database::open(&dir.join("splits.sqlite")).unwrap();
+    db.upsert_day(d).unwrap();
+
+    // Verify partial Body Battery intraday refresh does NOT wipe previously saved HRV / Sleep fields
+    db.upsert_day(&DayRecord {
+        date: "2026-11-25".to_string(),
+        body_battery_high: Some(92),
+        body_battery_latest: Some(64),
+        body_battery_drained: Some(44),
+        ..Default::default()
+    })
+    .unwrap();
+
+    let rows = db.list_days(5).unwrap();
+    let merged = &rows[0];
+    assert_eq!(merged.body_battery_latest, Some(64));
+    assert_eq!(merged.body_battery_drained, Some(44));
+    assert_eq!(merged.hrv_last_night, Some(68));
+    assert_eq!(merged.hrv_weekly_avg, Some(64));
+    assert_eq!(merged.body_battery_series.as_ref().map(|v| v.len()), Some(3));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn v0_2_4_sqlite_migration_briefing_cache_and_theme_mode() {
+    let dir = make_temp_dir("migrate-024");
+    let db_path = dir.join("splits.sqlite");
+
+    // Seed legacy `days` table without v0.2.4 columns
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE days (
+                date TEXT PRIMARY KEY,
+                resting_hr INTEGER,
+                stress_avg INTEGER,
+                body_battery_high INTEGER,
+                body_battery_latest INTEGER,
+                steps INTEGER,
+                step_goal INTEGER,
+                sleep_seconds INTEGER,
+                sleep_score INTEGER,
+                hrv_last_night INTEGER,
+                hrv_status TEXT
+            );
+            INSERT INTO days (date, resting_hr, sleep_seconds, sleep_score, hrv_last_night, hrv_status)
+            VALUES ('2026-11-24', 51, 24000, 82, 60, 'BALANCED');",
+        )
+        .unwrap();
+    }
+
+    // Re-opening runs idempotent ALTER TABLE migrations & creates `briefings`
+    let db = Database::open(&db_path).unwrap();
+    let days = db.list_days(10).unwrap();
+    assert_eq!(days.len(), 1);
+    assert_eq!(days[0].sleep_score, Some(82));
+    assert_eq!(days[0].sleep_duration_sec, Some(24000));
+    assert_eq!(days[0].hrv_weekly_avg, None);
+
+    // Daily briefing cache & prompt formatting
+    assert_eq!(
+        without_dashes("**Great sleep** — ready to roll"),
+        "Great sleep, ready to roll"
+    );
+    let briefing = DailyBriefingRecord {
+        date: "2026-11-25".to_string(),
+        headline: "Rested and ready for easy aerobic work".to_string(),
+        body: "Sleep came in at 7 h 6 min with score 91 and balanced HRV at 68 ms.\n\nNo sessions logged yesterday so legs are fresh within your weekly envelope.".to_string(),
+        action_cue: "Run 5.0 km easy under 142 bpm.".to_string(),
+        model_id: "gemini-3-flash-preview".to_string(),
+        thinking_level: "LOW".to_string(),
+        had_sleep: true,
+        generated_at: "2026-11-25T07:30:00Z".to_string(),
+    };
+    db.upsert_daily_briefing(&briefing).unwrap();
+    let cached = db.get_daily_briefing("2026-11-25").unwrap().unwrap();
+    assert_eq!(cached, briefing);
+
+    let facts = build_daily_briefing_facts(
+        &AthleteConfig::default(),
+        &[],
+        &[DayRecord {
+            date: "2026-11-25".to_string(),
+            sleep_seconds: Some(25560),
+            sleep_score: Some(91),
+            body_battery_high: Some(92),
+            body_battery_latest: Some(69),
+            hrv_last_night: Some(68),
+            hrv_status: Some("BALANCED".to_string()),
+            ..Default::default()
+        }],
+        None,
+        NaiveDate::from_ymd_opt(2026, 11, 25).unwrap(),
+    );
+    assert!(facts.contains("Last night: slept 7 h 6 min, sleep score 91 out of 100"));
+    assert!(facts.contains("Energy level (0 to 100) peaked at 92 (69 now)"));
+
+    // Theme mode persistence & reset
+    assert_eq!(db.get_theme_mode().unwrap(), "system");
+    assert_eq!(db.set_theme_mode("dark").unwrap(), "dark");
+    assert_eq!(db.get_theme_mode().unwrap(), "dark");
+    assert_eq!(db.set_theme_mode("light").unwrap(), "light");
+    assert_eq!(db.get_theme_mode().unwrap(), "light");
+    db.clean_slate_reset().unwrap();
+    assert_eq!(db.get_theme_mode().unwrap(), "system");
+    assert_eq!(db.get_daily_briefing("2026-11-25").unwrap(), None);
 
     let _ = std::fs::remove_dir_all(&dir);
 }
