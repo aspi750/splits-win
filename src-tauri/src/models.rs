@@ -1125,6 +1125,10 @@ pub struct ActivityRecord {
     pub garmin_notes: Option<String>,
     #[serde(default)]
     pub is_pr: Option<bool>,
+    #[serde(default)]
+    pub start_latitude: Option<f64>,
+    #[serde(default)]
+    pub start_longitude: Option<f64>,
 }
 
 impl ActivityRecord {
@@ -1757,4 +1761,85 @@ pub struct AnalyticsDatasetPayload {
 pub struct CachedHealthTakes {
     pub sleep_take: Option<DailyBriefingRecord>,
     pub hrv_take: Option<DailyBriefingRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct ExplorerTally {
+    pub count: usize,
+    pub distance_m: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExplorerCountryVisit {
+    pub id: String,
+    pub iso: String,
+    pub name: String,
+    pub continent: String,
+    pub flag: String,
+    pub label_lat: f64,
+    pub label_lon: f64,
+    pub first_iso: String,
+    pub last_iso: String,
+    pub count: usize,
+    pub distance_m: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExplorerCityVisit {
+    pub city_id: usize,
+    pub name: String,
+    pub country_id: String,
+    pub country_iso: String,
+    pub country_name: String,
+    pub flag: String,
+    pub lat: f64,
+    pub lon: f64,
+    pub first_iso: String,
+    pub count: usize,
+    pub distance_m: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExplorerLeg {
+    pub from_country_id: String,
+    pub from_lat: f64,
+    pub from_lon: f64,
+    pub to_country_id: String,
+    pub to_lat: f64,
+    pub to_lon: f64,
+    pub date_iso: String,
+    pub year: i32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExplorerYearSummary {
+    pub year: i32,
+    pub country_ids: Vec<String>,
+    pub new_country_ids: Vec<String>,
+    pub city_ids: Vec<usize>,
+    pub new_cities: usize,
+    pub country_tallies: HashMap<String, ExplorerTally>,
+    pub city_tallies: HashMap<usize, ExplorerTally>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExplorerFirstVisit {
+    pub country_id: String,
+    pub iso: String,
+    pub name: String,
+    pub flag: String,
+    pub first_iso: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct ExplorerSummaryPayload {
+    pub sport_filter: String,
+    pub visits: Vec<ExplorerCountryVisit>,
+    pub cities: Vec<ExplorerCityVisit>,
+    pub legs: Vec<ExplorerLeg>,
+    pub years: Vec<ExplorerYearSummary>,
+    pub continents: Vec<String>,
+    pub first_visit: Option<ExplorerFirstVisit>,
+    pub total_located_activities: usize,
+    pub total_activities_in_filter: usize,
 }

@@ -128,6 +128,8 @@ fn test_shared_store_and_sqlite_roundtrip() {
         fit_temp_source: None,
         garmin_notes: None,
         is_pr: None,
+        start_latitude: None,
+        start_longitude: None,
     })
     .unwrap();
     let acts = db.list_activities(10).unwrap();
@@ -185,6 +187,8 @@ fn test_readiness_engine_green_red_amber_and_persistence() {
             fit_temp_source: None,
             garmin_notes: None,
             is_pr: None,
+            start_latitude: None,
+            start_longitude: None,
         }],
         days: &[healthy_day.clone()],
         plan: None,
@@ -220,6 +224,8 @@ fn test_readiness_engine_green_red_amber_and_persistence() {
             fit_temp_source: None,
             garmin_notes: None,
             is_pr: None,
+            start_latitude: None,
+            start_longitude: None,
         }],
         days: &[bad_day],
         plan: None,
@@ -401,6 +407,8 @@ fn test_stage2_2_hybrid_hyrox_spacing_and_compromised_run_audit() {
         fit_temp_source: None,
         garmin_notes: None,
         is_pr: None,
+        start_latitude: None,
+        start_longitude: None,
     };
 
     let mut hybrid_config = AthleteConfig::default();
@@ -482,6 +490,8 @@ fn test_stage2_2_training_history_analyzer_and_starter_templates() {
             fit_temp_source: None,
             garmin_notes: None,
             is_pr: None,
+            start_latitude: None,
+            start_longitude: None,
         });
         if offset % 4 == 1 {
             activities.push(ActivityRecord {
@@ -503,6 +513,8 @@ fn test_stage2_2_training_history_analyzer_and_starter_templates() {
                 fit_temp_source: None,
                 garmin_notes: None,
                 is_pr: None,
+                start_latitude: None,
+                start_longitude: None,
             });
         }
     }
@@ -589,6 +601,8 @@ fn test_stage3_1_user_profile_migration_and_hyrox_reclassification() {
         fit_temp_source: None,
         garmin_notes: None,
         is_pr: None,
+        start_latitude: None,
+        start_longitude: None,
     };
     db.upsert_activity(&act).unwrap();
     db.set_activity_hyrox(555, true).unwrap();
@@ -759,6 +773,8 @@ fn test_v0_2_1_sweat_matrix_1hz_window_and_ledger() {
         fit_temp_source: None,
         garmin_notes: None,
         is_pr: None,
+        start_latitude: None,
+        start_longitude: None,
     })
     .unwrap();
     db.save_post_run_context(888, &computed).unwrap();
@@ -930,6 +946,8 @@ fn test_garmin_weight_sync_scale_pairing_and_hybrid_tempe_parity() {
         fit_temp_source: Some("watch_internal".to_string()),
         garmin_notes: None,
         is_pr: None,
+        start_latitude: None,
+        start_longitude: None,
     };
     db.upsert_activity(&act).unwrap();
     let tool_res =
@@ -2209,6 +2227,8 @@ fn v0_2_5_records_aggregation_and_scoped_sleep_hrv_takes() {
         fit_temp_source: None,
         garmin_notes: None,
         is_pr: Some(true),
+        start_latitude: None,
+        start_longitude: None,
     })
     .unwrap();
 
@@ -2231,6 +2251,8 @@ fn v0_2_5_records_aggregation_and_scoped_sleep_hrv_takes() {
         fit_temp_source: None,
         garmin_notes: None,
         is_pr: Some(false),
+        start_latitude: None,
+        start_longitude: None,
     })
     .unwrap();
 
@@ -2254,6 +2276,8 @@ fn v0_2_5_records_aggregation_and_scoped_sleep_hrv_takes() {
         fit_temp_source: None,
         garmin_notes: None,
         is_pr: None,
+        start_latitude: None,
+        start_longitude: None,
     })
     .unwrap();
 
@@ -2360,6 +2384,173 @@ fn v0_2_5_records_aggregation_and_scoped_sleep_hrv_takes() {
     assert!(sleep_facts.contains("Verdict:"));
     let hrv_facts = splits_win_lib::coach::build_hrv_take_facts(&sample_days, &[], ref_date).unwrap();
     assert!(hrv_facts.contains("Last night's HRV was"));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn v0_2_5_1_records_type_keys_and_bootstrap_onboarded_fix() {
+    let dir = make_temp_dir("records-fix-0251");
+    let store = SharedStore::new(Some(dir.clone())).unwrap();
+    let db = Database::open(&dir.join("state").join("splits.sqlite")).unwrap();
+
+    let now = Utc::now();
+    let make_run = |id: i64, name: &str, type_key: &str, days_ago: i64, dist_m: f64, sec: f64, elev: f64| ActivityRecord {
+        garmin_id: id,
+        name: name.to_string(),
+        type_key: type_key.to_string(),
+        start_iso: (now - Duration::days(days_ago)).format("%Y-%m-%dT07:30:00Z").to_string(),
+        distance_m: dist_m,
+        duration_sec: sec,
+        moving_duration_sec: sec,
+        elevation_gain_m: elev,
+        average_hr: Some(152.0),
+        max_hr: Some(170.0),
+        cadence_spm: Some(176.0),
+        training_load: Some(110.0),
+        shoe_name: Some("Superblast 3".to_string()),
+        is_hyrox: None,
+        post_run_context: None,
+        fit_temp_source: None,
+        garmin_notes: None,
+        is_pr: None,
+        start_latitude: None,
+        start_longitude: None,
+    };
+
+    db.upsert_activity(&make_run(4001, "Track 1K", "track_running", 40, 1_050.0, 220.0, 4.0)).unwrap();
+    db.upsert_activity(&make_run(4002, "City 5K", "street_running", 30, 5_050.0, 1_200.0, 15.0)).unwrap();
+    db.upsert_activity(&make_run(4003, "Morning 10K", "running", 20, 10_100.0, 2_550.0, 45.0)).unwrap();
+    db.upsert_activity(&make_run(4004, "Trail Half", "trail_running", 12, 21_200.0, 6_000.0, 540.0)).unwrap();
+    db.upsert_activity(&make_run(4005, "Marathon", "running", 5, 42_300.0, 12_600.0, 220.0)).unwrap();
+    // Treadmill run must be excluded from outdoor distance PRs
+    db.upsert_activity(&make_run(4006, "Fast Treadmill", "treadmill_running", 2, 5_000.0, 900.0, 0.0)).unwrap();
+
+    let records = db.compute_personal_records().unwrap();
+    assert_eq!(records.total_outdoor_runs, 5);
+    let labels: Vec<&str> = records.distance_records.iter().map(|r| r.label.as_str()).collect();
+    for expected in ["1K", "5K", "10K", "Half Marathon", "Marathon"] {
+        assert!(labels.contains(&expected), "Missing PR label {expected}");
+    }
+    assert!(records.milestones.iter().any(|m| m.key == "longest_run" && m.activity_id == Some(4005)));
+    assert!(records.milestones.iter().any(|m| m.key == "biggest_elevation" && m.activity_id == Some(4004)));
+    assert!(records.milestones.iter().any(|m| m.key == "highest_weekly_km"));
+
+    // Simulate app restart with default in-memory AppSettings (profile_onboarded = false),
+    // while SQLite user_profile has onboarding_completed = true
+    let mut prof = db.get_user_profile().unwrap();
+    prof.onboarding_completed = true;
+    db.save_user_profile(&prof).unwrap();
+
+    let default_settings = splits_win_lib::storage::AppSettings::default();
+    assert!(!default_settings.profile_onboarded);
+    let boot = splits_win_lib::build_bootstrap_state(&store, &db, &default_settings).unwrap();
+    assert_eq!(boot["settings"]["profile_onboarded"].as_bool(), Some(true));
+    assert_eq!(boot["lifetime_backfill_completed"].as_bool(), Some(false));
+    assert_eq!(boot["total_activities_count"].as_u64(), Some(6));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn v0_2_5_1_explorer_multi_year_country_city_and_backfill_flag() {
+    let dir = make_temp_dir("explorer-0251");
+    let db_path = dir.join("splits.sqlite");
+
+    // Seed v0.2.5 schema WITHOUT start_latitude / start_longitude to verify idempotent migration
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE activities (
+                garmin_id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                type_key TEXT NOT NULL,
+                start_iso TEXT NOT NULL,
+                distance_m REAL NOT NULL,
+                duration_sec REAL NOT NULL,
+                moving_duration_sec REAL NOT NULL,
+                elevation_gain_m REAL NOT NULL,
+                average_hr REAL,
+                max_hr REAL,
+                cadence_spm REAL,
+                training_load REAL,
+                shoe_name TEXT,
+                is_hyrox INTEGER,
+                post_run_context_json TEXT,
+                fit_temp_source TEXT,
+                garmin_notes TEXT,
+                is_pr INTEGER
+            );
+            INSERT INTO activities (
+                garmin_id, name, type_key, start_iso, distance_m, duration_sec, moving_duration_sec,
+                elevation_gain_m, average_hr, max_hr, cadence_spm, training_load, shoe_name
+            ) VALUES (
+                5000, 'Legacy No-GPS Run', 'running', '2025-10-01T07:00:00Z', 8000.0, 2700.0, 2680.0,
+                30.0, 140.0, 150.0, 174.0, 65.0, NULL
+            );",
+        )
+        .unwrap();
+    }
+
+    let db = Database::open(&db_path).unwrap();
+    assert!(!db.is_lifetime_backfill_completed().unwrap());
+
+    let make_gps_act = |id: i64, name: &str, type_key: &str, start_iso: &str, dist_m: f64, lat: f64, lon: f64| ActivityRecord {
+        garmin_id: id,
+        name: name.to_string(),
+        type_key: type_key.to_string(),
+        start_iso: start_iso.to_string(),
+        distance_m: dist_m,
+        duration_sec: 3000.0,
+        moving_duration_sec: 2950.0,
+        elevation_gain_m: 40.0,
+        average_hr: Some(144.0),
+        max_hr: Some(160.0),
+        cadence_spm: Some(176.0),
+        training_load: Some(80.0),
+        shoe_name: None,
+        is_hyrox: None,
+        post_run_context: None,
+        fit_temp_source: None,
+        garmin_notes: None,
+        is_pr: None,
+        start_latitude: Some(lat),
+        start_longitude: Some(lon),
+    };
+
+    // Multi-year outdoor runs across Madrid (ES), Amsterdam (NL), New York (US), London (GB)
+    db.upsert_activity(&make_gps_act(5001, "Retiro Run", "running", "2018-05-12T08:00:00Z", 10_000.0, 40.4168, -3.7038)).unwrap();
+    db.upsert_activity(&make_gps_act(5002, "Vondelpark", "street_running", "2020-07-04T09:00:00Z", 8_000.0, 52.3676, 4.9041)).unwrap();
+    db.upsert_activity(&make_gps_act(5003, "Central Park", "running", "2024-11-02T07:30:00Z", 12_000.0, 40.7829, -73.9654)).unwrap();
+    db.upsert_activity(&make_gps_act(5004, "Hyde Park", "trail_running", "2026-03-15T08:15:00Z", 15_000.0, 51.5074, -0.1278)).unwrap();
+    // Cycling in Paris (FR)
+    db.upsert_activity(&make_gps_act(5005, "Longchamp Ride", "road_biking", "2026-04-01T10:00:00Z", 45_000.0, 48.8566, 2.3522)).unwrap();
+    // Indoor run with coordinates must be excluded
+    db.upsert_activity(&make_gps_act(5006, "Indoor Track", "treadmill_running", "2026-04-02T10:00:00Z", 5_000.0, 52.3676, 4.9041)).unwrap();
+
+    let all_acts = db.list_activities(10_000).unwrap();
+    let run_summary = splits_win_lib::explorer::compute_explorer_summary(&all_acts, "run");
+    assert_eq!(run_summary.visits.len(), 4);
+    assert_eq!(run_summary.legs.len(), 3);
+    assert!(run_summary.continents.contains(&"Europe".to_string()));
+    assert!(run_summary.continents.contains(&"North America".to_string()));
+    assert_eq!(run_summary.first_visit.as_ref().map(|f| f.iso.as_str()), Some("ES"));
+    assert_eq!(run_summary.years.len(), 4);
+    assert_eq!(run_summary.years[0].year, 2026);
+    assert_eq!(run_summary.years[0].new_country_ids, vec!["GB".to_string()]);
+    assert!(!run_summary.cities.is_empty());
+
+    let ride_summary = splits_win_lib::explorer::compute_explorer_summary(&all_acts, "ride");
+    assert_eq!(ride_summary.visits.len(), 1);
+    assert_eq!(ride_summary.visits[0].iso, "FR");
+
+    let everything_summary = splits_win_lib::explorer::compute_explorer_summary(&all_acts, "all");
+    assert_eq!(everything_summary.visits.len(), 5);
+
+    db.set_lifetime_backfill_completed(true).unwrap();
+    assert!(db.is_lifetime_backfill_completed().unwrap());
+    db.clean_slate_reset().unwrap();
+    assert!(!db.is_lifetime_backfill_completed().unwrap());
 
     let _ = std::fs::remove_dir_all(&dir);
 }

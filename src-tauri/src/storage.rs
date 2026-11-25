@@ -609,7 +609,9 @@ impl Database {
                 max_hr REAL,
                 cadence_spm REAL,
                 training_load REAL,
-                shoe_name TEXT
+                shoe_name TEXT,
+                start_latitude REAL,
+                start_longitude REAL
             );
             CREATE TABLE IF NOT EXISTS days (
                 date TEXT PRIMARY KEY,
@@ -691,6 +693,8 @@ impl Database {
         let _ = conn.execute("ALTER TABLE activities ADD COLUMN fit_temp_source TEXT", []);
         let _ = conn.execute("ALTER TABLE activities ADD COLUMN garmin_notes TEXT", []);
         let _ = conn.execute("ALTER TABLE activities ADD COLUMN is_pr INTEGER", []);
+        let _ = conn.execute("ALTER TABLE activities ADD COLUMN start_latitude REAL", []);
+        let _ = conn.execute("ALTER TABLE activities ADD COLUMN start_longitude REAL", []);
 
         for col_sql in [
             "ALTER TABLE days ADD COLUMN sleep_duration_sec INTEGER",
@@ -1015,8 +1019,8 @@ impl Database {
         self.conn.lock().unwrap().execute(
             "INSERT INTO activities (
                 garmin_id, name, type_key, start_iso, distance_m, duration_sec, moving_duration_sec,
-                elevation_gain_m, average_hr, max_hr, cadence_spm, training_load, shoe_name, is_hyrox, post_run_context_json, fit_temp_source, garmin_notes, is_pr
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
+                elevation_gain_m, average_hr, max_hr, cadence_spm, training_load, shoe_name, is_hyrox, post_run_context_json, fit_temp_source, garmin_notes, is_pr, start_latitude, start_longitude
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)
             ON CONFLICT(garmin_id) DO UPDATE SET
                 name=excluded.name, type_key=excluded.type_key, start_iso=excluded.start_iso,
                 distance_m=excluded.distance_m, duration_sec=excluded.duration_sec,
@@ -1027,12 +1031,15 @@ impl Database {
                 post_run_context_json=COALESCE(excluded.post_run_context_json, activities.post_run_context_json),
                 fit_temp_source=COALESCE(excluded.fit_temp_source, activities.fit_temp_source),
                 garmin_notes=COALESCE(excluded.garmin_notes, activities.garmin_notes),
-                is_pr=COALESCE(excluded.is_pr, activities.is_pr)",
+                is_pr=COALESCE(excluded.is_pr, activities.is_pr),
+                start_latitude=COALESCE(excluded.start_latitude, activities.start_latitude),
+                start_longitude=COALESCE(excluded.start_longitude, activities.start_longitude)",
             params![
                 act.garmin_id, act.name, act.type_key, act.start_iso, act.distance_m,
                 act.duration_sec, act.moving_duration_sec, act.elevation_gain_m,
                 act.average_hr, act.max_hr, act.cadence_spm, act.training_load, act.shoe_name,
-                hyrox_int, post_run_json, act.fit_temp_source, cleaned_notes, is_pr_int
+                hyrox_int, post_run_json, act.fit_temp_source, cleaned_notes, is_pr_int,
+                act.start_latitude, act.start_longitude
             ],
         )?;
         Ok(())
@@ -1042,7 +1049,7 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT garmin_id, name, type_key, start_iso, distance_m, duration_sec, moving_duration_sec,
-                    elevation_gain_m, average_hr, max_hr, cadence_spm, training_load, shoe_name, is_hyrox, post_run_context_json, fit_temp_source, garmin_notes, is_pr
+                    elevation_gain_m, average_hr, max_hr, cadence_spm, training_load, shoe_name, is_hyrox, post_run_context_json, fit_temp_source, garmin_notes, is_pr, start_latitude, start_longitude
              FROM activities ORDER BY start_iso DESC LIMIT ?1",
         )?;
         let rows = stmt.query_map(params![limit as i64], |r| {
@@ -1068,6 +1075,8 @@ impl Database {
                 fit_temp_source: r.get(15)?,
                 garmin_notes: r.get(16)?,
                 is_pr: is_pr_opt.map(|v| v != 0),
+                start_latitude: r.get(18)?,
+                start_longitude: r.get(19)?,
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -1328,7 +1337,7 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT garmin_id, name, type_key, start_iso, distance_m, duration_sec, moving_duration_sec,
-                    elevation_gain_m, average_hr, max_hr, cadence_spm, training_load, shoe_name, is_hyrox, post_run_context_json, fit_temp_source, garmin_notes, is_pr
+                    elevation_gain_m, average_hr, max_hr, cadence_spm, training_load, shoe_name, is_hyrox, post_run_context_json, fit_temp_source, garmin_notes, is_pr, start_latitude, start_longitude
              FROM activities WHERE garmin_id = ?1 LIMIT 1",
         )?;
         let mut rows = stmt.query_map(params![garmin_id], |r| {
@@ -1354,12 +1363,34 @@ impl Database {
                 fit_temp_source: r.get(15)?,
                 garmin_notes: r.get(16)?,
                 is_pr: is_pr_opt.map(|v| v != 0),
+                start_latitude: r.get(18)?,
+                start_longitude: r.get(19)?,
             })
         })?;
         match rows.next() {
             Some(row) => Ok(Some(row?)),
             None => Ok(None),
         }
+    }
+
+    pub fn is_lifetime_backfill_completed(&self) -> Result<bool, StorageError> {
+        Ok(self
+            .get_setting("lifetime_backfill_completed")?
+            .as_deref()
+            == Some("true"))
+    }
+
+    pub fn set_lifetime_backfill_completed(&self, completed: bool) -> Result<(), StorageError> {
+        self.set_setting(
+            "lifetime_backfill_completed",
+            if completed { Some("true") } else { None },
+        )
+    }
+
+    pub fn count_activities(&self) -> Result<usize, StorageError> {
+        let conn = self.conn.lock().unwrap();
+        let cnt: i64 = conn.query_row("SELECT COUNT(*) FROM activities", [], |r| r.get(0))?;
+        Ok(cnt.max(0) as usize)
     }
 
     pub fn upsert_fit_track(&self, garmin_id: i64, track: &FitTrackAnalysis) -> Result<(), StorageError> {
@@ -1431,33 +1462,50 @@ impl Database {
                 a.name.clone()
             };
 
+            let active_sec = if a.moving_duration_sec > 0.0 {
+                a.moving_duration_sec
+            } else {
+                a.duration_sec
+            };
+
             if let Some(points) = tracks_map.get(&a.garmin_id).filter(|p| p.len() >= 10) {
                 scanned_fit_runs += 1;
                 let max_track_dist = points.last().map(|p| p.distance_m).unwrap_or(0.0);
                 for &(label, target_m) in &STANDARD_DISTANCES {
-                    if max_track_dist < target_m {
-                        continue;
+                    if max_track_dist >= target_m {
+                        if let Some((best_sec, seg_hr)) = fastest_stretch_in_points(points, target_m) {
+                            efforts.push(DistanceRecordEntry {
+                                label: label.to_string(),
+                                distance_m: target_m,
+                                time_sec: best_sec,
+                                pace_sec_per_km: best_sec / (target_m / 1000.0),
+                                date: date_str.clone(),
+                                activity_id: a.garmin_id,
+                                activity_name: display_name.clone(),
+                                average_hr: seg_hr.or(a.average_hr),
+                                source: "fit_best_stretch".to_string(),
+                            });
+                            continue;
+                        }
                     }
-                    if let Some((best_sec, seg_hr)) = fastest_stretch_in_points(points, target_m) {
-                        efforts.push(DistanceRecordEntry {
-                            label: label.to_string(),
-                            distance_m: target_m,
-                            time_sec: best_sec,
-                            pace_sec_per_km: best_sec / (target_m / 1000.0),
-                            date: date_str.clone(),
-                            activity_id: a.garmin_id,
-                            activity_name: display_name.clone(),
-                            average_hr: seg_hr.or(a.average_hr),
-                            source: "fit_best_stretch".to_string(),
-                        });
+                    if active_sec > 0.0 && a.distance_m >= target_m * 0.99 {
+                        let scaled_sec = active_sec * (target_m / a.distance_m);
+                        if plausible_run_effort(target_m, scaled_sec) {
+                            efforts.push(DistanceRecordEntry {
+                                label: label.to_string(),
+                                distance_m: target_m,
+                                time_sec: scaled_sec,
+                                pace_sec_per_km: scaled_sec / (target_m / 1000.0),
+                                date: date_str.clone(),
+                                activity_id: a.garmin_id,
+                                activity_name: display_name.clone(),
+                                average_hr: a.average_hr,
+                                source: "activity_average".to_string(),
+                            });
+                        }
                     }
                 }
             } else {
-                let active_sec = if a.moving_duration_sec > 0.0 {
-                    a.moving_duration_sec
-                } else {
-                    a.duration_sec
-                };
                 if active_sec <= 0.0 || a.distance_m <= 0.0 {
                     continue;
                 }
@@ -1724,7 +1772,10 @@ impl Database {
 
 fn is_indoor_activity(type_key: &str) -> bool {
     let lower = type_key.to_lowercase();
-    lower.contains("treadmill") || lower.contains("indoor") || lower.contains("virtual")
+    lower.contains("treadmill")
+        || lower.contains("indoor")
+        || lower.contains("virtual")
+        || lower.contains("trainer")
 }
 
 fn is_outdoor_run(a: &ActivityRecord) -> bool {
@@ -1737,7 +1788,7 @@ fn plausible_run_effort(distance_m: f64, sec: f64) -> bool {
         return false;
     }
     let speed_mps = distance_m / sec;
-    speed_mps > 1.0 && speed_mps < 6.7
+    speed_mps > 0.5 && speed_mps < 6.7
 }
 
 fn fastest_stretch_in_points(points: &[FitTrackPoint], target_m: f64) -> Option<(f64, Option<f64>)> {

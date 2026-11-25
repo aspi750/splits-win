@@ -1,4 +1,5 @@
 pub mod coach;
+pub mod explorer;
 pub mod forensic_extractor;
 pub mod garmin;
 pub mod models;
@@ -47,7 +48,9 @@ pub fn build_bootstrap_state(
 ) -> Result<serde_json::Value, String> {
     let has_garmin_key = CredentialStore::read_garmin_key().is_some();
     let has_gemini_key = CredentialStore::read_gemini_key().is_some();
-    let config = store.load_athlete_config().map_err(|e| e.to_string())?.unwrap_or_default();
+    let stored_config = store.load_athlete_config().map_err(|e| e.to_string())?;
+    let has_stored_config = stored_config.is_some();
+    let config = stored_config.unwrap_or_default();
     let readiness: Option<ReadinessState> = store.read_json("readiness_state.json").ok().flatten();
     let activities = db.list_activities(50).map_err(|e| e.to_string())?;
     let days = db.list_days(60).map_err(|e| e.to_string())?;
@@ -60,13 +63,21 @@ pub fn build_bootstrap_state(
     let today_local = Local::now().format("%Y-%m-%d").to_string();
     let daily_briefing = db.get_daily_briefing(&today_local).ok().flatten();
     let theme_mode = db.get_theme_mode().unwrap_or_else(|_| "system".to_string());
+    let lifetime_backfill_completed = db.is_lifetime_backfill_completed().unwrap_or(false);
+    let total_activities_count = db.count_activities().unwrap_or(activities.len());
+
+    let mut effective_settings = settings.clone();
+    effective_settings.profile_onboarded = settings.profile_onboarded
+        || user_profile.onboarding_completed
+        || has_stored_config
+        || !activities.is_empty();
 
     Ok(serde_json::json!({
         "has_garmin_key": has_garmin_key,
         "has_gemini_key": has_gemini_key,
         "engine_mode": coach::resolve_coach_engine_mode(),
         "shared_dir": store.root().display().to_string(),
-        "settings": settings,
+        "settings": effective_settings,
         "athlete_config": config,
         "user_profile": user_profile,
         "readiness_state": readiness,
@@ -77,6 +88,8 @@ pub fn build_bootstrap_state(
         "first_use_state": first_use_state,
         "daily_briefing": daily_briefing,
         "theme_mode": theme_mode,
+        "lifetime_backfill_completed": lifetime_backfill_completed,
+        "total_activities_count": total_activities_count,
     }))
 }
 
@@ -298,16 +311,19 @@ fn recompute_readiness(state: State<'_, AppState>) -> Result<ReadinessState, Str
 async fn perform_full_garmin_sync(
     store: &SharedStore,
     db: &Database,
+    force_lifetime: bool,
 ) -> Result<(usize, usize, usize, ReadinessState), String> {
-    let initial_backfill = db.list_activities(1).map_err(|e| e.to_string())?.is_empty();
+    let needs_lifetime = force_lifetime
+        || !db.is_lifetime_backfill_completed().unwrap_or(false)
+        || db.list_activities(1).map_err(|e| e.to_string())?.is_empty();
     let client = garmin::GarminClient::new(None);
     let (synced_activities, synced_days) = client
-        .sync_lifetime_and_wellness(initial_backfill)
+        .sync_lifetime_and_wellness(needs_lifetime)
         .await
         .map_err(|e| e.to_string())?;
 
     let synced_weights = client
-        .sync_weights(if initial_backfill { 365 } else { 35 })
+        .sync_weights(if needs_lifetime { 365 } else { 35 })
         .await;
 
     let acts = synced_activities.len();
@@ -321,6 +337,9 @@ async fn perform_full_garmin_sync(
     }
     for w in &synced_weights {
         let _ = db.upsert_weight_entry(w);
+    }
+    if needs_lifetime {
+        let _ = db.set_lifetime_backfill_completed(true);
     }
 
     // Lightweight metadata-only upsert on rolling last 7 days to capture late Garmin Connect edits/notes
@@ -387,12 +406,30 @@ async fn sync_garmin_now(state: State<'_, AppState>) -> Result<serde_json::Value
     let store = state.load_store()?;
     let db = state.open_db()?;
     let (acts, days_count, weights_count, readiness_state) =
-        perform_full_garmin_sync(&store, &db).await?;
+        perform_full_garmin_sync(&store, &db, false).await?;
 
     Ok(serde_json::json!({
         "synced_activities": acts,
         "synced_days": days_count,
         "synced_weights": weights_count,
+        "readiness_state": readiness_state,
+    }))
+}
+
+#[tauri::command]
+async fn backfill_lifetime_history(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+    let store = state.load_store()?;
+    let db = state.open_db()?;
+    let (acts, days_count, weights_count, readiness_state) =
+        perform_full_garmin_sync(&store, &db, true).await?;
+    let total_activities = db.count_activities().unwrap_or(acts);
+
+    Ok(serde_json::json!({
+        "synced_activities": acts,
+        "synced_days": days_count,
+        "synced_weights": weights_count,
+        "total_activities": total_activities,
+        "lifetime_backfill_completed": true,
         "readiness_state": readiness_state,
     }))
 }
@@ -793,7 +830,7 @@ async fn complete_history_sync_stage(
     let store = state.load_store()?;
     let db = state.open_db()?;
     if run_garmin_sync {
-        perform_full_garmin_sync(&store, &db).await?;
+        perform_full_garmin_sync(&store, &db, false).await?;
     }
 
     let mut flow = store.load_first_use_state().map_err(|e| e.to_string())?;
@@ -1169,6 +1206,19 @@ fn get_records_summary(state: State<'_, AppState>) -> Result<RecordsPayload, Str
 }
 
 #[tauri::command]
+fn get_explorer_summary(
+    state: State<'_, AppState>,
+    sport_filter: Option<String>,
+) -> Result<ExplorerSummaryPayload, String> {
+    let db = state.open_db()?;
+    let activities = db.list_activities(20_000).map_err(|e| e.to_string())?;
+    Ok(explorer::compute_explorer_summary(
+        &activities,
+        sport_filter.as_deref().unwrap_or("run"),
+    ))
+}
+
+#[tauri::command]
 fn get_cached_health_takes(state: State<'_, AppState>) -> Result<CachedHealthTakes, String> {
     let db = state.open_db()?;
     let days = db.list_days(90).map_err(|e| e.to_string())?;
@@ -1383,6 +1433,7 @@ pub fn run() {
             set_custom_shared_dir,
             recompute_readiness,
             sync_garmin_now,
+            backfill_lifetime_history,
             refresh_activity_metadata,
             queue_intake_file,
             remove_intake_file,
@@ -1402,6 +1453,7 @@ pub fn run() {
             get_or_generate_daily_briefing,
             get_analytics_dataset,
             get_records_summary,
+            get_explorer_summary,
             get_cached_health_takes,
             get_or_generate_sleep_take,
             get_or_generate_hrv_take,

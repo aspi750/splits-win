@@ -1,4 +1,4 @@
-import { Award, Flag, RefreshCw, Trophy } from "lucide-react";
+import { Award, Download, Flag, RefreshCw, Trophy } from "lucide-react";
 import type { RecordsPayload } from "../types";
 
 interface RecordsViewProps {
@@ -7,6 +7,10 @@ interface RecordsViewProps {
   error: string | null;
   onRefresh: () => void;
   onOpenActivity: (activityId: number) => void;
+  hasGarminKey?: boolean;
+  lifetimeBackfillCompleted?: boolean;
+  backfillBusy?: boolean;
+  onBackfillHistory?: () => void;
 }
 
 const STANDARD_LABELS = ["1K", "5K", "10K", "Half Marathon", "Marathon"];
@@ -34,6 +38,10 @@ export function RecordsView({
   error,
   onRefresh,
   onOpenActivity,
+  hasGarminKey = false,
+  lifetimeBackfillCompleted = true,
+  backfillBusy = false,
+  onBackfillHistory,
 }: RecordsViewProps) {
   if (loading && !records) {
     return (
@@ -61,7 +69,33 @@ export function RecordsView({
   if (!records || (records.total_outdoor_runs === 0 && records.milestones.length === 0)) {
     return (
       <div className="card">
-        <h3 style={{ marginTop: 0 }}>Records</h3>
+        <div className="card-header" style={{ marginBottom: 8 }}>
+          <h3 style={{ margin: 0 }}>Records</h3>
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+            {hasGarminKey && !lifetimeBackfillCompleted && onBackfillHistory && (
+              <button
+                type="button"
+                className="primary"
+                disabled={backfillBusy}
+                onClick={onBackfillHistory}
+                style={{ display: "inline-flex", alignItems: "center", gap: 6 }}
+              >
+                <Download size={14} />
+                {backfillBusy ? "Backfilling History…" : "Full History Backfill"}
+              </button>
+            )}
+            <button
+              type="button"
+              className="secondary"
+              disabled={loading}
+              onClick={onRefresh}
+              style={{ display: "inline-flex", alignItems: "center", gap: 6 }}
+            >
+              <RefreshCw size={14} />
+              {loading ? "Refreshing…" : "Recompute"}
+            </button>
+          </div>
+        </div>
         <div className="muted">
           No outdoor runs or milestones synced yet. Click <strong>Sync Watch</strong> to compute your personal records.
         </div>
@@ -80,16 +114,30 @@ export function RecordsView({
             {records.total_outdoor_runs} outdoor runs · {records.scanned_fit_runs} with 1Hz FIT best-stretch analysis
           </span>
         </div>
-        <button
-          type="button"
-          className="secondary"
-          disabled={loading}
-          onClick={onRefresh}
-          style={{ display: "inline-flex", alignItems: "center", gap: 6 }}
-        >
-          <RefreshCw size={14} />
-          {loading ? "Refreshing…" : "Recompute"}
-        </button>
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+          {hasGarminKey && !lifetimeBackfillCompleted && onBackfillHistory && (
+            <button
+              type="button"
+              className="primary"
+              disabled={backfillBusy}
+              onClick={onBackfillHistory}
+              style={{ display: "inline-flex", alignItems: "center", gap: 6 }}
+            >
+              <Download size={14} />
+              {backfillBusy ? "Backfilling History…" : "Full History Backfill"}
+            </button>
+          )}
+          <button
+            type="button"
+            className="secondary"
+            disabled={loading}
+            onClick={onRefresh}
+            style={{ display: "inline-flex", alignItems: "center", gap: 6 }}
+          >
+            <RefreshCw size={14} />
+            {loading ? "Refreshing…" : "Recompute"}
+          </button>
+        </div>
       </div>
 
       {/* Standard Distance Personal Records */}

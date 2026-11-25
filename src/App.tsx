@@ -40,6 +40,7 @@ import { SleepView } from "./components/SleepView";
 import { TrendsView } from "./components/TrendsView";
 import {
   RACE_DISTANCE_PRESETS,
+  isHyroxDisciplineEnabled,
   parseValidHrBpm,
   presetDistanceKm,
   presetFromDistanceKm,
@@ -56,6 +57,8 @@ import {
   type DailyBriefingRecord,
   type DayRecord,
   type ExecutionMode,
+  type ExplorerSportFilter,
+  type ExplorerSummaryPayload,
   type FirstUseStage,
   type FitTrackPoint,
   type GoalType,
@@ -371,6 +374,14 @@ export default function App() {
   const [recordsData, setRecordsData] = useState<RecordsPayload | null>(null);
   const [recordsLoading, setRecordsLoading] = useState(false);
   const [recordsError, setRecordsError] = useState<string | null>(null);
+  const [explorerFilter, setExplorerFilter] = useState<ExplorerSportFilter>("run");
+  const [explorerData, setExplorerData] = useState<ExplorerSummaryPayload | null>(null);
+  const [explorerLoading, setExplorerLoading] = useState(false);
+  const [explorerError, setExplorerError] = useState<string | null>(null);
+  const [backfillBusy, setBackfillBusy] = useState(false);
+  const [backfillStatus, setBackfillStatus] = useState<string | null>(null);
+  const [syncEpoch, setSyncEpoch] = useState(0);
+  const autoBackfillTriggeredRef = useRef(false);
   const [sleepTake, setSleepTake] = useState<DailyBriefingRecord | null>(null);
   const [hrvTake, setHrvTake] = useState<DailyBriefingRecord | null>(null);
 
@@ -400,7 +411,7 @@ export default function App() {
   const [confirmCleanSlate, setConfirmCleanSlate] = useState(false);
   const [cleanSlateBusy, setCleanSlateBusy] = useState(false);
 
-  const [appVersion, setAppVersion] = useState<string>("0.2.5-beta");
+  const [appVersion, setAppVersion] = useState<string>("0.2.5.1-beta");
   const [bootstrapError, setBootstrapError] = useState<string | null>(null);
   const [themeMode, setThemeMode] = useState<ThemeMode>(() => {
     try {
@@ -592,10 +603,16 @@ export default function App() {
     return () => window.removeEventListener("keydown", onKeyDown);
   }, []);
 
+  const isOnboarded = Boolean(
+    state &&
+      (state.settings.profile_onboarded || state.user_profile?.onboarding_completed !== false) &&
+      !showOnboarding
+  );
+
   useEffect(() => {
-    if (!state || state.settings.profile_onboarded === false) return;
+    if (!isOnboarded) return;
     if (
-      (tab === "trends" || tab === "sleep" || tab === "hrv" || tab === "explorer") &&
+      (tab === "trends" || tab === "sleep" || tab === "hrv") &&
       !analyticsData &&
       !analyticsLoading
     ) {
@@ -615,10 +632,10 @@ export default function App() {
         cancelled = true;
       };
     }
-  }, [state, tab, analyticsData, analyticsLoading]);
+  }, [isOnboarded, tab, analyticsData, analyticsLoading, syncEpoch]);
 
   useEffect(() => {
-    if (!state || state.settings.profile_onboarded === false) return;
+    if (!isOnboarded) return;
     if (tab !== "sleep" && tab !== "hrv") return;
     if (sleepTake && hrvTake) return;
     let cancelled = false;
@@ -632,11 +649,11 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, [state, tab, sleepTake, hrvTake]);
+  }, [isOnboarded, tab, sleepTake, hrvTake]);
 
   useEffect(() => {
-    if (!state || state.settings.profile_onboarded === false) return;
-    if (tab !== "records" || recordsData || recordsLoading) return;
+    if (!isOnboarded || tab !== "records") return;
+    if (recordsData || recordsLoading) return;
     let cancelled = false;
     setRecordsLoading(true);
     setRecordsError(null);
@@ -653,7 +670,60 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, [state, tab, recordsData, recordsLoading]);
+  }, [isOnboarded, tab, recordsData, recordsLoading, syncEpoch]);
+
+  useEffect(() => {
+    if (!isOnboarded || tab !== "explorer") return;
+    let cancelled = false;
+    setExplorerLoading(true);
+    setExplorerError(null);
+    void invoke<ExplorerSummaryPayload>("get_explorer_summary", {
+      sportFilter: explorerFilter,
+    })
+      .then((res) => {
+        if (!cancelled) setExplorerData(res);
+      })
+      .catch((err) => {
+        if (!cancelled) setExplorerError(err instanceof Error ? err.message : String(err));
+      })
+      .finally(() => {
+        if (!cancelled) setExplorerLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [isOnboarded, tab, explorerFilter, syncEpoch]);
+
+  async function handleFullHistoryBackfill() {
+    if (backfillBusy) return;
+    setBackfillBusy(true);
+    setBackfillStatus("Syncing full Garmin history & GPS coordinates…");
+    try {
+      const res = await invoke<{
+        synced_activities?: number;
+        total_activities?: number;
+      }>("backfill_lifetime_history");
+      setAnalyticsData(null);
+      setRecordsData(null);
+      setExplorerData(null);
+      setSyncEpoch((e) => e + 1);
+      await reload();
+      const total = res?.total_activities ?? res?.synced_activities ?? 0;
+      setBackfillStatus(`Full history backfill complete (${total.toLocaleString()} workouts indexed).`);
+    } catch (err) {
+      setBackfillStatus(`Backfill failed: ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      setBackfillBusy(false);
+    }
+  }
+
+  useEffect(() => {
+    if (!isOnboarded || !state?.has_garmin_key) return;
+    if (state.lifetime_backfill_completed !== false) return;
+    if (autoBackfillTriggeredRef.current || backfillBusy) return;
+    autoBackfillTriggeredRef.current = true;
+    void handleFullHistoryBackfill();
+  }, [isOnboarded, state?.has_garmin_key, state?.lifetime_backfill_completed, backfillBusy]);
 
   useEffect(() => {
     const unlistenDelta = listen<{ delta: string }>("coach:delta", (event) => {
@@ -724,10 +794,10 @@ export default function App() {
 
   useEffect(() => {
     if (
+      !isOnboarded ||
       !state ||
       tab !== "today" ||
-      !state.has_gemini_key ||
-      state.settings.profile_onboarded === false
+      !state.has_gemini_key
     ) {
       return;
     }
@@ -768,7 +838,7 @@ export default function App() {
   }, [state, tab, todayIsoForEffects, todayHasSleepForEffects, briefing]);
 
   useEffect(() => {
-    if (!state?.has_garmin_key || tab !== "today" || state.settings.profile_onboarded === false) {
+    if (!isOnboarded || !state?.has_garmin_key || tab !== "today") {
       return;
     }
     if (bbRefreshAttemptedRef.current === todayIsoForEffects) {
@@ -960,6 +1030,7 @@ export default function App() {
     );
   }
 
+  const hyroxEnabled = isHyroxDisciplineEnabled(state.user_profile, state.athlete_config);
   const r = state.readiness_state;
   const todayIso = toLocalIsoDate(new Date());
   const todayDay = state.days.find((d) => d.date === todayIso) ?? state.days[0];
@@ -1234,6 +1305,21 @@ export default function App() {
     }
   }
 
+  async function refreshExplorerSummary(filterOverride?: ExplorerSportFilter) {
+    setExplorerLoading(true);
+    setExplorerError(null);
+    try {
+      const res = await invoke<ExplorerSummaryPayload>("get_explorer_summary", {
+        sportFilter: filterOverride ?? explorerFilter,
+      });
+      setExplorerData(res);
+    } catch (err) {
+      setExplorerError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setExplorerLoading(false);
+    }
+  }
+
   async function handleStage1UploadFiles() {
     const selected = await open({
       multiple: true,
@@ -1420,7 +1506,7 @@ export default function App() {
           text:
             "**Setup complete — your profile and training block are now active.**\n\n" +
             "- **Today**: Check daily readiness gatekeeper status, HR ceiling, and your prescribed session.\n" +
-            "- **Activities**: Review synced Garmin runs/HYROX splits, .fit telemetry, and Garmin notes.\n" +
+            `- **Activities**: Review synced Garmin ${hyroxEnabled ? "runs/HYROX splits" : "runs"}, .fit telemetry, and Garmin notes.\n` +
             "- **Coach**: Ask questions anytime or run weekly/monthly block reviews from the Tools menu.",
         });
       }
@@ -1536,8 +1622,10 @@ export default function App() {
                 await invoke("sync_garmin_now");
                 setAnalyticsData(null);
                 setRecordsData(null);
+                setExplorerData(null);
                 setSleepTake(null);
                 setHrvTake(null);
+                setSyncEpoch((e) => e + 1);
                 await reload();
               } finally {
                 setBusy(false);
@@ -2241,6 +2329,7 @@ export default function App() {
         {tab === "activities" && selectedActivity && (
           <ActivityDetailView
             detail={selectedActivity}
+            hyroxEnabled={hyroxEnabled}
             onBack={() => {
               setSelectedActivity(null);
               if (detailReturnTab !== "activities") {
@@ -2314,6 +2403,10 @@ export default function App() {
               error={recordsError}
               onRefresh={() => void refreshRecordsSummary()}
               onOpenActivity={(id) => void openActivityById(id, "records")}
+              hasGarminKey={state.has_garmin_key}
+              lifetimeBackfillCompleted={state.lifetime_backfill_completed ?? false}
+              backfillBusy={backfillBusy}
+              onBackfillHistory={() => void handleFullHistoryBackfill()}
             />
           </ErrorBoundary>
         )}
@@ -2321,9 +2414,18 @@ export default function App() {
         {tab === "explorer" && (
           <ErrorBoundary>
             <ExplorerView
-              activities={analyticsData?.activities ?? state.activities}
-              loading={analyticsLoading}
-              onOpenActivity={(id) => void openActivityById(id, "explorer")}
+              summary={explorerData}
+              sportFilter={explorerFilter}
+              onChangeSportFilter={(next) => {
+                setExplorerFilter(next);
+              }}
+              loading={explorerLoading}
+              error={explorerError}
+              onRefresh={() => void refreshExplorerSummary()}
+              hasGarminKey={state.has_garmin_key}
+              lifetimeBackfillCompleted={state.lifetime_backfill_completed ?? false}
+              backfillBusy={backfillBusy}
+              onBackfillHistory={() => void handleFullHistoryBackfill()}
             />
           </ErrorBoundary>
         )}
@@ -2812,12 +2914,7 @@ export default function App() {
                     "Compare my fresh 1km pace against compromised 1km race splits and estimate station fatigue cost.",
                 },
               ];
-              const isHyroxFirst =
-                state.user_profile?.athlete_type === "hyrox" ||
-                state.user_profile?.athlete_type === "hybrid_both";
-              const chips = isHyroxFirst
-                ? [...hyroxChips, ...runnerChips]
-                : [...runnerChips, ...hyroxChips];
+              const chips = hyroxEnabled ? [...hyroxChips, ...runnerChips] : runnerChips;
               return (
                 <div className="starter-chips-grid" style={{ marginBottom: 12 }}>
                   {chips.map((q) => (
@@ -3151,6 +3248,43 @@ export default function App() {
                   {garminVerifyStatus.text}
                 </div>
               )}
+              <div
+                style={{
+                  marginTop: 14,
+                  paddingTop: 12,
+                  borderTop: "1px solid var(--border)",
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                  gap: 12,
+                  flexWrap: "wrap",
+                }}
+              >
+                <div>
+                  <div style={{ fontSize: 13.5, fontWeight: 600 }}>Full Lifetime Activity Backfill</div>
+                  <div className="muted" style={{ fontSize: 12 }}>
+                    {(state.total_activities_count ?? state.activities.length).toLocaleString()} workouts indexed ·{" "}
+                    {state.lifetime_backfill_completed
+                      ? "Full lifetime history & GPS coordinates synced"
+                      : "Only recent workouts synced — run backfill to load full multi-year history"}
+                  </div>
+                  {backfillStatus && (
+                    <div className="muted" style={{ fontSize: 12, marginTop: 4, color: "var(--accent-primary)" }}>
+                      {backfillStatus}
+                    </div>
+                  )}
+                </div>
+                <button
+                  type="button"
+                  className={state.lifetime_backfill_completed ? "secondary" : "primary"}
+                  disabled={!state.has_garmin_key || backfillBusy}
+                  onClick={() => void handleFullHistoryBackfill()}
+                  style={{ display: "inline-flex", alignItems: "center", gap: 6 }}
+                >
+                  <Download size={14} />
+                  {backfillBusy ? "Backfilling History…" : "Full History Backfill"}
+                </button>
+              </div>
             </div>
 
             <div className="card">
@@ -3489,7 +3623,9 @@ export default function App() {
                         <option value="return_from_injury">Return from Injury</option>
                         <option value="return_to_running">Back to Running (Re-Entry)</option>
                         <option value="couch_to_5k">Couch to 5K (C25K)</option>
-                        <option value="hybrid_hyrox">Hyrox / Hybrid Athlete</option>
+                        {(showHyrox || draftConfig.objective.goalType === "hybrid_hyrox") && (
+                          <option value="hybrid_hyrox">Hyrox / Hybrid Athlete</option>
+                        )}
                       </select>
                     </div>
                     <div>
@@ -4264,6 +4400,9 @@ export default function App() {
                         setBriefingError(null);
                         setAnalyticsData(null);
                         setRecordsData(null);
+                        setExplorerData(null);
+                        setBackfillStatus(null);
+                        autoBackfillTriggeredRef.current = false;
                         setSleepTake(null);
                         setHrvTake(null);
                         briefingAttemptedRef.current = null;
@@ -4376,12 +4515,14 @@ function parseRatingOrZero(raw: string): number {
 
 function ActivityDetailView({
   detail,
+  hyroxEnabled,
   onBack,
   onAnalyze,
   onToggleHyrox,
   onActivityUpdated,
 }: {
   detail: ActivityDetailPayload;
+  hyroxEnabled: boolean;
   onBack: () => void;
   onAnalyze: () => void;
   onToggleHyrox: (isHyrox: boolean) => Promise<void>;
@@ -4611,12 +4752,14 @@ function ActivityDetailView({
             >
               <Download size={14} /> Export 1Hz CSV
             </button>
-            <button
-              className={isHyroxActive ? "primary" : "secondary"}
-              onClick={() => void onToggleHyrox(!isHyroxActive)}
-            >
-              {isHyroxActive ? "HYROX / Hybrid Sim ✓" : "Mark as HYROX / Hybrid Sim"}
-            </button>
+            {hyroxEnabled && (
+              <button
+                className={isHyroxActive ? "primary" : "secondary"}
+                onClick={() => void onToggleHyrox(!isHyroxActive)}
+              >
+                {isHyroxActive ? "HYROX / Hybrid Sim ✓" : "Mark as HYROX / Hybrid Sim"}
+              </button>
+            )}
             <button className="primary" style={{ display: "flex", alignItems: "center", gap: 6 }} onClick={onAnalyze}>
               <Sparkles size={14} /> Analyze in Coach
             </button>
@@ -4644,7 +4787,7 @@ function ActivityDetailView({
             </div>
           </div>
         )}
-        {track?.hyrox_dissection && (
+        {hyroxEnabled && track?.hyrox_dissection && (
           <div
             style={{
               marginBottom: 14,
@@ -4676,7 +4819,7 @@ function ActivityDetailView({
             </div>
           </div>
         )}
-        {isHyroxActive && track?.hyrox_dissection && (
+        {hyroxEnabled && isHyroxActive && track?.hyrox_dissection && (
           <div style={{ marginBottom: 14 }}>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
               <strong>Dual-Column {halfSim ? "4×4 Half-Sim" : "8×8"} HYROX Round Matrix</strong>

@@ -263,6 +263,8 @@ export interface ActivityRecord {
   fit_temp_source?: string | null;
   garmin_notes?: string | null;
   is_pr?: boolean | null;
+  start_latitude?: number | null;
+  start_longitude?: number | null;
 }
 
 export type ThemeMode = "system" | "dark" | "light";
@@ -368,6 +370,8 @@ export interface BootstrapState {
   first_use_state?: FirstUseFlowState;
   daily_briefing?: DailyBriefingRecord | null;
   theme_mode?: ThemeMode;
+  lifetime_backfill_completed?: boolean;
+  total_activities_count?: number;
 }
 
 export interface CoachProfileThresholds {
@@ -661,4 +665,96 @@ export interface AnalyticsDatasetPayload {
 export interface CachedHealthTakes {
   sleep_take: DailyBriefingRecord | null;
   hrv_take: DailyBriefingRecord | null;
+}
+
+export type ExplorerSportFilter = "run" | "ride" | "all";
+
+export interface ExplorerTally {
+  count: number;
+  distance_m: number;
+}
+
+export interface ExplorerCountryVisit {
+  id: string;
+  iso: string;
+  name: string;
+  continent: string;
+  flag: string;
+  label_lat: number;
+  label_lon: number;
+  first_iso: string;
+  last_iso: string;
+  count: number;
+  distance_m: number;
+}
+
+export interface ExplorerCityVisit {
+  city_id: number;
+  name: string;
+  country_id: string;
+  country_iso: string;
+  country_name: string;
+  flag: string;
+  lat: number;
+  lon: number;
+  first_iso: string;
+  count: number;
+  distance_m: number;
+}
+
+export interface ExplorerLeg {
+  from_country_id: string;
+  from_lat: number;
+  from_lon: number;
+  to_country_id: string;
+  to_lat: number;
+  to_lon: number;
+  date_iso: string;
+  year: number;
+}
+
+export interface ExplorerYearSummary {
+  year: number;
+  country_ids: string[];
+  new_country_ids: string[];
+  city_ids: number[];
+  new_cities: number;
+  country_tallies: Record<string, ExplorerTally>;
+  city_tallies: Record<string, ExplorerTally>;
+}
+
+export interface ExplorerFirstVisit {
+  country_id: string;
+  iso: string;
+  name: string;
+  flag: string;
+  first_iso: string;
+}
+
+export interface ExplorerSummaryPayload {
+  sport_filter: ExplorerSportFilter | string;
+  visits: ExplorerCountryVisit[];
+  cities: ExplorerCityVisit[];
+  legs: ExplorerLeg[];
+  years: ExplorerYearSummary[];
+  continents: string[];
+  first_visit: ExplorerFirstVisit | null;
+  total_located_activities: number;
+  total_activities_in_filter: number;
+}
+
+export function isHyroxDisciplineEnabled(
+  profile: UserProfile | null | undefined,
+  config: AthleteConfig | null | undefined
+): boolean {
+  if (profile?.athlete_type === "hyrox" || profile?.athlete_type === "hybrid_both") {
+    return true;
+  }
+  if (config?.objective?.goalType === "hybrid_hyrox") {
+    return true;
+  }
+  if (config?.discipline === "hyrox" || config?.discipline === "hybrid") {
+    return true;
+  }
+  return false;
 }

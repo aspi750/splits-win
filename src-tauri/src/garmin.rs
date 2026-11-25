@@ -231,6 +231,8 @@ impl GarminClient {
                 fit_temp_source: None,
                 garmin_notes: normalize_optional_text(dto.description),
                 is_pr: dto.is_pr,
+                start_latitude: dto.start_latitude,
+                start_longitude: dto.start_longitude,
             });
         }
 
@@ -253,7 +255,7 @@ impl GarminClient {
         let mut activities = Vec::new();
         let mut start = 0usize;
         const PAGE_SIZE: usize = 100;
-        const MAX_PAGES: usize = 50;
+        const MAX_PAGES: usize = 100;
 
         for _ in 0..MAX_PAGES {
             let start_param = start.to_string();
@@ -290,6 +292,8 @@ impl GarminClient {
                     fit_temp_source: None,
                     garmin_notes: normalize_optional_text(dto.description),
                     is_pr: dto.is_pr,
+                    start_latitude: dto.start_latitude,
+                    start_longitude: dto.start_longitude,
                 });
             }
             if count < PAGE_SIZE {
@@ -1211,6 +1215,10 @@ struct ActivityDTO {
     activity_training_load: Option<f64>,
     #[serde(default, rename = "isPR")]
     is_pr: Option<bool>,
+    #[serde(default)]
+    start_latitude: Option<f64>,
+    #[serde(default)]
+    start_longitude: Option<f64>,
 }
 
 #[derive(Debug, Deserialize)]

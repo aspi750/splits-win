@@ -25,6 +25,10 @@
   --chart-blue: #2563EB;
   --chart-pink: #DB2777;
   --chart-coral: #DC2626;
+  --map-ocean: #D8E6F0;
+  --map-land: #EDF1EF;
+  --map-border: #C4D0CA;
+  --map-grid: rgba(28, 30, 29, 0.08);
 }
 
 :root[data-theme="light"] {
@@ -58,6 +62,10 @@
     --chart-blue: #60A5FA;
     --chart-pink: #F472B6;
     --chart-coral: #F87171;
+    --map-ocean: #0B1622;
+    --map-land: #192734;
+    --map-border: #293D50;
+    --map-grid: rgba(255, 255, 255, 0.06);
   }
 }
 
@@ -87,6 +95,10 @@
   --chart-blue: #60A5FA;
   --chart-pink: #F472B6;
   --chart-coral: #F87171;
+  --map-ocean: #0B1622;
+  --map-land: #192734;
+  --map-border: #293D50;
+  --map-grid: rgba(255, 255, 255, 0.06);
 }
 
 * { box-sizing: border-box; }
@@ -1016,4 +1028,164 @@ input:focus, select:focus, textarea:focus { outline: 2px solid var(--accent-bord
   z-index: 25;
   white-space: nowrap;
   box-shadow: 0 6px 18px rgba(0, 0, 0, 0.3);
+}
+
+/* World Map Explorer (v0.2.5.1) */
+.explorer-root {
+  display: flex;
+  flex-direction: column;
+  height: calc(100vh - 48px);
+  min-height: 540px;
+}
+
+.explorer-layout {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  overflow: hidden;
+  background: var(--card);
+}
+
+.explorer-map-pane {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  background: var(--map-ocean);
+  overflow: hidden;
+  cursor: grab;
+  user-select: none;
+}
+
+.explorer-map-pane.dragging {
+  cursor: grabbing;
+}
+
+.explorer-map-stage {
+  width: 100%;
+  height: 100%;
+  will-change: transform;
+}
+
+.explorer-map-controls {
+  position: absolute;
+  right: 14px;
+  bottom: 14px;
+  z-index: 15;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.explorer-ctrl-btn {
+  width: 32px;
+  height: 32px;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  background: rgba(15, 22, 30, 0.85);
+  color: #f0f5f2;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+}
+
+.explorer-ctrl-btn:hover {
+  background: rgba(30, 44, 58, 0.96);
+  border-color: var(--accent-primary);
+}
+
+.explorer-tooltip {
+  position: absolute;
+  pointer-events: none;
+  z-index: 20;
+  background: rgba(8, 12, 16, 0.9);
+  color: #ffffff;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  border-radius: 8px;
+  padding: 6px 10px;
+  font-size: 12.5px;
+  font-weight: 600;
+  white-space: nowrap;
+  box-shadow: 0 8px 22px rgba(0, 0, 0, 0.35);
+}
+
+.explorer-empty-overlay {
+  position: absolute;
+  inset: 0;
+  margin: auto;
+  width: fit-content;
+  height: fit-content;
+  max-width: 380px;
+  padding: 24px 26px;
+  border-radius: 14px;
+  background: rgba(12, 18, 24, 0.86);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  color: #f2f6f4;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  z-index: 12;
+}
+
+.explorer-sidebar {
+  width: 340px;
+  flex-shrink: 0;
+  border-left: 1px solid var(--border);
+  background: var(--card);
+  overflow-y: auto;
+  padding: 18px;
+}
+
+.explorer-year-card {
+  width: 100%;
+  text-align: left;
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: var(--card-subtle);
+  color: var(--text);
+  cursor: pointer;
+  display: flex;
+  flex-direction: column;
+  transition: border-color 120ms ease, background 120ms ease;
+}
+
+.explorer-year-card:hover {
+  border-color: var(--accent-border);
+}
+
+.explorer-rank-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 3px 0;
+}
+
+.explorer-rank-idx {
+  width: 22px;
+  text-align: right;
+  font-size: 11.5px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  flex-shrink: 0;
+}
+
+@media (max-width: 1020px) {
+  .explorer-root {
+    height: auto;
+  }
+  .explorer-layout {
+    flex-direction: column;
+  }
+  .explorer-map-pane {
+    height: 360px;
+  }
+  .explorer-sidebar {
+    width: 100%;
+    border-left: none;
+    border-top: 1px solid var(--border);
+  }
 }
