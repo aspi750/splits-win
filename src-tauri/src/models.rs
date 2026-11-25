@@ -1758,6 +1758,72 @@ pub struct DistanceProgressionSeries {
     pub points: Vec<ProgressionPoint>,
 }
 
+pub const HYROX_STATION_NAMES: [&str; 8] = [
+    "1000m SkiErg",
+    "50m Sled Push",
+    "50m Sled Pull",
+    "80m Burpee Broad Jumps",
+    "1000m Row",
+    "200m Farmers Carry",
+    "100m Sandbag Lunges",
+    "100 Wall Balls",
+];
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HyroxRecordEntry {
+    pub activity_id: i64,
+    pub activity_name: String,
+    pub date: String,
+    pub time_sec: f64,
+    pub average_hr: Option<f64>,
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HyroxResilienceRecord {
+    pub activity_id: i64,
+    pub activity_name: String,
+    pub date: String,
+    pub decay_sec_per_km: f64,
+    pub run_count: usize,
+    pub average_hr: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HyroxStationRecord {
+    pub station_index: usize,
+    pub station_name: String,
+    pub activity_id: i64,
+    pub activity_name: String,
+    pub date: String,
+    pub time_sec: f64,
+    pub average_hr: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct HyroxRecordsSummary {
+    pub total_hyrox_sessions: usize,
+    pub fastest_full_sim: Option<HyroxRecordEntry>,
+    pub fastest_half_sim: Option<HyroxRecordEntry>,
+    pub best_clean_1k_run: Option<HyroxRecordEntry>,
+    pub best_compromised_resilience: Option<HyroxResilienceRecord>,
+    #[serde(default)]
+    pub best_station_splits: Vec<HyroxStationRecord>,
+}
+
+pub fn is_hyrox_discipline_enabled(profile: &UserProfile, config: &AthleteConfig) -> bool {
+    if matches!(profile.athlete_type, AthleteType::Hyrox | AthleteType::HybridBoth) {
+        return true;
+    }
+    if config.objective.goal_type == GoalType::HybridHyrox {
+        return true;
+    }
+    matches!(
+        config.discipline,
+        Some(TrainingDiscipline::Hyrox | TrainingDiscipline::Hybrid)
+    )
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct RecordsPayload {
     pub distance_records: Vec<DistanceRecordEntry>,
@@ -1770,6 +1836,12 @@ pub struct RecordsPayload {
     pub pr_activities: Vec<ActivityRecord>,
     pub total_outdoor_runs: usize,
     pub scanned_fit_runs: usize,
+    #[serde(default)]
+    pub hyrox_records: HyroxRecordsSummary,
+    #[serde(default)]
+    pub newly_downloaded_fits: usize,
+    #[serde(default)]
+    pub prefetch_warning: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]

@@ -1486,6 +1486,13 @@ impl Database {
         }
     }
 
+    pub fn list_cached_fit_track_ids(&self) -> Result<HashSet<i64>, StorageError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT garmin_id FROM fit_tracks")?;
+        let rows = stmt.query_map([], |r| r.get::<_, i64>(0))?;
+        Ok(rows.filter_map(Result::ok).collect())
+    }
+
     pub fn compute_personal_records(&self) -> Result<RecordsPayload, StorageError> {
         self.compute_personal_records_with_progress(|_, _, _| {})
     }
@@ -1498,22 +1505,21 @@ impl Database {
         F: FnMut(usize, usize, &str),
     {
         #[derive(serde::Deserialize)]
-        struct MinimalFitPoints {
+        struct MinimalFitForRecords {
             #[serde(default)]
             full_points: Vec<FitTrackPoint>,
+            #[serde(default)]
+            laps: Vec<FitLap>,
+            #[serde(default)]
+            hyrox_dissection: Option<HyroxDissection>,
         }
 
         let activities = self.list_activities(20_000)?;
-        let fit_track_ids: HashSet<i64> = {
-            let conn = self.conn.lock().unwrap();
-            let mut stmt = conn.prepare("SELECT garmin_id FROM fit_tracks")?;
-            let rows = stmt.query_map([], |r| r.get::<_, i64>(0))?;
-            rows.filter_map(Result::ok).collect()
-        };
+        let fit_track_ids = self.list_cached_fit_track_ids()?;
 
         let outdoor_candidates_total = activities
             .iter()
-            .filter(|a| is_outdoor_run(a) && a.distance_m >= 1_000.0)
+            .filter(|a| is_outdoor_run(a) && a.distance_m >= 1_000.0 && a.is_hyrox != Some(true))
             .count();
         on_progress(
             0,
@@ -1530,10 +1536,40 @@ impl Database {
         ];
 
         let mut efforts: Vec<DistanceRecordEntry> = Vec::new();
+        let mut hyrox_sessions: Vec<(&ActivityRecord, Option<HyroxDissection>)> = Vec::new();
         let mut total_outdoor_runs = 0usize;
         let mut scanned_fit_runs = 0usize;
 
         for a in &activities {
+            let cached_fit: Option<MinimalFitForRecords> = if fit_track_ids.contains(&a.garmin_id) {
+                let raw_json: Option<String> = {
+                    let conn = self.conn.lock().unwrap();
+                    let mut stmt =
+                        conn.prepare_cached("SELECT track_json FROM fit_tracks WHERE garmin_id = ?1 LIMIT 1")?;
+                    let mut rows = stmt.query_map(params![a.garmin_id], |r| r.get::<_, String>(0))?;
+                    rows.next().and_then(Result::ok)
+                };
+                raw_json.and_then(|txt| serde_json::from_str::<MinimalFitForRecords>(&txt).ok())
+            } else {
+                None
+            };
+
+            let mut resolved_dissection = cached_fit.as_ref().and_then(|m| m.hyrox_dissection.clone());
+            if resolved_dissection.is_none() && a.is_hyrox == Some(true) {
+                if let Some(ref fit) = cached_fit {
+                    if !fit.laps.is_empty() {
+                        resolved_dissection = crate::garmin::dissect_hyrox_laps(&fit.laps, true);
+                    }
+                }
+            }
+            let is_hyrox_session = a.is_hyrox == Some(true)
+                || resolved_dissection.as_ref().map_or(false, |d| d.is_hyrox_sim);
+
+            if is_hyrox_session {
+                hyrox_sessions.push((a, resolved_dissection));
+                continue;
+            }
+
             if !is_outdoor_run(a) || a.distance_m < 1_000.0 {
                 continue;
             }
@@ -1545,38 +1581,37 @@ impl Database {
                 a.name.clone()
             };
 
-            let active_sec = if a.moving_duration_sec > 0.0 {
-                a.moving_duration_sec
-            } else {
+            // Use elapsed time for best-stretch / PR windows so race times match Garmin Connect.
+            let elapsed_sec = if a.duration_sec > 0.0 {
                 a.duration_sec
+            } else {
+                a.moving_duration_sec
             };
-
-            let fit_points_opt: Option<Vec<FitTrackPoint>> = if fit_track_ids.contains(&a.garmin_id) {
-                let raw_json: Option<String> = {
-                    let conn = self.conn.lock().unwrap();
-                    let mut stmt =
-                        conn.prepare_cached("SELECT track_json FROM fit_tracks WHERE garmin_id = ?1 LIMIT 1")?;
-                    let mut rows = stmt.query_map(params![a.garmin_id], |r| r.get::<_, String>(0))?;
-                    rows.next().and_then(Result::ok)
-                };
-                raw_json
-                    .and_then(|txt| serde_json::from_str::<MinimalFitPoints>(&txt).ok())
-                    .map(|m| m.full_points)
-                    .filter(|p| p.len() >= 10)
+            let activity_avg_speed_mps = if elapsed_sec > 0.0 && a.distance_m > 0.0 {
+                Some(a.distance_m / elapsed_sec)
             } else {
                 None
             };
 
-            let whole_run_plausible = active_sec > 0.0
+            let fit_points_opt: Option<Vec<FitTrackPoint>> = cached_fit
+                .map(|m| m.full_points)
+                .filter(|p| p.len() >= 10);
+
+            let whole_run_plausible = elapsed_sec > 0.0
                 && a.distance_m > 0.0
-                && plausible_run_effort(a.distance_m, active_sec, a.average_hr);
+                && plausible_run_effort(a.distance_m, elapsed_sec, a.average_hr);
 
             if let Some(points) = fit_points_opt {
                 scanned_fit_runs += 1;
                 let max_track_dist = points.last().map(|p| p.distance_m).unwrap_or(0.0);
                 for &(label, target_m) in &STANDARD_DISTANCES {
                     if max_track_dist >= target_m {
-                        if let Some((best_sec, seg_hr)) = fastest_stretch_in_points(&points, target_m) {
+                        if let Some((best_sec, seg_hr)) = fastest_stretch_in_points(
+                            &points,
+                            target_m,
+                            activity_avg_speed_mps,
+                            a.cadence_spm,
+                        ) {
                             let effective_hr = seg_hr.or(a.average_hr);
                             if plausible_run_effort(target_m, best_sec, effective_hr) {
                                 efforts.push(DistanceRecordEntry {
@@ -1595,8 +1630,16 @@ impl Database {
                         }
                     }
                     if whole_run_plausible && a.distance_m >= target_m * 0.99 {
-                        let scaled_sec = active_sec * (target_m / a.distance_m);
-                        if plausible_run_effort(target_m, scaled_sec, a.average_hr) {
+                        let scaled_sec = elapsed_sec * (target_m / a.distance_m);
+                        if plausible_run_effort(target_m, scaled_sec, a.average_hr)
+                            && !is_low_cadence_speed_spike(
+                                target_m,
+                                scaled_sec,
+                                activity_avg_speed_mps,
+                                a.cadence_spm,
+                                a.cadence_spm,
+                            )
+                        {
                             efforts.push(DistanceRecordEntry {
                                 label: label.to_string(),
                                 distance_m: target_m,
@@ -1616,8 +1659,16 @@ impl Database {
                     if a.distance_m < target_m * 0.99 {
                         continue;
                     }
-                    let scaled_sec = active_sec * (target_m / a.distance_m);
-                    if plausible_run_effort(target_m, scaled_sec, a.average_hr) {
+                    let scaled_sec = elapsed_sec * (target_m / a.distance_m);
+                    if plausible_run_effort(target_m, scaled_sec, a.average_hr)
+                        && !is_low_cadence_speed_spike(
+                            target_m,
+                            scaled_sec,
+                            activity_avg_speed_mps,
+                            a.cadence_spm,
+                            a.cadence_spm,
+                        )
+                    {
                         efforts.push(DistanceRecordEntry {
                             label: label.to_string(),
                             distance_m: target_m,
@@ -1918,6 +1969,8 @@ impl Database {
             }
         }
 
+        let hyrox_records = aggregate_hyrox_records(&hyrox_sessions);
+
         let pr_activities: Vec<ActivityRecord> = activities
             .into_iter()
             .filter(|a| a.is_pr == Some(true))
@@ -1933,8 +1986,287 @@ impl Database {
             pr_activities,
             total_outdoor_runs,
             scanned_fit_runs,
+            hyrox_records,
+            newly_downloaded_fits: 0,
+            prefetch_warning: None,
         })
     }
+}
+
+fn aggregate_hyrox_records(sessions: &[(&ActivityRecord, Option<HyroxDissection>)]) -> HyroxRecordsSummary {
+    if sessions.is_empty() {
+        return HyroxRecordsSummary::default();
+    }
+
+    let mut fastest_full_sim: Option<HyroxRecordEntry> = None;
+    let mut fastest_half_sim: Option<HyroxRecordEntry> = None;
+    let mut best_clean_1k_run: Option<HyroxRecordEntry> = None;
+    let mut best_compromised_resilience: Option<HyroxResilienceRecord> = None;
+    let mut station_bests: [Option<HyroxStationRecord>; 8] = Default::default();
+
+    for (a, dis_opt) in sessions {
+        let total_sec = if a.duration_sec > 0.0 {
+            a.duration_sec
+        } else {
+            a.moving_duration_sec
+        };
+        let date = a.start_iso.get(..10).unwrap_or(&a.start_iso).to_string();
+        let name = if a.name.trim().is_empty() {
+            a.type_key.clone()
+        } else {
+            a.name.clone()
+        };
+        let lower_name = name.to_lowercase();
+        let has_half_marker = lower_name.contains("half")
+            || lower_name.contains("4x4")
+            || lower_name.contains("4×4");
+        let has_full_marker = lower_name.contains("8x8")
+            || lower_name.contains("8×8")
+            || lower_name.contains("full")
+            || lower_name.contains("race");
+
+        let run_count = dis_opt.as_ref().map_or(0, |d| d.run_splits.len());
+        let station_count = dis_opt.as_ref().map_or(0, |d| d.station_splits.len());
+
+        let is_full_sim = if dis_opt.is_some() && (run_count > 0 || station_count > 0) {
+            run_count >= 7 && station_count >= 7
+        } else {
+            a.is_hyrox == Some(true)
+                && !has_half_marker
+                && (has_full_marker || (a.distance_m >= 7_000.0 && total_sec >= 2_400.0))
+        };
+
+        let is_half_sim = if is_full_sim {
+            false
+        } else if dis_opt.is_some() && (run_count > 0 || station_count > 0) {
+            run_count >= 4 && station_count >= 4
+        } else {
+            a.is_hyrox == Some(true) && has_half_marker && total_sec >= 600.0
+        };
+
+        if is_full_sim && total_sec > 0.0 {
+            let candidate = HyroxRecordEntry {
+                activity_id: a.garmin_id,
+                activity_name: name.clone(),
+                date: date.clone(),
+                time_sec: total_sec,
+                average_hr: a.average_hr,
+                detail: Some(if dis_opt.is_some() && (run_count > 0 || station_count > 0) {
+                    format!("{run_count} runs · {station_count} stations")
+                } else {
+                    "8×8 HYROX".to_string()
+                }),
+            };
+            if fastest_full_sim
+                .as_ref()
+                .map_or(true, |cur| candidate.time_sec < cur.time_sec)
+            {
+                fastest_full_sim = Some(candidate);
+            }
+        }
+
+        if is_half_sim && total_sec > 0.0 {
+            let candidate = HyroxRecordEntry {
+                activity_id: a.garmin_id,
+                activity_name: name.clone(),
+                date: date.clone(),
+                time_sec: total_sec,
+                average_hr: a.average_hr,
+                detail: Some(if dis_opt.is_some() && (run_count > 0 || station_count > 0) {
+                    format!("{run_count} runs · {station_count} stations")
+                } else {
+                    "4×4 Half-Sim".to_string()
+                }),
+            };
+            if fastest_half_sim
+                .as_ref()
+                .map_or(true, |cur| candidate.time_sec < cur.time_sec)
+            {
+                fastest_half_sim = Some(candidate);
+            }
+        }
+
+        if let Some(dis) = dis_opt {
+            let best_split = dis
+                .run_splits
+                .iter()
+                .filter_map(|s| {
+                    if !(800.0..=1_300.0).contains(&s.distance_m) {
+                        return None;
+                    }
+                    let sec = if s.moving_sec > 0.0 { s.moving_sec } else { s.elapsed_sec };
+                    if sec <= 0.0 {
+                        return None;
+                    }
+                    let pace = sec / (s.distance_m / 1000.0);
+                    if (150.0..=600.0).contains(&pace) {
+                        Some((pace, s.avg_hr_bpm))
+                    } else {
+                        None
+                    }
+                })
+                .min_by(|x, y| x.0.total_cmp(&y.0));
+
+            if let Some((pace_sec, split_hr)) = best_split {
+                let candidate = HyroxRecordEntry {
+                    activity_id: a.garmin_id,
+                    activity_name: name.clone(),
+                    date: date.clone(),
+                    time_sec: pace_sec,
+                    average_hr: split_hr.or(a.average_hr),
+                    detail: Some("1 km HYROX run split".to_string()),
+                };
+                if best_clean_1k_run
+                    .as_ref()
+                    .map_or(true, |cur| candidate.time_sec < cur.time_sec)
+                {
+                    best_clean_1k_run = Some(candidate);
+                }
+            } else if let Some(clean_pace) = dis
+                .clean_run_pace_sec_per_km
+                .filter(|&p| (150.0..=600.0).contains(&p))
+            {
+                let candidate = HyroxRecordEntry {
+                    activity_id: a.garmin_id,
+                    activity_name: name.clone(),
+                    date: date.clone(),
+                    time_sec: clean_pace,
+                    average_hr: a.average_hr,
+                    detail: Some("Avg clean HYROX run".to_string()),
+                };
+                if best_clean_1k_run
+                    .as_ref()
+                    .map_or(true, |cur| candidate.time_sec < cur.time_sec)
+                {
+                    best_clean_1k_run = Some(candidate);
+                }
+            }
+
+            if run_count >= 4 {
+                if let Some(decay) = dis.compromised_pace_decay_sec.filter(|d| d.is_finite()) {
+                    let candidate = HyroxResilienceRecord {
+                        activity_id: a.garmin_id,
+                        activity_name: name.clone(),
+                        date: date.clone(),
+                        decay_sec_per_km: decay,
+                        run_count,
+                        average_hr: a.average_hr,
+                    };
+                    if best_compromised_resilience
+                        .as_ref()
+                        .map_or(true, |cur| candidate.decay_sec_per_km < cur.decay_sec_per_km)
+                    {
+                        best_compromised_resilience = Some(candidate);
+                    }
+                }
+            }
+
+            if station_count >= 4 {
+                for (idx, split) in dis
+                    .station_splits
+                    .iter()
+                    .take(HYROX_STATION_NAMES.len())
+                    .enumerate()
+                {
+                    let split_sec = if split.elapsed_sec > 0.0 {
+                        split.elapsed_sec
+                    } else {
+                        split.moving_sec
+                    };
+                    if split_sec < 15.0 {
+                        continue;
+                    }
+                    let candidate = HyroxStationRecord {
+                        station_index: idx,
+                        station_name: HYROX_STATION_NAMES[idx].to_string(),
+                        activity_id: a.garmin_id,
+                        activity_name: name.clone(),
+                        date: date.clone(),
+                        time_sec: split_sec,
+                        average_hr: split.avg_hr_bpm,
+                    };
+                    if station_bests[idx]
+                        .as_ref()
+                        .map_or(true, |cur| candidate.time_sec < cur.time_sec)
+                    {
+                        station_bests[idx] = Some(candidate);
+                    }
+                }
+            }
+        }
+    }
+
+    HyroxRecordsSummary {
+        total_hyrox_sessions: sessions.len(),
+        fastest_full_sim,
+        fastest_half_sim,
+        best_clean_1k_run,
+        best_compromised_resilience,
+        best_station_splits: station_bests.into_iter().flatten().collect(),
+    }
+}
+
+pub fn select_records_fit_prefetch_candidates(
+    activities: &[ActivityRecord],
+    cached_fit_ids: &HashSet<i64>,
+    include_hyrox: bool,
+    cap: usize,
+) -> Vec<i64> {
+    if cap == 0 {
+        return Vec::new();
+    }
+    let mut selected = Vec::new();
+    let mut seen: HashSet<i64> = HashSet::new();
+    let mut push_id = |id: i64| {
+        if selected.len() < cap && !cached_fit_ids.contains(&id) && seen.insert(id) {
+            selected.push(id);
+        }
+    };
+
+    // 1. All Garmin PR-flagged outdoor runs missing cached FIT tracks
+    for a in activities {
+        if a.is_pr == Some(true) && is_outdoor_run(a) && a.is_hyrox != Some(true) {
+            push_id(a.garmin_id);
+        }
+    }
+
+    // 2. All HYROX-tagged activities when HYROX/Hybrid is enabled
+    if include_hyrox {
+        for a in activities {
+            if a.is_hyrox == Some(true) {
+                push_id(a.garmin_id);
+            }
+        }
+    }
+
+    // 3. Top 5 fastest outdoor runs by average elapsed pace in each distance bucket
+    const BUCKETS: [f64; 5] = [1_000.0, 5_000.0, 10_000.0, 21_097.5, 42_195.0];
+    for bucket_m in BUCKETS {
+        let mut ranked: Vec<(i64, f64)> = activities
+            .iter()
+            .filter_map(|a| {
+                if !is_outdoor_run(a) || a.is_hyrox == Some(true) || a.distance_m < bucket_m {
+                    return None;
+                }
+                let elapsed = if a.duration_sec > 0.0 {
+                    a.duration_sec
+                } else {
+                    a.moving_duration_sec
+                };
+                if elapsed <= 0.0 || !plausible_run_effort(a.distance_m, elapsed, a.average_hr) {
+                    return None;
+                }
+                let pace = elapsed / (a.distance_m / 1000.0);
+                Some((a.garmin_id, pace))
+            })
+            .collect();
+        ranked.sort_by(|x, y| x.1.total_cmp(&y.1));
+        for (id, _) in ranked.into_iter().take(5) {
+            push_id(id);
+        }
+    }
+
+    selected
 }
 
 fn is_indoor_activity(type_key: &str) -> bool {
@@ -1989,6 +2321,49 @@ pub fn hr_plausible_for_speed(speed_mps: f64, avg_hr: Option<f64>) -> bool {
     true
 }
 
+pub fn is_gps_glitch_step(dd: f64, dt: f64) -> bool {
+    if dd < -5.0 {
+        return true;
+    }
+    if dd <= 0.0 {
+        return false;
+    }
+    if dt <= 0.0 {
+        return dd > 25.0;
+    }
+    (dd / dt) > 7.5 || (dt <= 1.5 && dd > 25.0) || (dt <= 5.0 && dd > 30.0)
+}
+
+pub fn normalize_cadence_spm(raw: Option<f64>) -> Option<f64> {
+    let c = raw.filter(|v| v.is_finite() && *v > 0.0)?;
+    Some(if c < 120.0 { c * 2.0 } else { c })
+}
+
+pub fn is_low_cadence_speed_spike(
+    target_m: f64,
+    sec: f64,
+    activity_avg_speed_mps: Option<f64>,
+    window_cadence_spm: Option<f64>,
+    activity_cadence_spm: Option<f64>,
+) -> bool {
+    if target_m > 1_500.0 {
+        return false;
+    }
+    if !sec.is_finite() || sec <= 0.0 {
+        return true;
+    }
+    let Some(avg_spd) = activity_avg_speed_mps.filter(|v| v.is_finite() && *v > 0.0) else {
+        return false;
+    };
+    let win_spd = target_m / sec;
+    if win_spd <= 1.85 * avg_spd {
+        return false;
+    }
+    let eff_cad = normalize_cadence_spm(window_cadence_spm)
+        .or_else(|| normalize_cadence_spm(activity_cadence_spm));
+    eff_cad.map_or(false, |c| c < 155.0)
+}
+
 pub fn plausible_run_effort(distance_m: f64, sec: f64, avg_hr: Option<f64>) -> bool {
     if !sec.is_finite() || !distance_m.is_finite() || sec <= 0.0 || distance_m <= 0.0 {
         return false;
@@ -2000,21 +2375,68 @@ pub fn plausible_run_effort(distance_m: f64, sec: f64, avg_hr: Option<f64>) -> b
     hr_plausible_for_speed(speed_mps, avg_hr)
 }
 
-fn fastest_stretch_in_points(points: &[FitTrackPoint], target_m: f64) -> Option<(f64, Option<f64>)> {
+fn fastest_stretch_in_points(
+    points: &[FitTrackPoint],
+    target_m: f64,
+    activity_avg_speed_mps: Option<f64>,
+    activity_cadence_spm: Option<f64>,
+) -> Option<(f64, Option<f64>)> {
     if points.len() < 2 || target_m <= 0.0 {
         return None;
     }
+    let n = points.len();
+    let mut bad_prefix = vec![0usize; n];
+    let mut hr_sum = vec![0.0_f64; n + 1];
+    let mut hr_cnt = vec![0usize; n + 1];
+    let mut cad_sum = vec![0.0_f64; n + 1];
+    let mut cad_cnt = vec![0usize; n + 1];
+
+    for idx in 0..n {
+        if idx > 0 {
+            let dd = points[idx].distance_m - points[idx - 1].distance_m;
+            let dt = points[idx].timestamp_sec - points[idx - 1].timestamp_sec;
+            bad_prefix[idx] = bad_prefix[idx - 1] + usize::from(is_gps_glitch_step(dd, dt));
+        }
+        let hr = points[idx].heart_rate_bpm.filter(|v| v.is_finite() && *v > 0.0);
+        hr_sum[idx + 1] = hr_sum[idx] + hr.unwrap_or(0.0);
+        hr_cnt[idx + 1] = hr_cnt[idx] + usize::from(hr.is_some());
+
+        let cad = normalize_cadence_spm(points[idx].cadence_spm);
+        cad_sum[idx + 1] = cad_sum[idx] + cad.unwrap_or(0.0);
+        cad_cnt[idx + 1] = cad_cnt[idx] + usize::from(cad.is_some());
+    }
+
+    let resolved_avg_speed = activity_avg_speed_mps.filter(|v| v.is_finite() && *v > 0.0).or_else(|| {
+        let total_d = points.last()?.distance_m - points.first()?.distance_m;
+        let total_t = points.last()?.timestamp_sec - points.first()?.timestamp_sec;
+        if total_d > 0.0 && total_t > 0.0 {
+            Some(total_d / total_t)
+        } else {
+            None
+        }
+    });
+    let resolved_act_cad = normalize_cadence_spm(activity_cadence_spm).or_else(|| {
+        if cad_cnt[n] > 0 {
+            Some(cad_sum[n] / cad_cnt[n] as f64)
+        } else {
+            None
+        }
+    });
+
     let mut best_sec: Option<f64> = None;
-    let mut best_range: Option<(usize, usize)> = None;
+    let mut best_hr: Option<f64> = None;
     let mut j = 0usize;
 
-    for i in 0..points.len() {
+    for i in 0..n {
         let start_d = points[i].distance_m;
-        while j < points.len() && (points[j].distance_m - start_d) < target_m {
+        while j < n && (points[j].distance_m - start_d) < target_m {
             j += 1;
         }
-        if j >= points.len() {
+        if j >= n {
             break;
+        }
+        if bad_prefix[j] > bad_prefix[i] {
+            continue;
         }
         let end_d = points[j].distance_m - start_d;
         let dt = if j > i && end_d > target_m {
@@ -2032,31 +2454,37 @@ fn fastest_stretch_in_points(points: &[FitTrackPoint], target_m: f64) -> Option<
             points[j].timestamp_sec - points[i].timestamp_sec
         };
 
-        let seg_hr = {
-            let hrs: Vec<f64> = points[i..=j].iter().filter_map(|p| p.heart_rate_bpm).collect();
-            if hrs.is_empty() {
-                None
-            } else {
-                Some(hrs.iter().sum::<f64>() / hrs.len() as f64)
-            }
+        let h_count = hr_cnt[j + 1] - hr_cnt[i];
+        let seg_hr = if h_count > 0 {
+            Some((hr_sum[j + 1] - hr_sum[i]) / h_count as f64)
+        } else {
+            None
         };
 
-        if plausible_run_effort(target_m, dt, seg_hr) && best_sec.map_or(true, |b| dt < b) {
+        let c_count = cad_cnt[j + 1] - cad_cnt[i];
+        let seg_cad = if c_count > 0 {
+            Some((cad_sum[j + 1] - cad_sum[i]) / c_count as f64)
+        } else {
+            None
+        };
+
+        if plausible_run_effort(target_m, dt, seg_hr)
+            && !is_low_cadence_speed_spike(
+                target_m,
+                dt,
+                resolved_avg_speed,
+                seg_cad,
+                resolved_act_cad,
+            )
+            && best_sec.map_or(true, |b| dt < b)
+        {
             best_sec = Some(dt);
-            best_range = Some((i, j));
+            best_hr = seg_hr;
         }
     }
 
     let sec = best_sec?;
-    let avg_hr = best_range.and_then(|(s, e)| {
-        let hrs: Vec<f64> = points[s..=e].iter().filter_map(|p| p.heart_rate_bpm).collect();
-        if hrs.is_empty() {
-            None
-        } else {
-            Some(hrs.iter().sum::<f64>() / hrs.len() as f64)
-        }
-    });
-    Some((sec, avg_hr))
+    Some((sec, best_hr))
 }
 
 fn format_hms(sec: f64) -> String {

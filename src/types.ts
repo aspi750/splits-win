@@ -663,6 +663,43 @@ export interface DistanceProgressionSeries {
   points: ProgressionPoint[];
 }
 
+export interface HyroxRecordEntry {
+  activity_id: number;
+  activity_name: string;
+  date: string;
+  time_sec: number;
+  average_hr: number | null;
+  detail: string | null;
+}
+
+export interface HyroxResilienceRecord {
+  activity_id: number;
+  activity_name: string;
+  date: string;
+  decay_sec_per_km: number;
+  run_count: number;
+  average_hr: number | null;
+}
+
+export interface HyroxStationRecord {
+  station_index: number;
+  station_name: string;
+  activity_id: number;
+  activity_name: string;
+  date: string;
+  time_sec: number;
+  average_hr: number | null;
+}
+
+export interface HyroxRecordsSummary {
+  total_hyrox_sessions: number;
+  fastest_full_sim: HyroxRecordEntry | null;
+  fastest_half_sim: HyroxRecordEntry | null;
+  best_clean_1k_run: HyroxRecordEntry | null;
+  best_compromised_resilience: HyroxResilienceRecord | null;
+  best_station_splits: HyroxStationRecord[];
+}
+
 export interface RecordsPayload {
   distance_records: DistanceRecordEntry[];
   milestones: MilestoneRecordEntry[];
@@ -673,6 +710,9 @@ export interface RecordsPayload {
   pr_activities: ActivityRecord[];
   total_outdoor_runs: number;
   scanned_fit_runs: number;
+  hyrox_records?: HyroxRecordsSummary;
+  newly_downloaded_fits?: number;
+  prefetch_warning?: string | null;
 }
 
 export interface AnalyticsDatasetPayload {

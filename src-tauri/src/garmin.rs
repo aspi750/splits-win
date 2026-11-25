@@ -139,8 +139,19 @@ impl GarminClient {
     }
 
     pub async fn get_bytes(&self, path: &str, query: &[(&str, &str)], accept: &str) -> Result<Vec<u8>, GarminError> {
+        self.get_bytes_inner(path, query, accept, true).await
+    }
+
+    async fn get_bytes_inner(
+        &self,
+        path: &str,
+        query: &[(&str, &str)],
+        accept: &str,
+        retry_429: bool,
+    ) -> Result<Vec<u8>, GarminError> {
         let mut renewed = false;
-        for attempt in 0..4u64 {
+        let max_attempts = if retry_429 { 4u64 } else { 2u64 };
+        for attempt in 0..max_attempts {
             let bearer = self.authenticate(false).await?;
             self.pace_gap().await;
             let url = format!("{GARMIN_API_BASE}{path}");
@@ -163,7 +174,7 @@ impl GarminClient {
                 }
                 401 | 403 => return Err(GarminError::BadKey),
                 429 => {
-                    if attempt == 3 {
+                    if !retry_429 || attempt + 1 >= max_attempts {
                         return Err(GarminError::RateLimited);
                     }
                     tokio::time::sleep(StdDuration::from_secs(15 * (attempt + 1))).await;
@@ -181,6 +192,22 @@ impl GarminClient {
         let zip_bytes = self
             .get_bytes(&format!("/download-service/files/activity/{activity_id}"), &[], "*/*")
             .await?;
+        Self::unpack_fit_zip(zip_bytes)
+    }
+
+    pub async fn download_fit_bytes_fast_429(&self, activity_id: i64) -> Result<Vec<u8>, GarminError> {
+        let zip_bytes = self
+            .get_bytes_inner(
+                &format!("/download-service/files/activity/{activity_id}"),
+                &[],
+                "*/*",
+                false,
+            )
+            .await?;
+        Self::unpack_fit_zip(zip_bytes)
+    }
+
+    fn unpack_fit_zip(zip_bytes: Vec<u8>) -> Result<Vec<u8>, GarminError> {
         let cursor = Cursor::new(zip_bytes);
         let mut archive = zip::ZipArchive::new(cursor).map_err(|e| GarminError::Zip(e.to_string()))?;
         let archive_len = archive.len();

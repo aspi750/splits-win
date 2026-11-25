@@ -1,5 +1,5 @@
 import { useMemo, useState } from "react";
-import { Award, Download, Flag, RefreshCw, Trophy } from "lucide-react";
+import { Activity, AlertTriangle, Award, Download, Flame, Flag, RefreshCw, Timer, Trophy, Zap } from "lucide-react";
 import type { ProgressionPoint, RecordsPayload, RecordsProgressEvent } from "../types";
 
 interface RecordsViewProps {
@@ -7,6 +7,9 @@ interface RecordsViewProps {
   loading: boolean;
   error: string | null;
   progress?: RecordsProgressEvent | null;
+  statusMessage?: string | null;
+  warningMessage?: string | null;
+  hyroxEnabled?: boolean;
   onRefresh: () => void;
   onOpenActivity: (activityId: number) => void;
   hasGarminKey?: boolean;
@@ -52,6 +55,9 @@ export function RecordsView({
   loading,
   error,
   progress = null,
+  statusMessage = null,
+  warningMessage = null,
+  hyroxEnabled = false,
   onRefresh,
   onOpenActivity,
   hasGarminKey = false,
@@ -112,44 +118,69 @@ export function RecordsView({
     );
   }
 
-  if (!records || (records.total_outdoor_runs === 0 && records.milestones.length === 0)) {
+  const hyroxSessionCount = records?.hyrox_records?.total_hyrox_sessions ?? 0;
+
+  if (
+    !records ||
+    (records.total_outdoor_runs === 0 &&
+      records.milestones.length === 0 &&
+      (!hyroxEnabled || hyroxSessionCount === 0))
+  ) {
     return (
-      <div className="card">
-        <div className="card-header" style={{ marginBottom: 8 }}>
-          <h3 style={{ margin: 0 }}>Records</h3>
-          <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-            {hasGarminKey && !lifetimeBackfillCompleted && onBackfillHistory && (
+      <div>
+        <div className="card">
+          <div className="card-header" style={{ marginBottom: 8 }}>
+            <h3 style={{ margin: 0 }}>Records</h3>
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+              {hasGarminKey && !lifetimeBackfillCompleted && onBackfillHistory && (
+                <button
+                  type="button"
+                  className="primary"
+                  disabled={backfillBusy}
+                  onClick={onBackfillHistory}
+                  style={{ display: "inline-flex", alignItems: "center", gap: 6 }}
+                >
+                  <Download size={14} />
+                  {backfillBusy ? "Backfilling History…" : "Full History Backfill"}
+                </button>
+              )}
               <button
                 type="button"
-                className="primary"
-                disabled={backfillBusy}
-                onClick={onBackfillHistory}
+                className="secondary"
+                disabled={loading}
+                onClick={onRefresh}
                 style={{ display: "inline-flex", alignItems: "center", gap: 6 }}
               >
-                <Download size={14} />
-                {backfillBusy ? "Backfilling History…" : "Full History Backfill"}
+                <RefreshCw size={14} className={loading ? "spin" : undefined} />
+                {loading ? "Recomputing…" : "Recompute"}
               </button>
-            )}
-            <button
-              type="button"
-              className="secondary"
-              disabled={loading}
-              onClick={onRefresh}
-              style={{ display: "inline-flex", alignItems: "center", gap: 6 }}
-            >
-              <RefreshCw size={14} />
-              {loading ? "Refreshing…" : "Recompute"}
-            </button>
+            </div>
+          </div>
+          <div className="muted">
+            No outdoor runs or milestones synced yet. Click <strong>Sync Watch</strong> to compute your personal records.
           </div>
         </div>
-        <div className="muted">
-          No outdoor runs or milestones synced yet. Click <strong>Sync Watch</strong> to compute your personal records.
-        </div>
+        {hyroxEnabled && (
+          <div className="card">
+            <div className="card-header">
+              <div>
+                <strong>HYROX Personal Records</strong>
+                <div className="muted" style={{ fontSize: 12 }}>
+                  8×8 race simulations, clean 1 km pace, compromised resilience &amp; station splits
+                </div>
+              </div>
+            </div>
+            <div className="muted" style={{ fontSize: 13 }}>
+              Tag any simulation or race as &apos;HYROX / Hybrid Sim&apos; in Activity Detail to track your 8×8, clean 1 km, and station PRs here.
+            </div>
+          </div>
+        )}
       </div>
     );
   }
 
   const byLabel = new Map(records.distance_records.map((r) => [r.label, r]));
+  const hyroxRecords = records.hyrox_records;
 
   return (
     <div>
@@ -157,7 +188,9 @@ export function RecordsView({
         <div className="page-header-left">
           <h2 className="today-title">Records</h2>
           <span className="today-subtitle">
-            {records.total_outdoor_runs} outdoor runs · {records.scanned_fit_runs} with 1Hz FIT best-stretch analysis
+            {statusMessage
+              ? statusMessage
+              : `${records.total_outdoor_runs} outdoor runs · ${records.scanned_fit_runs} with 1Hz FIT best-stretch analysis`}
           </span>
         </div>
         <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
@@ -180,8 +213,8 @@ export function RecordsView({
             onClick={onRefresh}
             style={{ display: "inline-flex", alignItems: "center", gap: 6 }}
           >
-            <RefreshCw size={14} />
-            {loading ? "Refreshing…" : "Recompute"}
+            <RefreshCw size={14} className={loading ? "spin" : undefined} />
+            {loading ? "Recomputing…" : "Recompute"}
           </button>
         </div>
       </div>
@@ -202,6 +235,22 @@ export function RecordsView({
               style={pct != null ? { width: `${pct}%` } : undefined}
             />
           </div>
+        </div>
+      )}
+
+      {warningMessage && (
+        <div
+          className="card"
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: 10,
+            marginBottom: 12,
+            borderColor: "rgba(245, 158, 11, 0.45)",
+          }}
+        >
+          <AlertTriangle size={16} color="var(--amber)" style={{ flexShrink: 0 }} />
+          <span style={{ fontSize: 13 }}>{warningMessage}</span>
         </div>
       )}
 
@@ -272,6 +321,198 @@ export function RecordsView({
           })}
         </div>
       </div>
+
+      {/* Discipline-Gated HYROX Personal Records */}
+      {hyroxEnabled && (
+        <div className="card">
+          <div className="card-header">
+            <div>
+              <strong>HYROX Personal Records</strong>
+              <div className="muted" style={{ fontSize: 12 }}>
+                {hyroxRecords && hyroxRecords.total_hyrox_sessions > 0
+                  ? `${hyroxRecords.total_hyrox_sessions} HYROX / Hybrid session${hyroxRecords.total_hyrox_sessions === 1 ? "" : "s"} tracked · Click any record to inspect`
+                  : "8×8 race simulations, clean 1 km pace, compromised resilience & station splits"}
+              </div>
+            </div>
+          </div>
+
+          {!hyroxRecords || hyroxRecords.total_hyrox_sessions === 0 ? (
+            <div className="muted" style={{ fontSize: 13 }}>
+              Tag any simulation or race as &apos;HYROX / Hybrid Sim&apos; in Activity Detail to track your 8×8, clean 1 km, and station PRs here.
+            </div>
+          ) : (
+            <>
+              <div className="record-grid">
+                <button
+                  type="button"
+                  className="record-tile"
+                  disabled={!hyroxRecords.fastest_full_sim}
+                  onClick={() =>
+                    hyroxRecords.fastest_full_sim &&
+                    onOpenActivity(hyroxRecords.fastest_full_sim.activity_id)
+                  }
+                >
+                  <span style={{ display: "inline-flex", alignItems: "center", gap: 6, fontSize: 12.5, color: "var(--muted)", fontWeight: 600 }}>
+                    <Flame size={14} color="var(--accent-primary)" />
+                    Fastest Full Sim / Race (8×8)
+                  </span>
+                  <div style={{ fontSize: 25, fontWeight: 700, fontVariantNumeric: "tabular-nums" }}>
+                    {hyroxRecords.fastest_full_sim
+                      ? formatDuration(hyroxRecords.fastest_full_sim.time_sec)
+                      : "–"}
+                  </div>
+                  {hyroxRecords.fastest_full_sim ? (
+                    <>
+                      {hyroxRecords.fastest_full_sim.detail && (
+                        <div style={{ fontSize: 13, fontWeight: 600, color: "var(--accent-primary)" }}>
+                          {hyroxRecords.fastest_full_sim.detail}
+                        </div>
+                      )}
+                      <div className="muted" style={{ fontSize: 12 }}>
+                        {hyroxRecords.fastest_full_sim.activity_name} · {hyroxRecords.fastest_full_sim.date}
+                      </div>
+                    </>
+                  ) : (
+                    <div className="muted" style={{ fontSize: 12 }}>No 8×8 session yet</div>
+                  )}
+                </button>
+
+                <button
+                  type="button"
+                  className="record-tile"
+                  disabled={!hyroxRecords.fastest_half_sim}
+                  onClick={() =>
+                    hyroxRecords.fastest_half_sim &&
+                    onOpenActivity(hyroxRecords.fastest_half_sim.activity_id)
+                  }
+                >
+                  <span style={{ display: "inline-flex", alignItems: "center", gap: 6, fontSize: 12.5, color: "var(--muted)", fontWeight: 600 }}>
+                    <Zap size={14} color="var(--accent-primary)" />
+                    Fastest Half-Sim (4×4)
+                  </span>
+                  <div style={{ fontSize: 25, fontWeight: 700, fontVariantNumeric: "tabular-nums" }}>
+                    {hyroxRecords.fastest_half_sim
+                      ? formatDuration(hyroxRecords.fastest_half_sim.time_sec)
+                      : "–"}
+                  </div>
+                  {hyroxRecords.fastest_half_sim ? (
+                    <>
+                      {hyroxRecords.fastest_half_sim.detail && (
+                        <div style={{ fontSize: 13, fontWeight: 600, color: "var(--accent-primary)" }}>
+                          {hyroxRecords.fastest_half_sim.detail}
+                        </div>
+                      )}
+                      <div className="muted" style={{ fontSize: 12 }}>
+                        {hyroxRecords.fastest_half_sim.activity_name} · {hyroxRecords.fastest_half_sim.date}
+                      </div>
+                    </>
+                  ) : (
+                    <div className="muted" style={{ fontSize: 12 }}>No 4×4 sim yet</div>
+                  )}
+                </button>
+
+                <button
+                  type="button"
+                  className="record-tile"
+                  disabled={!hyroxRecords.best_clean_1k_run}
+                  onClick={() =>
+                    hyroxRecords.best_clean_1k_run &&
+                    onOpenActivity(hyroxRecords.best_clean_1k_run.activity_id)
+                  }
+                >
+                  <span style={{ display: "inline-flex", alignItems: "center", gap: 6, fontSize: 12.5, color: "var(--muted)", fontWeight: 600 }}>
+                    <Activity size={14} color="var(--accent-primary)" />
+                    Best Clean 1 km Run (HYROX)
+                  </span>
+                  <div style={{ fontSize: 25, fontWeight: 700, fontVariantNumeric: "tabular-nums" }}>
+                    {hyroxRecords.best_clean_1k_run
+                      ? formatPace(hyroxRecords.best_clean_1k_run.time_sec)
+                      : "–"}
+                  </div>
+                  {hyroxRecords.best_clean_1k_run ? (
+                    <>
+                      {hyroxRecords.best_clean_1k_run.detail && (
+                        <div style={{ fontSize: 13, fontWeight: 600, color: "var(--accent-primary)" }}>
+                          {hyroxRecords.best_clean_1k_run.detail}
+                        </div>
+                      )}
+                      <div className="muted" style={{ fontSize: 12 }}>
+                        {hyroxRecords.best_clean_1k_run.activity_name} · {hyroxRecords.best_clean_1k_run.date}
+                      </div>
+                    </>
+                  ) : (
+                    <div className="muted" style={{ fontSize: 12 }}>Needs lap dissection</div>
+                  )}
+                </button>
+
+                <button
+                  type="button"
+                  className="record-tile"
+                  disabled={!hyroxRecords.best_compromised_resilience}
+                  onClick={() =>
+                    hyroxRecords.best_compromised_resilience &&
+                    onOpenActivity(hyroxRecords.best_compromised_resilience.activity_id)
+                  }
+                >
+                  <span style={{ display: "inline-flex", alignItems: "center", gap: 6, fontSize: 12.5, color: "var(--muted)", fontWeight: 600 }}>
+                    <Timer size={14} color="var(--accent-primary)" />
+                    Best Compromised Pace Resilience
+                  </span>
+                  <div style={{ fontSize: 25, fontWeight: 700, fontVariantNumeric: "tabular-nums" }}>
+                    {hyroxRecords.best_compromised_resilience
+                      ? `${hyroxRecords.best_compromised_resilience.decay_sec_per_km >= 0 ? "+" : ""}${hyroxRecords.best_compromised_resilience.decay_sec_per_km.toFixed(1)} s/km`
+                      : "–"}
+                  </div>
+                  {hyroxRecords.best_compromised_resilience ? (
+                    <>
+                      <div style={{ fontSize: 13, fontWeight: 600, color: "var(--accent-primary)" }}>
+                        Run 1 vs Runs 5–8 ({hyroxRecords.best_compromised_resilience.run_count} runs)
+                      </div>
+                      <div className="muted" style={{ fontSize: 12 }}>
+                        {hyroxRecords.best_compromised_resilience.activity_name} · {hyroxRecords.best_compromised_resilience.date}
+                      </div>
+                    </>
+                  ) : (
+                    <div className="muted" style={{ fontSize: 12 }}>Needs 4+ run laps</div>
+                  )}
+                </button>
+              </div>
+
+              {hyroxRecords.best_station_splits.length > 0 && (
+                <div style={{ marginTop: 16 }}>
+                  <div className="muted" style={{ fontSize: 12, fontWeight: 600, marginBottom: 8 }}>
+                    Best Station Splits
+                  </div>
+                  <div
+                    className="record-grid"
+                    style={{ gridTemplateColumns: "repeat(auto-fill, minmax(175px, 1fr))" }}
+                  >
+                    {hyroxRecords.best_station_splits.map((st) => (
+                      <button
+                        key={st.station_index}
+                        type="button"
+                        className="record-tile"
+                        style={{ padding: "10px 12px" }}
+                        onClick={() => onOpenActivity(st.activity_id)}
+                      >
+                        <div className="muted" style={{ fontSize: 11.5, fontWeight: 600 }}>
+                          {st.station_name}
+                        </div>
+                        <div style={{ fontSize: 19, fontWeight: 700, fontVariantNumeric: "tabular-nums" }}>
+                          {formatDuration(st.time_sec)}
+                        </div>
+                        <div className="muted" style={{ fontSize: 11.5 }}>
+                          {st.activity_name} · {st.date}
+                        </div>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </>
+          )}
+        </div>
+      )}
 
       {/* Race Predictions — "If you raced today" */}
       {records.distance_records.length > 0 && (

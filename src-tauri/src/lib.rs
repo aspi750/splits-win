@@ -1249,17 +1249,94 @@ fn get_analytics_dataset(state: State<'_, AppState>) -> Result<AnalyticsDatasetP
     Ok(AnalyticsDatasetPayload { activities, days })
 }
 
-#[tauri::command]
-async fn get_records_summary(
+async fn run_records_computation(
     app: AppHandle,
-    state: State<'_, AppState>,
+    store: SharedStore,
+    fetch_missing_fits: bool,
 ) -> Result<RecordsPayload, String> {
-    let store = state.load_store()?;
     let db_path = store.root().join("state").join("splits.sqlite");
-    tokio::task::spawn_blocking(move || {
+    let mut newly_downloaded_fits = 0usize;
+    let mut prefetch_warning: Option<String> = None;
+
+    if fetch_missing_fits {
+        let (candidates, config, is_hyrox_map) = {
+            let db = Database::open(&db_path).map_err(|e| e.to_string())?;
+            let activities = db.list_activities(20_000).map_err(|e| e.to_string())?;
+            let cached_ids = db.list_cached_fit_track_ids().map_err(|e| e.to_string())?;
+            let profile = db.get_user_profile().unwrap_or_default();
+            let config = store
+                .load_athlete_config()
+                .map_err(|e| e.to_string())?
+                .unwrap_or_default();
+            let include_hyrox = is_hyrox_discipline_enabled(&profile, &config);
+            let candidates =
+                storage::select_records_fit_prefetch_candidates(&activities, &cached_ids, include_hyrox, 25);
+            let hyrox_map: std::collections::HashMap<i64, bool> = activities
+                .iter()
+                .map(|a| (a.garmin_id, a.is_hyrox == Some(true)))
+                .collect();
+            (candidates, config, hyrox_map)
+        };
+
+        if !candidates.is_empty() {
+            if CredentialStore::read_garmin_key().is_none() {
+                prefetch_warning = Some(
+                    "Add your Garmin Personal API key in Settings to download 1Hz FIT tracks for PR candidates."
+                        .to_string(),
+                );
+            } else {
+                let client = garmin::GarminClient::new(None);
+                let total_dl = candidates.len();
+                let db = Database::open(&db_path).map_err(|e| e.to_string())?;
+                for (idx, act_id) in candidates.into_iter().enumerate() {
+                    let _ = app.emit(
+                        "records-progress",
+                        serde_json::json!({
+                            "processed": idx,
+                            "total": total_dl,
+                            "message": format!("Downloading FIT tracks for PR candidates ({} / {total_dl})…", idx + 1),
+                        }),
+                    );
+                    match client.download_fit_bytes_fast_429(act_id).await {
+                        Ok(bytes) => {
+                            if let Ok(mut parsed) = garmin::parse_fit_track(act_id, &bytes, &config) {
+                                if is_hyrox_map.get(&act_id).copied().unwrap_or(false) {
+                                    parsed.hyrox_dissection =
+                                        garmin::dissect_hyrox_laps(&parsed.laps, true);
+                                }
+                                let _ = db.upsert_fit_track(act_id, &parsed);
+                                let _ = db.set_activity_fit_temp_source(act_id, &parsed.temp_source);
+                                newly_downloaded_fits += 1;
+                            }
+                        }
+                        Err(garmin::GarminError::RateLimited) => {
+                            prefetch_warning = Some(format!(
+                                "Garmin rate limit (429) reached after {newly_downloaded_fits} FIT downloads. Partial 1Hz results saved — try Recompute again in a few minutes."
+                            ));
+                            break;
+                        }
+                        Err(garmin::GarminError::BadKey | garmin::GarminError::NoKey) => {
+                            prefetch_warning = Some(
+                                "Garmin API key rejected or expired. Update your key in Settings to fetch 1Hz FIT tracks."
+                                    .to_string(),
+                            );
+                            break;
+                        }
+                        Err(_) => {
+                            // Non-fatal single-activity download/ZIP error: skip and continue
+                        }
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                }
+            }
+        }
+    }
+
+    let app_for_scan = app.clone();
+    let mut payload = tokio::task::spawn_blocking(move || {
         let db = Database::open(&db_path).map_err(|e| e.to_string())?;
         db.compute_personal_records_with_progress(|processed, total, msg| {
-            let _ = app.emit(
+            let _ = app_for_scan.emit(
                 "records-progress",
                 serde_json::json!({
                     "processed": processed,
@@ -1271,7 +1348,30 @@ async fn get_records_summary(
         .map_err(|e| e.to_string())
     })
     .await
-    .map_err(|e| format!("Records worker failed: {e}"))?
+    .map_err(|e| format!("Records worker failed: {e}"))??;
+
+    payload.newly_downloaded_fits = newly_downloaded_fits;
+    payload.prefetch_warning = prefetch_warning;
+    Ok(payload)
+}
+
+#[tauri::command]
+async fn get_records_summary(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    fetch_missing_fits: Option<bool>,
+) -> Result<RecordsPayload, String> {
+    let store = state.load_store()?;
+    run_records_computation(app, store, fetch_missing_fits.unwrap_or(false)).await
+}
+
+#[tauri::command]
+async fn recompute_records_with_fit_prefetch(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<RecordsPayload, String> {
+    let store = state.load_store()?;
+    run_records_computation(app, store, true).await
 }
 
 #[tauri::command]
@@ -1522,6 +1622,7 @@ pub fn run() {
             get_or_generate_daily_briefing,
             get_analytics_dataset,
             get_records_summary,
+            recompute_records_with_fit_prefetch,
             get_explorer_summary,
             get_cached_health_takes,
             get_or_generate_sleep_take,

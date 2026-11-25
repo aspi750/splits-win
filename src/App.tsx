@@ -377,6 +377,8 @@ export default function App() {
   const [recordsLoading, setRecordsLoading] = useState(false);
   const [recordsError, setRecordsError] = useState<string | null>(null);
   const [recordsProgress, setRecordsProgress] = useState<RecordsProgressEvent | null>(null);
+  const [recordsStatusMsg, setRecordsStatusMsg] = useState<string | null>(null);
+  const [recordsWarning, setRecordsWarning] = useState<string | null>(null);
   const [explorerFilter, setExplorerFilter] = useState<ExplorerSportFilter>("run");
   const [explorerData, setExplorerData] = useState<ExplorerSummaryPayload | null>(null);
   const [explorerLoading, setExplorerLoading] = useState(false);
@@ -418,7 +420,7 @@ export default function App() {
   const [confirmCleanSlate, setConfirmCleanSlate] = useState(false);
   const [cleanSlateBusy, setCleanSlateBusy] = useState(false);
 
-  const [appVersion, setAppVersion] = useState<string>("0.2.5.3-beta");
+  const [appVersion, setAppVersion] = useState<string>("0.2.6-beta");
   const [bootstrapError, setBootstrapError] = useState<string | null>(null);
   const [themeMode, setThemeMode] = useState<ThemeMode>(() => {
     try {
@@ -1323,14 +1325,29 @@ export default function App() {
   }
 
   async function refreshRecordsSummary() {
+    if (recordsLoading) return;
     const reqId = ++recordsReqIdRef.current;
     setRecordsLoading(true);
     setRecordsError(null);
-    setRecordsProgress(null);
+    setRecordsStatusMsg(null);
+    setRecordsWarning(null);
+    setRecordsProgress({
+      processed: 0,
+      total: 1,
+      message: "Preparing PR candidate FIT downloads…",
+    });
     try {
-      const res = await invoke<RecordsPayload>("get_records_summary");
+      const res = await invoke<RecordsPayload>("recompute_records_with_fit_prefetch");
       if (recordsReqIdRef.current === reqId) {
         setRecordsData(res);
+        const newSuffix =
+          res.newly_downloaded_fits && res.newly_downloaded_fits > 0
+            ? ` (+${res.newly_downloaded_fits} new)`
+            : "";
+        setRecordsStatusMsg(
+          `Updated · ${res.total_outdoor_runs} runs · ${res.scanned_fit_runs} with 1Hz FIT analysis${newSuffix}`
+        );
+        setRecordsWarning(res.prefetch_warning ?? null);
       }
     } catch (err) {
       if (recordsReqIdRef.current === reqId) {
@@ -2415,6 +2432,7 @@ export default function App() {
               });
               setSelectedActivity(updated);
               setAnalyticsData(null);
+              setRecordsData(null);
               await reload();
             }}
             onActivityUpdated={async (updatedActivity: ActivityRecord) => {
@@ -2473,6 +2491,9 @@ export default function App() {
               loading={recordsLoading}
               error={recordsError}
               progress={recordsProgress}
+              statusMessage={recordsStatusMsg}
+              warningMessage={recordsWarning}
+              hyroxEnabled={hyroxEnabled}
               onRefresh={() => void refreshRecordsSummary()}
               onOpenActivity={(id) => void openActivityById(id, "records")}
               hasGarminKey={state.has_garmin_key}

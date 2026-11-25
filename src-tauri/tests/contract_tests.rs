@@ -2731,3 +2731,372 @@ fn v0_2_5_3_records_rejects_gps_corrupted_outlier_and_builds_progression() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn v0_2_6_gps_spike_guard_rejects_barcelona_jump_accepts_clean_339_and_excludes_hyrox() {
+    let dir = make_temp_dir("records-gps-spike-026");
+    let db = Database::open(&dir.join("splits.sqlite")).unwrap();
+
+    // 1. Barcelona 11.51 km / 1:16:12 (4572s) / 144 spm run with a synthetic GPS teleport jump
+    //    at s=2001..2004 (+500m in 4s) that would produce a fake 3:15 1K without the spike guard.
+    let barcelona = ActivityRecord {
+        garmin_id: 9201,
+        name: "Barcelona Morning Run".to_string(),
+        type_key: "running".to_string(),
+        start_iso: "2014-07-14T07:30:00Z".to_string(),
+        distance_m: 11_510.0,
+        duration_sec: 4_572.0,
+        moving_duration_sec: 4_572.0,
+        elevation_gain_m: 45.0,
+        average_hr: Some(146.0),
+        max_hr: Some(165.0),
+        cadence_spm: Some(144.0),
+        training_load: Some(110.0),
+        shoe_name: None,
+        is_hyrox: Some(false),
+        post_run_context: None,
+        fit_temp_source: None,
+        garmin_notes: None,
+        is_pr: None,
+        start_latitude: Some(41.3851),
+        start_longitude: Some(2.1734),
+    };
+    db.upsert_activity(&barcelona).unwrap();
+
+    let mut spike_pts = Vec::with_capacity(4573);
+    let mut dist = 0.0_f64;
+    for s in 0..=4572 {
+        if s > 0 {
+            if (2001..=2004).contains(&s) {
+                dist += 125.0; // 500m GPS teleport in 4s
+            } else {
+                dist += 2.41;
+            }
+        }
+        spike_pts.push(make_fit_point(
+            s as f64,
+            dist,
+            2.52,
+            Some(146.0),
+            Some(72.0), // 72 * 2 = 144 spm
+            Some(15.0),
+        ));
+    }
+    let spike_track = analyze_fit_points(9201, spike_pts, &AthleteConfig::default());
+    db.upsert_fit_track(9201, &spike_track).unwrap();
+
+    // 2. Clean 3:39 (219s) 1K effort on 2023-09-16 at 178 spm
+    let clean_act = ActivityRecord {
+        garmin_id: 9202,
+        name: "Track Threshold 1K".to_string(),
+        type_key: "track_running".to_string(),
+        start_iso: "2023-09-16T08:00:00Z".to_string(),
+        distance_m: 5_000.0,
+        duration_sec: 1_400.0,
+        moving_duration_sec: 1_400.0,
+        elevation_gain_m: 10.0,
+        average_hr: Some(168.0),
+        max_hr: Some(182.0),
+        cadence_spm: Some(174.0),
+        training_load: Some(95.0),
+        shoe_name: None,
+        is_hyrox: Some(false),
+        post_run_context: None,
+        fit_temp_source: None,
+        garmin_notes: None,
+        is_pr: Some(true),
+        start_latitude: Some(40.4168),
+        start_longitude: Some(-3.7038),
+    };
+    db.upsert_activity(&clean_act).unwrap();
+
+    let mut clean_pts = Vec::with_capacity(1401);
+    let mut clean_dist = 0.0_f64;
+    for s in 0..=1400 {
+        let spd = if (400..=618).contains(&s) {
+            1000.0 / 219.0
+        } else {
+            3.35
+        };
+        if s > 0 {
+            clean_dist += spd;
+        }
+        clean_pts.push(make_fit_point(
+            s as f64,
+            clean_dist,
+            spd,
+            Some(if (400..=618).contains(&s) { 178.0 } else { 154.0 }),
+            Some(if (400..=618).contains(&s) { 89.0 } else { 85.0 }), // 178 / 170 spm
+            Some(20.0),
+        ));
+    }
+    let clean_track = analyze_fit_points(9202, clean_pts, &AthleteConfig::default());
+    db.upsert_fit_track(9202, &clean_track).unwrap();
+
+    // 3. Tagged HYROX activity & auto-detected HYROX sim must never enter running PRs or predictions
+    let recent_iso = (Utc::now() - Duration::days(7))
+        .format("%Y-%m-%dT09:00:00Z")
+        .to_string();
+    let hyrox_act = ActivityRecord {
+        garmin_id: 9203,
+        name: "HYROX Sim 8x8".to_string(),
+        type_key: "running".to_string(),
+        start_iso: recent_iso,
+        distance_m: 8_200.0,
+        duration_sec: 1_500.0, // artificially fast if unguarded
+        moving_duration_sec: 1_500.0,
+        elevation_gain_m: 0.0,
+        average_hr: Some(170.0),
+        max_hr: Some(184.0),
+        cadence_spm: Some(176.0),
+        training_load: Some(140.0),
+        shoe_name: None,
+        is_hyrox: Some(true),
+        post_run_context: None,
+        fit_temp_source: None,
+        garmin_notes: None,
+        is_pr: None,
+        start_latitude: None,
+        start_longitude: None,
+    };
+    db.upsert_activity(&hyrox_act).unwrap();
+
+    // Low-cadence 1.85x speed spike helper check
+    assert!(splits_win_lib::storage::is_low_cadence_speed_spike(
+        1000.0,
+        195.0,
+        Some(11_510.0 / 4_572.0),
+        Some(144.0),
+        Some(144.0),
+    ));
+    assert!(!splits_win_lib::storage::is_low_cadence_speed_spike(
+        1000.0,
+        195.0,
+        Some(11_510.0 / 4_572.0),
+        Some(180.0),
+        Some(152.0),
+    ));
+
+    let records = db.compute_personal_records().unwrap();
+    let one_k = records
+        .distance_records
+        .iter()
+        .find(|r| r.label == "1K")
+        .expect("1K record must exist");
+    assert_eq!(one_k.activity_id, 9202);
+    assert!((one_k.time_sec - 219.0).abs() < 2.0);
+    assert!(records
+        .distance_records
+        .iter()
+        .all(|r| r.activity_id != 9203));
+    assert!(records
+        .predictions
+        .iter()
+        .all(|p| p.source_activity_id != 9203));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn v0_2_6_fit_prefetch_candidate_selector_prioritizes_pr_hyrox_and_top5_capped_at_25() {
+    let mut acts = Vec::new();
+    let make = |id: i64, dist_m: f64, dur_s: f64, is_pr: bool, is_hyrox: bool| ActivityRecord {
+        garmin_id: id,
+        name: format!("Act {id}"),
+        type_key: "running".to_string(),
+        start_iso: "2026-01-15T08:00:00Z".to_string(),
+        distance_m: dist_m,
+        duration_sec: dur_s,
+        moving_duration_sec: dur_s,
+        elevation_gain_m: 10.0,
+        average_hr: Some(165.0),
+        max_hr: Some(180.0),
+        cadence_spm: Some(178.0),
+        training_load: Some(80.0),
+        shoe_name: None,
+        is_hyrox: if is_hyrox { Some(true) } else { Some(false) },
+        post_run_context: None,
+        fit_temp_source: None,
+        garmin_notes: None,
+        is_pr: if is_pr { Some(true) } else { Some(false) },
+        start_latitude: None,
+        start_longitude: None,
+    };
+
+    acts.push(make(1, 5_000.0, 1_300.0, true, false)); // PR uncached
+    acts.push(make(2, 5_000.0, 1_310.0, true, false)); // PR already cached
+    acts.push(make(3, 8_200.0, 4_200.0, false, true)); // HYROX uncached
+    // Add 35 fast outdoor runs across buckets
+    for i in 10..45i64 {
+        let dist = match i % 5 {
+            0 => 42_200.0,
+            1 => 21_200.0,
+            2 => 10_100.0,
+            3 => 5_100.0,
+            _ => 1_500.0,
+        };
+        acts.push(make(i, dist, dist / 4.2, false, false));
+    }
+
+    let mut cached = std::collections::HashSet::new();
+    cached.insert(2i64);
+
+    let without_hyrox =
+        splits_win_lib::storage::select_records_fit_prefetch_candidates(&acts, &cached, false, 25);
+    assert!(without_hyrox.contains(&1));
+    assert!(!without_hyrox.contains(&2));
+    assert!(!without_hyrox.contains(&3));
+    assert!(without_hyrox.len() <= 25);
+
+    let with_hyrox =
+        splits_win_lib::storage::select_records_fit_prefetch_candidates(&acts, &cached, true, 25);
+    assert!(with_hyrox.contains(&1));
+    assert!(with_hyrox.contains(&3));
+    assert!(!with_hyrox.contains(&2));
+    assert!(with_hyrox.len() <= 25);
+}
+
+#[test]
+fn v0_2_6_hyrox_records_aggregation_and_runner_gating() {
+    let dir = make_temp_dir("hyrox-records-026");
+    let db = Database::open(&dir.join("splits.sqlite")).unwrap();
+
+    let make_sim_track = |id: i64, run_paces: &[f64], station_secs: &[f64]| {
+        let mut laps = Vec::new();
+        for idx in 0..run_paces.len() {
+            let r_sec = run_paces[idx];
+            laps.push(FitLap {
+                elapsed_sec: r_sec,
+                moving_sec: r_sec,
+                distance_m: 1_000.0,
+                avg_hr_bpm: Some(168.0),
+            });
+            if idx < station_secs.len() {
+                let s_sec = station_secs[idx];
+                laps.push(FitLap {
+                    elapsed_sec: s_sec,
+                    moving_sec: s_sec,
+                    distance_m: 50.0,
+                    avg_hr_bpm: Some(172.0),
+                });
+            }
+        }
+        let dissection = dissect_hyrox_laps(&laps, true);
+        let mut track = analyze_fit_points(id, Vec::new(), &AthleteConfig::default());
+        track.laps = laps;
+        track.hyrox_dissection = dissection;
+        track
+    };
+
+    let full_act = ActivityRecord {
+        garmin_id: 9301,
+        name: "HYROX Madrid 8x8".to_string(),
+        type_key: "running".to_string(),
+        start_iso: "2026-09-20T09:00:00Z".to_string(),
+        distance_m: 8_400.0,
+        duration_sec: 4_620.0,
+        moving_duration_sec: 4_550.0,
+        elevation_gain_m: 0.0,
+        average_hr: Some(170.0),
+        max_hr: Some(186.0),
+        cadence_spm: Some(174.0),
+        training_load: Some(180.0),
+        shoe_name: None,
+        is_hyrox: Some(true),
+        post_run_context: None,
+        fit_temp_source: None,
+        garmin_notes: None,
+        is_pr: None,
+        start_latitude: None,
+        start_longitude: None,
+    };
+    let half_act = ActivityRecord {
+        garmin_id: 9302,
+        name: "HYROX Half Sim 4x4".to_string(),
+        type_key: "running".to_string(),
+        start_iso: "2026-09-10T09:00:00Z".to_string(),
+        distance_m: 4_200.0,
+        duration_sec: 2_150.0,
+        moving_duration_sec: 2_100.0,
+        elevation_gain_m: 0.0,
+        average_hr: Some(168.0),
+        max_hr: Some(184.0),
+        cadence_spm: Some(176.0),
+        training_load: Some(120.0),
+        shoe_name: None,
+        is_hyrox: Some(true),
+        post_run_context: None,
+        fit_temp_source: None,
+        garmin_notes: None,
+        is_pr: None,
+        start_latitude: None,
+        start_longitude: None,
+    };
+    db.upsert_activity(&full_act).unwrap();
+    db.upsert_activity(&half_act).unwrap();
+
+    db.upsert_fit_track(
+        9301,
+        &make_sim_track(
+            9301,
+            &[240.0, 245.0, 250.0, 255.0, 252.0, 254.0, 255.0, 255.0],
+            &[240.0, 180.0, 210.0, 260.0, 245.0, 130.0, 270.0, 290.0],
+        ),
+    )
+    .unwrap();
+    db.upsert_fit_track(
+        9302,
+        &make_sim_track(
+            9302,
+            &[230.0, 240.0, 255.0, 265.0],
+            &[220.0, 170.0, 200.0, 240.0],
+        ),
+    )
+    .unwrap();
+
+    let payload = db.compute_personal_records().unwrap();
+    let hyrox = &payload.hyrox_records;
+    assert_eq!(hyrox.total_hyrox_sessions, 2);
+    assert_eq!(hyrox.fastest_full_sim.as_ref().map(|r| r.activity_id), Some(9301));
+    assert!((hyrox.fastest_full_sim.as_ref().unwrap().time_sec - 4620.0).abs() < 0.5);
+    assert_eq!(hyrox.fastest_half_sim.as_ref().map(|r| r.activity_id), Some(9302));
+    assert!((hyrox.fastest_half_sim.as_ref().unwrap().time_sec - 2150.0).abs() < 0.5);
+    assert_eq!(hyrox.best_clean_1k_run.as_ref().map(|r| r.activity_id), Some(9302));
+    assert!((hyrox.best_clean_1k_run.as_ref().unwrap().time_sec - 230.0).abs() < 0.5);
+    assert_eq!(
+        hyrox.best_compromised_resilience.as_ref().map(|r| r.activity_id),
+        Some(9301)
+    );
+    assert!((hyrox.best_compromised_resilience.as_ref().unwrap().decay_sec_per_km - 14.0).abs() < 0.5);
+    assert_eq!(hyrox.best_station_splits.len(), 8);
+    assert_eq!(hyrox.best_station_splits[0].station_name, "1000m SkiErg");
+    assert_eq!(hyrox.best_station_splits[0].activity_id, 9302);
+    assert_eq!(hyrox.best_station_splits[7].station_name, "100 Wall Balls");
+    assert_eq!(hyrox.best_station_splits[7].activity_id, 9301);
+
+    // Discipline gating check: pure runners see zero HYROX UI
+    let runner_profile = UserProfile {
+        athlete_type: AthleteType::Runner,
+        ..Default::default()
+    };
+    let runner_config = AthleteConfig::default();
+    assert!(!is_hyrox_discipline_enabled(&runner_profile, &runner_config));
+
+    let hyrox_profile = UserProfile {
+        athlete_type: AthleteType::Hyrox,
+        ..Default::default()
+    };
+    assert!(is_hyrox_discipline_enabled(&hyrox_profile, &runner_config));
+
+    let hybrid_profile = UserProfile {
+        athlete_type: AthleteType::HybridBoth,
+        ..Default::default()
+    };
+    assert!(is_hyrox_discipline_enabled(&hybrid_profile, &runner_config));
+
+    let mut hybrid_goal_config = AthleteConfig::default();
+    hybrid_goal_config.objective.goal_type = GoalType::HybridHyrox;
+    assert!(is_hyrox_discipline_enabled(&runner_profile, &hybrid_goal_config));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
