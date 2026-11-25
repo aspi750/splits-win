@@ -1123,6 +1123,8 @@ pub struct ActivityRecord {
     pub fit_temp_source: Option<String>,
     #[serde(default)]
     pub garmin_notes: Option<String>,
+    #[serde(default)]
+    pub is_pr: Option<bool>,
 }
 
 impl ActivityRecord {
@@ -1185,6 +1187,26 @@ pub struct DayRecord {
     pub hrv_baseline_low: Option<i32>,
     #[serde(default)]
     pub hrv_baseline_high: Option<i32>,
+    #[serde(default)]
+    pub sleep_need_minutes: Option<i32>,
+    #[serde(default)]
+    pub sleep_baseline_minutes: Option<i32>,
+    #[serde(default)]
+    pub sleep_awake_count: Option<i32>,
+    #[serde(default)]
+    pub sleep_avg_hr: Option<f64>,
+    #[serde(default)]
+    pub sleep_stress: Option<f64>,
+    #[serde(default)]
+    pub sleep_respiration_avg: Option<f64>,
+    #[serde(default)]
+    pub sleep_respiration_low: Option<f64>,
+    #[serde(default)]
+    pub sleep_respiration_high: Option<f64>,
+    #[serde(default)]
+    pub sleep_quality: Option<String>,
+    #[serde(default)]
+    pub hrv_last_night_5min_high: Option<i32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1650,4 +1672,89 @@ pub struct FitBaselineProbe {
     pub detected_rhr_baseline: Option<i32>,
     pub estimated_lthr: Option<i32>,
     pub weekly_km_est: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NightHrvReading {
+    pub timestamp_iso: String,
+    pub timestamp_ms: i64,
+    pub value_ms: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct NightHrvDetail {
+    pub date: String,
+    pub readings: Vec<NightHrvReading>,
+    pub last_night_avg: Option<i32>,
+    pub last_night_5min_high: Option<i32>,
+    pub baseline_low: Option<i32>,
+    pub baseline_high: Option<i32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DistanceRecordEntry {
+    pub label: String,
+    pub distance_m: f64,
+    pub time_sec: f64,
+    pub pace_sec_per_km: f64,
+    pub date: String,
+    pub activity_id: i64,
+    pub activity_name: String,
+    pub average_hr: Option<f64>,
+    pub source: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MilestoneRecordEntry {
+    pub key: String,
+    pub label: String,
+    pub value_display: String,
+    pub value_num: f64,
+    pub date: String,
+    pub activity_id: Option<i64>,
+    pub activity_name: Option<String>,
+    pub average_hr: Option<f64>,
+    pub pace_sec_per_km: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RacePredictionEntry {
+    pub label: String,
+    pub distance_m: f64,
+    pub predicted_sec: f64,
+    pub pace_sec_per_km: f64,
+    pub source_label: String,
+    pub source_time_sec: f64,
+    pub source_date: String,
+    pub source_activity_id: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct YearlyDistanceBest {
+    pub year: i32,
+    pub bests: HashMap<String, DistanceRecordEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct RecordsPayload {
+    pub distance_records: Vec<DistanceRecordEntry>,
+    pub milestones: Vec<MilestoneRecordEntry>,
+    pub predictions: Vec<RacePredictionEntry>,
+    pub prediction_window_months: i32,
+    pub yearly_bests: Vec<YearlyDistanceBest>,
+    pub pr_activities: Vec<ActivityRecord>,
+    pub total_outdoor_runs: usize,
+    pub scanned_fit_runs: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct AnalyticsDatasetPayload {
+    pub activities: Vec<ActivityRecord>,
+    pub days: Vec<DayRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct CachedHealthTakes {
+    pub sleep_take: Option<DailyBriefingRecord>,
+    pub hrv_take: Option<DailyBriefingRecord>,
 }

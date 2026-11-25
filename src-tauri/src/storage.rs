@@ -1,7 +1,8 @@
 use crate::models::*;
-use chrono::Local;
+use chrono::{Datelike, Duration, Local, NaiveDate};
 use rusqlite::{params, Connection};
 use serde::{de::DeserializeOwned, Serialize};
+use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -635,7 +636,17 @@ impl Database {
                 hrv_status TEXT,
                 hrv_weekly_avg INTEGER,
                 hrv_baseline_low INTEGER,
-                hrv_baseline_high INTEGER
+                hrv_baseline_high INTEGER,
+                sleep_need_minutes INTEGER,
+                sleep_baseline_minutes INTEGER,
+                sleep_awake_count INTEGER,
+                sleep_avg_hr REAL,
+                sleep_stress REAL,
+                sleep_respiration_avg REAL,
+                sleep_respiration_low REAL,
+                sleep_respiration_high REAL,
+                sleep_quality TEXT,
+                hrv_last_night_5min_high INTEGER
             );
             CREATE TABLE IF NOT EXISTS briefings (
                 date TEXT PRIMARY KEY,
@@ -679,6 +690,7 @@ impl Database {
         let _ = conn.execute("ALTER TABLE activities ADD COLUMN post_run_context_json TEXT", []);
         let _ = conn.execute("ALTER TABLE activities ADD COLUMN fit_temp_source TEXT", []);
         let _ = conn.execute("ALTER TABLE activities ADD COLUMN garmin_notes TEXT", []);
+        let _ = conn.execute("ALTER TABLE activities ADD COLUMN is_pr INTEGER", []);
 
         for col_sql in [
             "ALTER TABLE days ADD COLUMN sleep_duration_sec INTEGER",
@@ -695,6 +707,16 @@ impl Database {
             "ALTER TABLE days ADD COLUMN hrv_weekly_avg INTEGER",
             "ALTER TABLE days ADD COLUMN hrv_baseline_low INTEGER",
             "ALTER TABLE days ADD COLUMN hrv_baseline_high INTEGER",
+            "ALTER TABLE days ADD COLUMN sleep_need_minutes INTEGER",
+            "ALTER TABLE days ADD COLUMN sleep_baseline_minutes INTEGER",
+            "ALTER TABLE days ADD COLUMN sleep_awake_count INTEGER",
+            "ALTER TABLE days ADD COLUMN sleep_avg_hr REAL",
+            "ALTER TABLE days ADD COLUMN sleep_stress REAL",
+            "ALTER TABLE days ADD COLUMN sleep_respiration_avg REAL",
+            "ALTER TABLE days ADD COLUMN sleep_respiration_low REAL",
+            "ALTER TABLE days ADD COLUMN sleep_respiration_high REAL",
+            "ALTER TABLE days ADD COLUMN sleep_quality TEXT",
+            "ALTER TABLE days ADD COLUMN hrv_last_night_5min_high INTEGER",
         ] {
             let _ = conn.execute(col_sql, []);
         }
@@ -984,6 +1006,7 @@ impl Database {
 
     pub fn upsert_activity(&self, act: &ActivityRecord) -> Result<(), StorageError> {
         let hyrox_int = act.is_hyrox.map(|b| if b { 1i64 } else { 0i64 });
+        let is_pr_int = act.is_pr.map(|b| if b { 1i64 } else { 0i64 });
         let post_run_json = act
             .post_run_context
             .as_ref()
@@ -992,8 +1015,8 @@ impl Database {
         self.conn.lock().unwrap().execute(
             "INSERT INTO activities (
                 garmin_id, name, type_key, start_iso, distance_m, duration_sec, moving_duration_sec,
-                elevation_gain_m, average_hr, max_hr, cadence_spm, training_load, shoe_name, is_hyrox, post_run_context_json, fit_temp_source, garmin_notes
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+                elevation_gain_m, average_hr, max_hr, cadence_spm, training_load, shoe_name, is_hyrox, post_run_context_json, fit_temp_source, garmin_notes, is_pr
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
             ON CONFLICT(garmin_id) DO UPDATE SET
                 name=excluded.name, type_key=excluded.type_key, start_iso=excluded.start_iso,
                 distance_m=excluded.distance_m, duration_sec=excluded.duration_sec,
@@ -1003,12 +1026,13 @@ impl Database {
                 is_hyrox=COALESCE(excluded.is_hyrox, activities.is_hyrox),
                 post_run_context_json=COALESCE(excluded.post_run_context_json, activities.post_run_context_json),
                 fit_temp_source=COALESCE(excluded.fit_temp_source, activities.fit_temp_source),
-                garmin_notes=COALESCE(excluded.garmin_notes, activities.garmin_notes)",
+                garmin_notes=COALESCE(excluded.garmin_notes, activities.garmin_notes),
+                is_pr=COALESCE(excluded.is_pr, activities.is_pr)",
             params![
                 act.garmin_id, act.name, act.type_key, act.start_iso, act.distance_m,
                 act.duration_sec, act.moving_duration_sec, act.elevation_gain_m,
                 act.average_hr, act.max_hr, act.cadence_spm, act.training_load, act.shoe_name,
-                hyrox_int, post_run_json, act.fit_temp_source, cleaned_notes
+                hyrox_int, post_run_json, act.fit_temp_source, cleaned_notes, is_pr_int
             ],
         )?;
         Ok(())
@@ -1018,12 +1042,13 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT garmin_id, name, type_key, start_iso, distance_m, duration_sec, moving_duration_sec,
-                    elevation_gain_m, average_hr, max_hr, cadence_spm, training_load, shoe_name, is_hyrox, post_run_context_json, fit_temp_source, garmin_notes
+                    elevation_gain_m, average_hr, max_hr, cadence_spm, training_load, shoe_name, is_hyrox, post_run_context_json, fit_temp_source, garmin_notes, is_pr
              FROM activities ORDER BY start_iso DESC LIMIT ?1",
         )?;
         let rows = stmt.query_map(params![limit as i64], |r| {
             let hyrox_opt: Option<i64> = r.get(13)?;
             let post_run_str: Option<String> = r.get(14)?;
+            let is_pr_opt: Option<i64> = r.get(17)?;
             Ok(ActivityRecord {
                 garmin_id: r.get(0)?,
                 name: r.get(1)?,
@@ -1042,6 +1067,7 @@ impl Database {
                 post_run_context: post_run_str.and_then(|s| serde_json::from_str(&s).ok()),
                 fit_temp_source: r.get(15)?,
                 garmin_notes: r.get(16)?,
+                is_pr: is_pr_opt.map(|v| v != 0),
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -1060,8 +1086,11 @@ impl Database {
                 body_battery_low, body_battery_charged, body_battery_drained, body_battery_series_json,
                 steps, step_goal, sleep_seconds, sleep_duration_sec, sleep_score,
                 sleep_start, sleep_end, sleep_deep_sec, sleep_light_sec, sleep_rem_sec, sleep_awake_sec,
-                hrv_last_night, hrv_status, hrv_weekly_avg, hrv_baseline_low, hrv_baseline_high
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)
+                hrv_last_night, hrv_status, hrv_weekly_avg, hrv_baseline_low, hrv_baseline_high,
+                sleep_need_minutes, sleep_baseline_minutes, sleep_awake_count, sleep_avg_hr, sleep_stress,
+                sleep_respiration_avg, sleep_respiration_low, sleep_respiration_high, sleep_quality,
+                hrv_last_night_5min_high
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35)
             ON CONFLICT(date) DO UPDATE SET
                 resting_hr=COALESCE(excluded.resting_hr, days.resting_hr),
                 stress_avg=COALESCE(excluded.stress_avg, days.stress_avg),
@@ -1086,7 +1115,17 @@ impl Database {
                 hrv_status=COALESCE(excluded.hrv_status, days.hrv_status),
                 hrv_weekly_avg=COALESCE(excluded.hrv_weekly_avg, days.hrv_weekly_avg),
                 hrv_baseline_low=COALESCE(excluded.hrv_baseline_low, days.hrv_baseline_low),
-                hrv_baseline_high=COALESCE(excluded.hrv_baseline_high, days.hrv_baseline_high)",
+                hrv_baseline_high=COALESCE(excluded.hrv_baseline_high, days.hrv_baseline_high),
+                sleep_need_minutes=COALESCE(excluded.sleep_need_minutes, days.sleep_need_minutes),
+                sleep_baseline_minutes=COALESCE(excluded.sleep_baseline_minutes, days.sleep_baseline_minutes),
+                sleep_awake_count=COALESCE(excluded.sleep_awake_count, days.sleep_awake_count),
+                sleep_avg_hr=COALESCE(excluded.sleep_avg_hr, days.sleep_avg_hr),
+                sleep_stress=COALESCE(excluded.sleep_stress, days.sleep_stress),
+                sleep_respiration_avg=COALESCE(excluded.sleep_respiration_avg, days.sleep_respiration_avg),
+                sleep_respiration_low=COALESCE(excluded.sleep_respiration_low, days.sleep_respiration_low),
+                sleep_respiration_high=COALESCE(excluded.sleep_respiration_high, days.sleep_respiration_high),
+                sleep_quality=COALESCE(excluded.sleep_quality, days.sleep_quality),
+                hrv_last_night_5min_high=COALESCE(excluded.hrv_last_night_5min_high, days.hrv_last_night_5min_high)",
             params![
                 day.date,
                 day.resting_hr,
@@ -1112,7 +1151,17 @@ impl Database {
                 day.hrv_status,
                 day.hrv_weekly_avg,
                 day.hrv_baseline_low,
-                day.hrv_baseline_high
+                day.hrv_baseline_high,
+                day.sleep_need_minutes,
+                day.sleep_baseline_minutes,
+                day.sleep_awake_count,
+                day.sleep_avg_hr,
+                day.sleep_stress,
+                day.sleep_respiration_avg,
+                day.sleep_respiration_low,
+                day.sleep_respiration_high,
+                day.sleep_quality,
+                day.hrv_last_night_5min_high
             ],
         )?;
         Ok(())
@@ -1125,7 +1174,10 @@ impl Database {
                     body_battery_low, body_battery_charged, body_battery_drained, body_battery_series_json,
                     steps, step_goal, sleep_seconds, sleep_duration_sec, sleep_score,
                     sleep_start, sleep_end, sleep_deep_sec, sleep_light_sec, sleep_rem_sec, sleep_awake_sec,
-                    hrv_last_night, hrv_status, hrv_weekly_avg, hrv_baseline_low, hrv_baseline_high
+                    hrv_last_night, hrv_status, hrv_weekly_avg, hrv_baseline_low, hrv_baseline_high,
+                    sleep_need_minutes, sleep_baseline_minutes, sleep_awake_count, sleep_avg_hr, sleep_stress,
+                    sleep_respiration_avg, sleep_respiration_low, sleep_respiration_high, sleep_quality,
+                    hrv_last_night_5min_high
              FROM days ORDER BY date DESC LIMIT ?1",
         )?;
         let rows = stmt.query_map(params![limit as i64], |r| {
@@ -1161,21 +1213,48 @@ impl Database {
                 hrv_weekly_avg: r.get(22)?,
                 hrv_baseline_low: r.get(23)?,
                 hrv_baseline_high: r.get(24)?,
+                sleep_need_minutes: r.get(25)?,
+                sleep_baseline_minutes: r.get(26)?,
+                sleep_awake_count: r.get(27)?,
+                sleep_avg_hr: r.get(28)?,
+                sleep_stress: r.get(29)?,
+                sleep_respiration_avg: r.get(30)?,
+                sleep_respiration_low: r.get(31)?,
+                sleep_respiration_high: r.get(32)?,
+                sleep_quality: r.get(33)?,
+                hrv_last_night_5min_high: r.get(34)?,
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
     pub fn get_daily_briefing(&self, date: &str) -> Result<Option<DailyBriefingRecord>, StorageError> {
+        self.get_scoped_briefing("", date)
+    }
+
+    pub fn upsert_daily_briefing(&self, briefing: &DailyBriefingRecord) -> Result<(), StorageError> {
+        self.upsert_scoped_briefing("", briefing)
+    }
+
+    pub fn get_scoped_briefing(
+        &self,
+        scope: &str,
+        date: &str,
+    ) -> Result<Option<DailyBriefingRecord>, StorageError> {
+        let key = if scope.is_empty() {
+            date.to_string()
+        } else {
+            format!("{scope}:{date}")
+        };
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT date, headline, body, action_cue, model_id, thinking_level, had_sleep, generated_at
              FROM briefings WHERE date = ?1 LIMIT 1",
         )?;
-        let mut rows = stmt.query_map(params![date], |r| {
+        let mut rows = stmt.query_map(params![key], |r| {
             let had_sleep_int: i64 = r.get(6)?;
             Ok(DailyBriefingRecord {
-                date: r.get(0)?,
+                date: date.to_string(),
                 headline: r.get(1)?,
                 body: r.get(2)?,
                 action_cue: r.get(3)?,
@@ -1191,7 +1270,16 @@ impl Database {
         }
     }
 
-    pub fn upsert_daily_briefing(&self, briefing: &DailyBriefingRecord) -> Result<(), StorageError> {
+    pub fn upsert_scoped_briefing(
+        &self,
+        scope: &str,
+        briefing: &DailyBriefingRecord,
+    ) -> Result<(), StorageError> {
+        let key = if scope.is_empty() {
+            briefing.date.clone()
+        } else {
+            format!("{scope}:{}", briefing.date)
+        };
         self.conn.lock().unwrap().execute(
             "INSERT INTO briefings (
                 date, headline, body, action_cue, model_id, thinking_level, had_sleep, generated_at
@@ -1205,7 +1293,7 @@ impl Database {
                 had_sleep = excluded.had_sleep,
                 generated_at = excluded.generated_at",
             params![
-                briefing.date,
+                key,
                 briefing.headline,
                 briefing.body,
                 briefing.action_cue,
@@ -1240,12 +1328,13 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT garmin_id, name, type_key, start_iso, distance_m, duration_sec, moving_duration_sec,
-                    elevation_gain_m, average_hr, max_hr, cadence_spm, training_load, shoe_name, is_hyrox, post_run_context_json, fit_temp_source, garmin_notes
+                    elevation_gain_m, average_hr, max_hr, cadence_spm, training_load, shoe_name, is_hyrox, post_run_context_json, fit_temp_source, garmin_notes, is_pr
              FROM activities WHERE garmin_id = ?1 LIMIT 1",
         )?;
         let mut rows = stmt.query_map(params![garmin_id], |r| {
             let hyrox_opt: Option<i64> = r.get(13)?;
             let post_run_str: Option<String> = r.get(14)?;
+            let is_pr_opt: Option<i64> = r.get(17)?;
             Ok(ActivityRecord {
                 garmin_id: r.get(0)?,
                 name: r.get(1)?,
@@ -1264,6 +1353,7 @@ impl Database {
                 post_run_context: post_run_str.and_then(|s| serde_json::from_str(&s).ok()),
                 fit_temp_source: r.get(15)?,
                 garmin_notes: r.get(16)?,
+                is_pr: is_pr_opt.map(|v| v != 0),
             })
         })?;
         match rows.next() {
@@ -1299,5 +1389,415 @@ impl Database {
             }
             None => Ok(None),
         }
+    }
+
+    pub fn compute_personal_records(&self) -> Result<RecordsPayload, StorageError> {
+        let activities = self.list_activities(10_000)?;
+        let mut tracks_map: HashMap<i64, Vec<FitTrackPoint>> = HashMap::new();
+        {
+            let conn = self.conn.lock().unwrap();
+            let mut stmt = conn.prepare("SELECT garmin_id, track_json FROM fit_tracks")?;
+            let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+            for row in rows.flatten() {
+                if let Ok(parsed) = serde_json::from_str::<FitTrackAnalysis>(&row.1) {
+                    if !parsed.full_points.is_empty() {
+                        tracks_map.insert(row.0, parsed.full_points);
+                    }
+                }
+            }
+        }
+
+        const STANDARD_DISTANCES: [(&str, f64); 5] = [
+            ("1K", 1_000.0),
+            ("5K", 5_000.0),
+            ("10K", 10_000.0),
+            ("Half Marathon", 21_097.5),
+            ("Marathon", 42_195.0),
+        ];
+
+        let mut efforts: Vec<DistanceRecordEntry> = Vec::new();
+        let mut total_outdoor_runs = 0usize;
+        let mut scanned_fit_runs = 0usize;
+
+        for a in &activities {
+            if !is_outdoor_run(a) || a.distance_m < 1_000.0 {
+                continue;
+            }
+            total_outdoor_runs += 1;
+            let date_str = a.start_iso.get(..10).unwrap_or(&a.start_iso).to_string();
+            let display_name = if a.name.trim().is_empty() {
+                a.type_key.clone()
+            } else {
+                a.name.clone()
+            };
+
+            if let Some(points) = tracks_map.get(&a.garmin_id).filter(|p| p.len() >= 10) {
+                scanned_fit_runs += 1;
+                let max_track_dist = points.last().map(|p| p.distance_m).unwrap_or(0.0);
+                for &(label, target_m) in &STANDARD_DISTANCES {
+                    if max_track_dist < target_m {
+                        continue;
+                    }
+                    if let Some((best_sec, seg_hr)) = fastest_stretch_in_points(points, target_m) {
+                        efforts.push(DistanceRecordEntry {
+                            label: label.to_string(),
+                            distance_m: target_m,
+                            time_sec: best_sec,
+                            pace_sec_per_km: best_sec / (target_m / 1000.0),
+                            date: date_str.clone(),
+                            activity_id: a.garmin_id,
+                            activity_name: display_name.clone(),
+                            average_hr: seg_hr.or(a.average_hr),
+                            source: "fit_best_stretch".to_string(),
+                        });
+                    }
+                }
+            } else {
+                let active_sec = if a.moving_duration_sec > 0.0 {
+                    a.moving_duration_sec
+                } else {
+                    a.duration_sec
+                };
+                if active_sec <= 0.0 || a.distance_m <= 0.0 {
+                    continue;
+                }
+                for &(label, target_m) in &STANDARD_DISTANCES {
+                    if a.distance_m < target_m * 0.99 {
+                        continue;
+                    }
+                    let scaled_sec = active_sec * (target_m / a.distance_m);
+                    if plausible_run_effort(target_m, scaled_sec) {
+                        efforts.push(DistanceRecordEntry {
+                            label: label.to_string(),
+                            distance_m: target_m,
+                            time_sec: scaled_sec,
+                            pace_sec_per_km: scaled_sec / (target_m / 1000.0),
+                            date: date_str.clone(),
+                            activity_id: a.garmin_id,
+                            activity_name: display_name.clone(),
+                            average_hr: a.average_hr,
+                            source: "activity_average".to_string(),
+                        });
+                    }
+                }
+            }
+        }
+
+        let mut distance_records = Vec::new();
+        for &(label, _) in &STANDARD_DISTANCES {
+            if let Some(best) = efforts
+                .iter()
+                .filter(|e| e.label == label)
+                .min_by(|a, b| a.time_sec.total_cmp(&b.time_sec))
+            {
+                distance_records.push(best.clone());
+            }
+        }
+
+        // Yearly bests matrix
+        let mut by_year: HashMap<i32, HashMap<String, DistanceRecordEntry>> = HashMap::new();
+        for e in &efforts {
+            if let Some(year) = e.date.get(..4).and_then(|y| y.parse::<i32>().ok()) {
+                let year_map = by_year.entry(year).or_default();
+                let replace = match year_map.get(&e.label) {
+                    Some(cur) => e.time_sec < cur.time_sec,
+                    None => true,
+                };
+                if replace {
+                    year_map.insert(e.label.clone(), e.clone());
+                }
+            }
+        }
+        let mut yearly_bests: Vec<YearlyDistanceBest> = by_year
+            .into_iter()
+            .map(|(year, bests)| YearlyDistanceBest { year, bests })
+            .collect();
+        yearly_bests.sort_by(|a, b| b.year.cmp(&a.year));
+
+        // Riegel race predictions from efforts >= 5K in last 4 months (fallback 12 months)
+        let today = Local::now().date_naive();
+        let cutoff_4m = (today - Duration::days(122)).format("%Y-%m-%d").to_string();
+        let cutoff_12m = (today - Duration::days(365)).format("%Y-%m-%d").to_string();
+        let mut pred_window_months = 4;
+        let mut pred_sources: Vec<&DistanceRecordEntry> = efforts
+            .iter()
+            .filter(|e| e.distance_m >= 5_000.0 && e.date >= cutoff_4m)
+            .collect();
+        if pred_sources.is_empty() {
+            pred_window_months = 12;
+            pred_sources = efforts
+                .iter()
+                .filter(|e| e.distance_m >= 5_000.0 && e.date >= cutoff_12m)
+                .collect();
+        }
+        let mut predictions = Vec::new();
+        const PRED_TARGETS: [(&str, f64); 4] = [
+            ("5K", 5_000.0),
+            ("10K", 10_000.0),
+            ("Half Marathon", 21_097.5),
+            ("Marathon", 42_195.0),
+        ];
+        for &(t_label, t_dist) in &PRED_TARGETS {
+            let best_pred = pred_sources
+                .iter()
+                .filter(|s| s.distance_m >= t_dist / 4.0)
+                .map(|s| {
+                    let predicted = s.time_sec * (t_dist / s.distance_m).powf(1.06);
+                    (*s, predicted)
+                })
+                .min_by(|a, b| a.1.total_cmp(&b.1));
+            if let Some((src, pred_sec)) = best_pred {
+                predictions.push(RacePredictionEntry {
+                    label: t_label.to_string(),
+                    distance_m: t_dist,
+                    predicted_sec: pred_sec,
+                    pace_sec_per_km: pred_sec / (t_dist / 1000.0),
+                    source_label: src.label.clone(),
+                    source_time_sec: src.time_sec,
+                    source_date: src.date.clone(),
+                    source_activity_id: src.activity_id,
+                });
+            }
+        }
+
+        // Volume & elevation milestones
+        let mut milestones = Vec::new();
+        let runs: Vec<&ActivityRecord> = activities
+            .iter()
+            .filter(|a| a.type_key.to_lowercase().contains("run") && a.distance_m > 0.0)
+            .collect();
+        if let Some(longest) = runs.iter().max_by(|a, b| a.distance_m.total_cmp(&b.distance_m)) {
+            let active = if longest.moving_duration_sec > 0.0 {
+                longest.moving_duration_sec
+            } else {
+                longest.duration_sec
+            };
+            milestones.push(MilestoneRecordEntry {
+                key: "longest_run".to_string(),
+                label: "Longest Run".to_string(),
+                value_display: format!("{:.2} km", longest.distance_m / 1000.0),
+                value_num: longest.distance_m / 1000.0,
+                date: longest.start_iso.get(..10).unwrap_or("").to_string(),
+                activity_id: Some(longest.garmin_id),
+                activity_name: Some(if longest.name.trim().is_empty() {
+                    longest.type_key.clone()
+                } else {
+                    longest.name.clone()
+                }),
+                average_hr: longest.average_hr,
+                pace_sec_per_km: if longest.distance_m > 0.0 && active > 0.0 {
+                    Some(active / (longest.distance_m / 1000.0))
+                } else {
+                    None
+                },
+            });
+        }
+
+        if let Some(climb) = activities
+            .iter()
+            .filter(|a| !is_indoor_activity(&a.type_key) && a.elevation_gain_m > 0.0)
+            .max_by(|a, b| a.elevation_gain_m.total_cmp(&b.elevation_gain_m))
+        {
+            milestones.push(MilestoneRecordEntry {
+                key: "biggest_elevation".to_string(),
+                label: "Biggest Elevation Gain".to_string(),
+                value_display: format!("{} m", climb.elevation_gain_m.round() as i64),
+                value_num: climb.elevation_gain_m,
+                date: climb.start_iso.get(..10).unwrap_or("").to_string(),
+                activity_id: Some(climb.garmin_id),
+                activity_name: Some(if climb.name.trim().is_empty() {
+                    climb.type_key.clone()
+                } else {
+                    climb.name.clone()
+                }),
+                average_hr: climb.average_hr,
+                pace_sec_per_km: None,
+            });
+        }
+
+        let mut weekly_run_km: HashMap<(i32, u32), (f64, NaiveDate)> = HashMap::new();
+        for r in &runs {
+            if let Some(d_str) = r.start_iso.get(..10) {
+                if let Ok(nd) = NaiveDate::parse_from_str(d_str, "%Y-%m-%d") {
+                    let iso = nd.iso_week();
+                    let week_monday =
+                        NaiveDate::from_isoywd_opt(iso.year(), iso.week(), chrono::Weekday::Mon)
+                            .unwrap_or(nd);
+                    let entry = weekly_run_km
+                        .entry((iso.year(), iso.week()))
+                        .or_insert((0.0, week_monday));
+                    entry.0 += r.distance_m / 1000.0;
+                }
+            }
+        }
+        if let Some((_, (best_km, week_start))) = weekly_run_km
+            .into_iter()
+            .max_by(|a, b| a.1 .0.total_cmp(&b.1 .0))
+        {
+            milestones.push(MilestoneRecordEntry {
+                key: "highest_weekly_km".to_string(),
+                label: "Highest Weekly Running Volume".to_string(),
+                value_display: format!("{best_km:.1} km"),
+                value_num: best_km,
+                date: week_start.format("%Y-%m-%d").to_string(),
+                activity_id: None,
+                activity_name: Some(format!("Week of {}", week_start.format("%Y-%m-%d"))),
+                average_hr: None,
+                pace_sec_per_km: None,
+            });
+        }
+
+        if let Some(long_sess) = activities.iter().max_by(|a, b| {
+            let da = if a.moving_duration_sec > 0.0 { a.moving_duration_sec } else { a.duration_sec };
+            let db_sec = if b.moving_duration_sec > 0.0 { b.moving_duration_sec } else { b.duration_sec };
+            da.total_cmp(&db_sec)
+        }) {
+            let sec = if long_sess.moving_duration_sec > 0.0 {
+                long_sess.moving_duration_sec
+            } else {
+                long_sess.duration_sec
+            };
+            if sec > 0.0 {
+                milestones.push(MilestoneRecordEntry {
+                    key: "longest_session".to_string(),
+                    label: "Longest Session".to_string(),
+                    value_display: format_hms(sec),
+                    value_num: sec,
+                    date: long_sess.start_iso.get(..10).unwrap_or("").to_string(),
+                    activity_id: Some(long_sess.garmin_id),
+                    activity_name: Some(if long_sess.name.trim().is_empty() {
+                        long_sess.type_key.clone()
+                    } else {
+                        long_sess.name.clone()
+                    }),
+                    average_hr: long_sess.average_hr,
+                    pace_sec_per_km: None,
+                });
+            }
+        }
+
+        if let Some(hardest) = activities
+            .iter()
+            .filter(|a| a.training_load.unwrap_or(0.0) > 0.0)
+            .max_by(|a, b| {
+                a.training_load
+                    .unwrap_or(0.0)
+                    .total_cmp(&b.training_load.unwrap_or(0.0))
+            })
+        {
+            if let Some(load) = hardest.training_load {
+                milestones.push(MilestoneRecordEntry {
+                    key: "hardest_effort".to_string(),
+                    label: "Hardest Effort".to_string(),
+                    value_display: format!("Load {}", load.round() as i64),
+                    value_num: load,
+                    date: hardest.start_iso.get(..10).unwrap_or("").to_string(),
+                    activity_id: Some(hardest.garmin_id),
+                    activity_name: Some(if hardest.name.trim().is_empty() {
+                        hardest.type_key.clone()
+                    } else {
+                        hardest.name.clone()
+                    }),
+                    average_hr: hardest.average_hr,
+                    pace_sec_per_km: None,
+                });
+            }
+        }
+
+        let pr_activities: Vec<ActivityRecord> = activities
+            .into_iter()
+            .filter(|a| a.is_pr == Some(true))
+            .collect();
+
+        Ok(RecordsPayload {
+            distance_records,
+            milestones,
+            predictions,
+            prediction_window_months: pred_window_months,
+            yearly_bests,
+            pr_activities,
+            total_outdoor_runs,
+            scanned_fit_runs,
+        })
+    }
+}
+
+fn is_indoor_activity(type_key: &str) -> bool {
+    let lower = type_key.to_lowercase();
+    lower.contains("treadmill") || lower.contains("indoor") || lower.contains("virtual")
+}
+
+fn is_outdoor_run(a: &ActivityRecord) -> bool {
+    let lower = a.type_key.to_lowercase();
+    lower.contains("run") && !is_indoor_activity(&lower)
+}
+
+fn plausible_run_effort(distance_m: f64, sec: f64) -> bool {
+    if sec <= 0.0 || distance_m <= 0.0 {
+        return false;
+    }
+    let speed_mps = distance_m / sec;
+    speed_mps > 1.0 && speed_mps < 6.7
+}
+
+fn fastest_stretch_in_points(points: &[FitTrackPoint], target_m: f64) -> Option<(f64, Option<f64>)> {
+    if points.len() < 2 || target_m <= 0.0 {
+        return None;
+    }
+    let mut best_sec: Option<f64> = None;
+    let mut best_range: Option<(usize, usize)> = None;
+    let mut j = 0usize;
+
+    for i in 0..points.len() {
+        let start_d = points[i].distance_m;
+        while j < points.len() && (points[j].distance_m - start_d) < target_m {
+            j += 1;
+        }
+        if j >= points.len() {
+            break;
+        }
+        let end_d = points[j].distance_m - start_d;
+        let dt = if j > i && end_d > target_m {
+            let prev_d = points[j - 1].distance_m - start_d;
+            let seg_d = points[j].distance_m - points[j - 1].distance_m;
+            if seg_d > 0.0 && target_m >= prev_d {
+                let frac = ((target_m - prev_d) / seg_d).clamp(0.0, 1.0);
+                let interp_ts = points[j - 1].timestamp_sec
+                    + frac * (points[j].timestamp_sec - points[j - 1].timestamp_sec);
+                interp_ts - points[i].timestamp_sec
+            } else {
+                points[j].timestamp_sec - points[i].timestamp_sec
+            }
+        } else {
+            points[j].timestamp_sec - points[i].timestamp_sec
+        };
+
+        if plausible_run_effort(target_m, dt) && best_sec.map_or(true, |b| dt < b) {
+            best_sec = Some(dt);
+            best_range = Some((i, j));
+        }
+    }
+
+    let sec = best_sec?;
+    let avg_hr = best_range.and_then(|(s, e)| {
+        let hrs: Vec<f64> = points[s..=e].iter().filter_map(|p| p.heart_rate_bpm).collect();
+        if hrs.is_empty() {
+            None
+        } else {
+            Some(hrs.iter().sum::<f64>() / hrs.len() as f64)
+        }
+    });
+    Some((sec, avg_hr))
+}
+
+fn format_hms(sec: f64) -> String {
+    let total = sec.round().max(0.0) as i64;
+    let h = total / 3600;
+    let m = (total % 3600) / 60;
+    let s = total % 60;
+    if h > 0 {
+        format!("{h}:{m:02}:{s:02}")
+    } else {
+        format!("{m}:{s:02}")
     }
 }

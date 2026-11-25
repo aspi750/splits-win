@@ -1155,6 +1155,154 @@ async fn get_or_generate_daily_briefing(
 }
 
 #[tauri::command]
+fn get_analytics_dataset(state: State<'_, AppState>) -> Result<AnalyticsDatasetPayload, String> {
+    let db = state.open_db()?;
+    let activities = db.list_activities(10_000).map_err(|e| e.to_string())?;
+    let days = db.list_days(1_500).map_err(|e| e.to_string())?;
+    Ok(AnalyticsDatasetPayload { activities, days })
+}
+
+#[tauri::command]
+fn get_records_summary(state: State<'_, AppState>) -> Result<RecordsPayload, String> {
+    let db = state.open_db()?;
+    db.compute_personal_records().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn get_cached_health_takes(state: State<'_, AppState>) -> Result<CachedHealthTakes, String> {
+    let db = state.open_db()?;
+    let days = db.list_days(90).map_err(|e| e.to_string())?;
+    let latest_sleep_date = days
+        .iter()
+        .find(|d| d.sleep_seconds.or(d.sleep_duration_sec).unwrap_or(0) > 0)
+        .map(|d| d.date.clone());
+    let latest_hrv_date = days
+        .iter()
+        .find(|d| d.hrv_last_night.unwrap_or(0) > 0)
+        .map(|d| d.date.clone());
+
+    let sleep_take = match latest_sleep_date {
+        Some(ref date) => db.get_scoped_briefing("sleep_take", date).ok().flatten(),
+        None => None,
+    };
+    let hrv_take = match latest_hrv_date {
+        Some(ref date) => db.get_scoped_briefing("hrv_take", date).ok().flatten(),
+        None => None,
+    };
+    Ok(CachedHealthTakes {
+        sleep_take,
+        hrv_take,
+    })
+}
+
+#[tauri::command]
+async fn get_or_generate_sleep_take(
+    state: State<'_, AppState>,
+    force_refresh: Option<bool>,
+) -> Result<DailyBriefingRecord, String> {
+    let store = state.load_store()?;
+    let db = state.open_db()?;
+    let days = db.list_days(90).map_err(|e| e.to_string())?;
+    let latest_night = days
+        .iter()
+        .find(|d| d.sleep_seconds.or(d.sleep_duration_sec).unwrap_or(0) > 0)
+        .map(|d| d.date.clone())
+        .ok_or_else(|| "No sleep nights synced yet.".to_string())?;
+
+    if !force_refresh.unwrap_or(false) {
+        if let Some(cached) = db
+            .get_scoped_briefing("sleep_take", &latest_night)
+            .map_err(|e| e.to_string())?
+        {
+            return Ok(cached);
+        }
+    }
+
+    let api_key = CredentialStore::read_gemini_key()
+        .ok_or_else(|| "Gemini API key required to generate Sleep Take.".to_string())?;
+    let config = store
+        .load_athlete_config()
+        .map_err(|e| e.to_string())?
+        .unwrap_or_default();
+    let model_settings = db.load_model_settings().unwrap_or_default();
+    let take = coach::generate_health_take(
+        "sleep_take",
+        &api_key,
+        &store,
+        &config,
+        &[],
+        &days,
+        &model_settings,
+        &latest_night,
+        Local::now().date_naive(),
+    )
+    .await?;
+    db.upsert_scoped_briefing("sleep_take", &take)
+        .map_err(|e| e.to_string())?;
+    Ok(take)
+}
+
+#[tauri::command]
+async fn get_or_generate_hrv_take(
+    state: State<'_, AppState>,
+    force_refresh: Option<bool>,
+) -> Result<DailyBriefingRecord, String> {
+    let store = state.load_store()?;
+    let db = state.open_db()?;
+    let days = db.list_days(400).map_err(|e| e.to_string())?;
+    let latest_hrv_date = days
+        .iter()
+        .find(|d| d.hrv_last_night.unwrap_or(0) > 0)
+        .map(|d| d.date.clone())
+        .ok_or_else(|| "No HRV nights synced yet.".to_string())?;
+
+    if !force_refresh.unwrap_or(false) {
+        if let Some(cached) = db
+            .get_scoped_briefing("hrv_take", &latest_hrv_date)
+            .map_err(|e| e.to_string())?
+        {
+            return Ok(cached);
+        }
+    }
+
+    let api_key = CredentialStore::read_gemini_key()
+        .ok_or_else(|| "Gemini API key required to generate HRV Take.".to_string())?;
+    let config = store
+        .load_athlete_config()
+        .map_err(|e| e.to_string())?
+        .unwrap_or_default();
+    let activities = db.list_activities(500).map_err(|e| e.to_string())?;
+    let model_settings = db.load_model_settings().unwrap_or_default();
+    let take = coach::generate_health_take(
+        "hrv_take",
+        &api_key,
+        &store,
+        &config,
+        &activities,
+        &days,
+        &model_settings,
+        &latest_hrv_date,
+        Local::now().date_naive(),
+    )
+    .await?;
+    db.upsert_scoped_briefing("hrv_take", &take)
+        .map_err(|e| e.to_string())?;
+    Ok(take)
+}
+
+#[tauri::command]
+async fn get_night_hrv_readings(date: String) -> Result<NightHrvDetail, String> {
+    if CredentialStore::read_garmin_key().is_none() {
+        return Ok(NightHrvDetail {
+            date,
+            ..Default::default()
+        });
+    }
+    let client = garmin::GarminClient::new(None);
+    client.fetch_hrv_night(&date).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 fn import_training_ledger(state: State<'_, AppState>, source_path: String) -> Result<usize, String> {
     let store = state.load_store()?;
     let raw = std::fs::read_to_string(&source_path).map_err(|e| e.to_string())?;
@@ -1252,6 +1400,12 @@ pub fn run() {
             import_training_ledger,
             export_training_ledger,
             get_or_generate_daily_briefing,
+            get_analytics_dataset,
+            get_records_summary,
+            get_cached_health_takes,
+            get_or_generate_sleep_take,
+            get_or_generate_hrv_take,
+            get_night_hrv_readings,
             refresh_today_body_battery,
             get_plan_file,
             save_plan_envelope,

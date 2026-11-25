@@ -262,6 +262,7 @@ export interface ActivityRecord {
   post_run_context?: PostRunContext | null;
   fit_temp_source?: string | null;
   garmin_notes?: string | null;
+  is_pr?: boolean | null;
 }
 
 export type ThemeMode = "system" | "dark" | "light";
@@ -297,6 +298,16 @@ export interface DayRecord {
   hrv_weekly_avg: number | null;
   hrv_baseline_low: number | null;
   hrv_baseline_high: number | null;
+  sleep_need_minutes?: number | null;
+  sleep_baseline_minutes?: number | null;
+  sleep_awake_count?: number | null;
+  sleep_avg_hr?: number | null;
+  sleep_stress?: number | null;
+  sleep_respiration_avg?: number | null;
+  sleep_respiration_low?: number | null;
+  sleep_respiration_high?: number | null;
+  sleep_quality?: string | null;
+  hrv_last_night_5min_high?: number | null;
 }
 
 export interface DailyBriefingRecord {
@@ -574,4 +585,80 @@ export interface FitBaselineProbe {
 export interface ActivityDetailPayload {
   activity: ActivityRecord;
   track: FitTrackAnalysis | null;
+}
+
+export interface NightHrvReading {
+  timestamp_iso: string;
+  timestamp_ms: number;
+  value_ms: number;
+}
+
+export interface NightHrvDetail {
+  date: string;
+  readings: NightHrvReading[];
+  last_night_avg: number | null;
+  last_night_5min_high: number | null;
+  baseline_low: number | null;
+  baseline_high: number | null;
+}
+
+export interface DistanceRecordEntry {
+  label: string;
+  distance_m: number;
+  time_sec: number;
+  pace_sec_per_km: number;
+  date: string;
+  activity_id: number;
+  activity_name: string;
+  average_hr: number | null;
+  source: string;
+}
+
+export interface MilestoneRecordEntry {
+  key: string;
+  label: string;
+  value_display: string;
+  value_num: number;
+  date: string;
+  activity_id: number | null;
+  activity_name: string | null;
+  average_hr: number | null;
+  pace_sec_per_km: number | null;
+}
+
+export interface RacePredictionEntry {
+  label: string;
+  distance_m: number;
+  predicted_sec: number;
+  pace_sec_per_km: number;
+  source_label: string;
+  source_time_sec: number;
+  source_date: string;
+  source_activity_id: number;
+}
+
+export interface YearlyDistanceBest {
+  year: number;
+  bests: Record<string, DistanceRecordEntry>;
+}
+
+export interface RecordsPayload {
+  distance_records: DistanceRecordEntry[];
+  milestones: MilestoneRecordEntry[];
+  predictions: RacePredictionEntry[];
+  prediction_window_months: number;
+  yearly_bests: YearlyDistanceBest[];
+  pr_activities: ActivityRecord[];
+  total_outdoor_runs: number;
+  scanned_fit_runs: number;
+}
+
+export interface AnalyticsDatasetPayload {
+  activities: ActivityRecord[];
+  days: DayRecord[];
+}
+
+export interface CachedHealthTakes {
+  sleep_take: DailyBriefingRecord | null;
+  hrv_take: DailyBriefingRecord | null;
 }

@@ -12,11 +12,14 @@ import {
   Check,
   ChevronDown,
   Clipboard,
+  Compass,
   Download,
   Eye,
   EyeOff,
   FileText,
+  HeartPulse,
   MessageSquare,
+  Moon,
   MoreHorizontal,
   RefreshCw,
   Settings,
@@ -24,9 +27,17 @@ import {
   SquarePen,
   Sun,
   Trash2,
+  TrendingUp,
+  Trophy,
   Upload,
 } from "lucide-react";
+import { ErrorBoundary } from "./components/ErrorBoundary";
+import { ExplorerView } from "./components/ExplorerView";
+import { HRVView } from "./components/HRVView";
 import { OnboardingWizard } from "./components/OnboardingWizard";
+import { RecordsView } from "./components/RecordsView";
+import { SleepView } from "./components/SleepView";
+import { TrendsView } from "./components/TrendsView";
 import {
   RACE_DISTANCE_PRESETS,
   parseValidHrBpm,
@@ -35,10 +46,12 @@ import {
   sanitizeHrInput,
   type ActivityDetailPayload,
   type ActivityRecord,
+  type AnalyticsDatasetPayload,
   type AthleteConfig,
   type AthleteType,
   type BodyBatteryPoint,
   type BootstrapState,
+  type CachedHealthTakes,
   type CoachUpdateProposal,
   type DailyBriefingRecord,
   type DayRecord,
@@ -50,13 +63,34 @@ import {
   type PlanFile,
   type PostRunContext,
   type RaceDistancePreset,
+  type RecordsPayload,
   type ThemeMode,
   type ThinkingLevel,
   type TrainingDiscipline,
   type UserProfile,
 } from "./types";
 
-type NavTab = "today" | "activities" | "coach" | "settings";
+type NavTab =
+  | "today"
+  | "activities"
+  | "trends"
+  | "sleep"
+  | "hrv"
+  | "records"
+  | "explorer"
+  | "coach"
+  | "settings";
+
+const SIDEBAR_TABS: NavTab[] = [
+  "today",
+  "activities",
+  "trends",
+  "sleep",
+  "hrv",
+  "records",
+  "explorer",
+  "coach",
+];
 
 interface ChatMessage {
   role: "user" | "assistant";
@@ -330,7 +364,15 @@ export default function App() {
   const [showModelPopover, setShowModelPopover] = useState(false);
 
   const [selectedActivity, setSelectedActivity] = useState<ActivityDetailPayload | null>(null);
+  const [detailReturnTab, setDetailReturnTab] = useState<NavTab>("activities");
   const [loadingDetail, setLoadingDetail] = useState(false);
+  const [analyticsData, setAnalyticsData] = useState<AnalyticsDatasetPayload | null>(null);
+  const [analyticsLoading, setAnalyticsLoading] = useState(false);
+  const [recordsData, setRecordsData] = useState<RecordsPayload | null>(null);
+  const [recordsLoading, setRecordsLoading] = useState(false);
+  const [recordsError, setRecordsError] = useState<string | null>(null);
+  const [sleepTake, setSleepTake] = useState<DailyBriefingRecord | null>(null);
+  const [hrvTake, setHrvTake] = useState<DailyBriefingRecord | null>(null);
 
   const [draftConfig, setDraftConfig] = useState<AthleteConfig | null>(null);
   const [draftProfile, setDraftProfile] = useState<UserProfile | null>(null);
@@ -358,7 +400,7 @@ export default function App() {
   const [confirmCleanSlate, setConfirmCleanSlate] = useState(false);
   const [cleanSlateBusy, setCleanSlateBusy] = useState(false);
 
-  const [appVersion, setAppVersion] = useState<string>("0.2.4.1-beta");
+  const [appVersion, setAppVersion] = useState<string>("0.2.5-beta");
   const [bootstrapError, setBootstrapError] = useState<string | null>(null);
   const [themeMode, setThemeMode] = useState<ThemeMode>(() => {
     try {
@@ -530,14 +572,88 @@ export default function App() {
 
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
-      if ((e.ctrlKey || e.metaKey) && e.key === ",") {
+      if (!(e.ctrlKey || e.metaKey)) return;
+      if (e.key === ",") {
         e.preventDefault();
         setTab("settings");
+        return;
+      }
+      const num = Number(e.key);
+      if (Number.isInteger(num) && num >= 1 && num <= SIDEBAR_TABS.length) {
+        e.preventDefault();
+        const nextTab = SIDEBAR_TABS[num - 1];
+        if (nextTab === "activities") {
+          setSelectedActivity(null);
+        }
+        setTab(nextTab);
       }
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
   }, []);
+
+  useEffect(() => {
+    if (!state || state.settings.profile_onboarded === false) return;
+    if (
+      (tab === "trends" || tab === "sleep" || tab === "hrv" || tab === "explorer") &&
+      !analyticsData &&
+      !analyticsLoading
+    ) {
+      let cancelled = false;
+      setAnalyticsLoading(true);
+      void invoke<AnalyticsDatasetPayload>("get_analytics_dataset")
+        .then((res) => {
+          if (!cancelled) setAnalyticsData(res);
+        })
+        .catch(() => {
+          // Falls back to bootstrap activities/days if lazy fetch fails
+        })
+        .finally(() => {
+          if (!cancelled) setAnalyticsLoading(false);
+        });
+      return () => {
+        cancelled = true;
+      };
+    }
+  }, [state, tab, analyticsData, analyticsLoading]);
+
+  useEffect(() => {
+    if (!state || state.settings.profile_onboarded === false) return;
+    if (tab !== "sleep" && tab !== "hrv") return;
+    if (sleepTake && hrvTake) return;
+    let cancelled = false;
+    void invoke<CachedHealthTakes>("get_cached_health_takes")
+      .then((res) => {
+        if (cancelled) return;
+        if (res.sleep_take) setSleepTake(res.sleep_take);
+        if (res.hrv_take) setHrvTake(res.hrv_take);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [state, tab, sleepTake, hrvTake]);
+
+  useEffect(() => {
+    if (!state || state.settings.profile_onboarded === false) return;
+    if (tab !== "records" || recordsData || recordsLoading) return;
+    let cancelled = false;
+    setRecordsLoading(true);
+    setRecordsError(null);
+    void invoke<RecordsPayload>("get_records_summary")
+      .then((res) => {
+        if (!cancelled) setRecordsData(res);
+      })
+      .catch((err) => {
+        if (!cancelled) setRecordsError(err instanceof Error ? err.message : String(err));
+      })
+      .finally(() => {
+        if (!cancelled) setRecordsLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [state, tab, recordsData, recordsLoading]);
 
   useEffect(() => {
     const unlistenDelta = listen<{ delta: string }>("coach:delta", (event) => {
@@ -1079,6 +1195,7 @@ export default function App() {
   }
 
   async function openActivityDetail(activity: ActivityRecord) {
+    setDetailReturnTab("activities");
     setLoadingDetail(true);
     try {
       const detail = await invoke<ActivityDetailPayload>("get_activity_detail", {
@@ -1087,6 +1204,33 @@ export default function App() {
       setSelectedActivity(detail);
     } finally {
       setLoadingDetail(false);
+    }
+  }
+
+  async function openActivityById(activityId: number, fromTab: NavTab) {
+    setDetailReturnTab(fromTab);
+    setLoadingDetail(true);
+    setTab("activities");
+    try {
+      const detail = await invoke<ActivityDetailPayload>("get_activity_detail", {
+        activityId,
+      });
+      setSelectedActivity(detail);
+    } finally {
+      setLoadingDetail(false);
+    }
+  }
+
+  async function refreshRecordsSummary() {
+    setRecordsLoading(true);
+    setRecordsError(null);
+    try {
+      const res = await invoke<RecordsPayload>("get_records_summary");
+      setRecordsData(res);
+    } catch (err) {
+      setRecordsError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setRecordsLoading(false);
     }
   }
 
@@ -1319,7 +1463,9 @@ export default function App() {
       <aside className="sidebar">
         <h1>Splits Coach</h1>
         <button className={`nav-btn ${tab === "today" ? "active" : ""}`} onClick={() => setTab("today")}>
-          <Sun size={16} /> Today
+          <Sun size={16} />
+          <span>Today</span>
+          <span className="nav-shortcut">Ctrl+1</span>
         </button>
         <button
           className={`nav-btn ${tab === "activities" ? "active" : ""}`}
@@ -1328,10 +1474,39 @@ export default function App() {
             setTab("activities");
           }}
         >
-          <Activity size={16} /> Activities
+          <Activity size={16} />
+          <span>Activities</span>
+          <span className="nav-shortcut">Ctrl+2</span>
+        </button>
+        <button className={`nav-btn ${tab === "trends" ? "active" : ""}`} onClick={() => setTab("trends")}>
+          <TrendingUp size={16} />
+          <span>Trends</span>
+          <span className="nav-shortcut">Ctrl+3</span>
+        </button>
+        <button className={`nav-btn ${tab === "sleep" ? "active" : ""}`} onClick={() => setTab("sleep")}>
+          <Moon size={16} />
+          <span>Sleep</span>
+          <span className="nav-shortcut">Ctrl+4</span>
+        </button>
+        <button className={`nav-btn ${tab === "hrv" ? "active" : ""}`} onClick={() => setTab("hrv")}>
+          <HeartPulse size={16} />
+          <span>HRV</span>
+          <span className="nav-shortcut">Ctrl+5</span>
+        </button>
+        <button className={`nav-btn ${tab === "records" ? "active" : ""}`} onClick={() => setTab("records")}>
+          <Trophy size={16} />
+          <span>Records</span>
+          <span className="nav-shortcut">Ctrl+6</span>
+        </button>
+        <button className={`nav-btn ${tab === "explorer" ? "active" : ""}`} onClick={() => setTab("explorer")}>
+          <Compass size={16} />
+          <span>Explorer</span>
+          <span className="nav-shortcut">Ctrl+7</span>
         </button>
         <button className={`nav-btn ${tab === "coach" ? "active" : ""}`} onClick={() => setTab("coach")}>
-          <MessageSquare size={16} /> Coach
+          <MessageSquare size={16} />
+          <span>Coach</span>
+          <span className="nav-shortcut">Ctrl+8</span>
         </button>
         <div
           style={{
@@ -1349,7 +1524,7 @@ export default function App() {
           >
             <Settings size={16} />
             <span>Settings</span>
-            <span className="muted" style={{ marginLeft: "auto", fontSize: 11 }}>Ctrl+,</span>
+            <span className="nav-shortcut">Ctrl+,</span>
           </button>
           <button
             className="secondary"
@@ -1359,6 +1534,10 @@ export default function App() {
               setBusy(true);
               try {
                 await invoke("sync_garmin_now");
+                setAnalyticsData(null);
+                setRecordsData(null);
+                setSleepTake(null);
+                setHrvTake(null);
                 await reload();
               } finally {
                 setBusy(false);
@@ -2062,7 +2241,12 @@ export default function App() {
         {tab === "activities" && selectedActivity && (
           <ActivityDetailView
             detail={selectedActivity}
-            onBack={() => setSelectedActivity(null)}
+            onBack={() => {
+              setSelectedActivity(null);
+              if (detailReturnTab !== "activities") {
+                setTab(detailReturnTab);
+              }
+            }}
             onAnalyze={() => void analyzeInCoach(selectedActivity.activity)}
             onToggleHyrox={async (isHyrox: boolean) => {
               const updated = await invoke<ActivityDetailPayload>("reclassify_activity_as_hyrox", {
@@ -2070,6 +2254,7 @@ export default function App() {
                 isHyrox,
               });
               setSelectedActivity(updated);
+              setAnalyticsData(null);
               await reload();
             }}
             onActivityUpdated={async (updatedActivity: ActivityRecord) => {
@@ -2078,9 +2263,69 @@ export default function App() {
                   ? { ...prev, activity: updatedActivity }
                   : prev
               );
+              setAnalyticsData(null);
               await reload();
             }}
           />
+        )}
+
+        {tab === "trends" && (
+          <ErrorBoundary>
+            <TrendsView
+              activities={analyticsData?.activities ?? state.activities}
+              days={analyticsData?.days ?? state.days}
+              loading={analyticsLoading}
+              onOpenActivity={(id) => void openActivityById(id, "trends")}
+            />
+          </ErrorBoundary>
+        )}
+
+        {tab === "sleep" && (
+          <ErrorBoundary>
+            <SleepView
+              days={analyticsData?.days ?? state.days}
+              hasGeminiKey={state.has_gemini_key}
+              loading={analyticsLoading}
+              cachedTake={sleepTake}
+              onTakeUpdated={(take) => setSleepTake(take)}
+            />
+          </ErrorBoundary>
+        )}
+
+        {tab === "hrv" && (
+          <ErrorBoundary>
+            <HRVView
+              days={analyticsData?.days ?? state.days}
+              activities={analyticsData?.activities ?? state.activities}
+              hasGarminKey={state.has_garmin_key}
+              hasGeminiKey={state.has_gemini_key}
+              loading={analyticsLoading}
+              cachedTake={hrvTake}
+              onTakeUpdated={(take) => setHrvTake(take)}
+            />
+          </ErrorBoundary>
+        )}
+
+        {tab === "records" && (
+          <ErrorBoundary>
+            <RecordsView
+              records={recordsData}
+              loading={recordsLoading}
+              error={recordsError}
+              onRefresh={() => void refreshRecordsSummary()}
+              onOpenActivity={(id) => void openActivityById(id, "records")}
+            />
+          </ErrorBoundary>
+        )}
+
+        {tab === "explorer" && (
+          <ErrorBoundary>
+            <ExplorerView
+              activities={analyticsData?.activities ?? state.activities}
+              loading={analyticsLoading}
+              onOpenActivity={(id) => void openActivityById(id, "explorer")}
+            />
+          </ErrorBoundary>
         )}
 
         {tab === "coach" && (
@@ -4017,6 +4262,10 @@ export default function App() {
                         setConfirmCleanSlate(false);
                         setBriefing(null);
                         setBriefingError(null);
+                        setAnalyticsData(null);
+                        setRecordsData(null);
+                        setSleepTake(null);
+                        setHrvTake(null);
                         briefingAttemptedRef.current = null;
                         bbRefreshAttemptedRef.current = null;
                         applyThemeMode("system");

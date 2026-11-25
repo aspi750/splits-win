@@ -127,6 +127,7 @@ fn test_shared_store_and_sqlite_roundtrip() {
         post_run_context: None,
         fit_temp_source: None,
         garmin_notes: None,
+        is_pr: None,
     })
     .unwrap();
     let acts = db.list_activities(10).unwrap();
@@ -183,6 +184,7 @@ fn test_readiness_engine_green_red_amber_and_persistence() {
             post_run_context: None,
             fit_temp_source: None,
             garmin_notes: None,
+            is_pr: None,
         }],
         days: &[healthy_day.clone()],
         plan: None,
@@ -217,6 +219,7 @@ fn test_readiness_engine_green_red_amber_and_persistence() {
             post_run_context: None,
             fit_temp_source: None,
             garmin_notes: None,
+            is_pr: None,
         }],
         days: &[bad_day],
         plan: None,
@@ -397,6 +400,7 @@ fn test_stage2_2_hybrid_hyrox_spacing_and_compromised_run_audit() {
         post_run_context: None,
         fit_temp_source: None,
         garmin_notes: None,
+        is_pr: None,
     };
 
     let mut hybrid_config = AthleteConfig::default();
@@ -477,6 +481,7 @@ fn test_stage2_2_training_history_analyzer_and_starter_templates() {
             post_run_context: None,
             fit_temp_source: None,
             garmin_notes: None,
+            is_pr: None,
         });
         if offset % 4 == 1 {
             activities.push(ActivityRecord {
@@ -497,6 +502,7 @@ fn test_stage2_2_training_history_analyzer_and_starter_templates() {
                 post_run_context: None,
                 fit_temp_source: None,
                 garmin_notes: None,
+                is_pr: None,
             });
         }
     }
@@ -582,6 +588,7 @@ fn test_stage3_1_user_profile_migration_and_hyrox_reclassification() {
         post_run_context: None,
         fit_temp_source: None,
         garmin_notes: None,
+        is_pr: None,
     };
     db.upsert_activity(&act).unwrap();
     db.set_activity_hyrox(555, true).unwrap();
@@ -751,6 +758,7 @@ fn test_v0_2_1_sweat_matrix_1hz_window_and_ledger() {
         post_run_context: None,
         fit_temp_source: None,
         garmin_notes: None,
+        is_pr: None,
     })
     .unwrap();
     db.save_post_run_context(888, &computed).unwrap();
@@ -921,6 +929,7 @@ fn test_garmin_weight_sync_scale_pairing_and_hybrid_tempe_parity() {
         post_run_context: Some(paired),
         fit_temp_source: Some("watch_internal".to_string()),
         garmin_notes: None,
+        is_pr: None,
     };
     db.upsert_activity(&act).unwrap();
     let tool_res =
@@ -1995,6 +2004,362 @@ fn v0_2_4_1_legacy_v0_2_3_3_upgrade_bootstrap_serializes_cleanly() {
 
     assert!(val["daily_briefing"].is_null());
     assert_eq!(val["theme_mode"], "system");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn v0_2_5_migration_from_v0_2_4_preserves_rows_and_parses_extended_sleep_hrv() {
+    let dir = make_temp_dir("migrate-025");
+    let db_path = dir.join("splits.sqlite");
+
+    // Seed v0.2.4 `days` and `activities` tables without v0.2.5 extended columns
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE activities (
+                garmin_id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                type_key TEXT NOT NULL,
+                start_iso TEXT NOT NULL,
+                distance_m REAL NOT NULL,
+                duration_sec REAL NOT NULL,
+                moving_duration_sec REAL NOT NULL,
+                elevation_gain_m REAL NOT NULL,
+                average_hr REAL,
+                max_hr REAL,
+                cadence_spm REAL,
+                training_load REAL,
+                shoe_name TEXT,
+                is_hyrox INTEGER,
+                post_run_context_json TEXT,
+                fit_temp_source TEXT,
+                garmin_notes TEXT
+            );
+            CREATE TABLE days (
+                date TEXT PRIMARY KEY,
+                resting_hr INTEGER,
+                stress_avg INTEGER,
+                body_battery_high INTEGER,
+                body_battery_latest INTEGER,
+                body_battery_low INTEGER,
+                body_battery_charged INTEGER,
+                body_battery_drained INTEGER,
+                body_battery_series_json TEXT,
+                steps INTEGER,
+                step_goal INTEGER,
+                sleep_seconds INTEGER,
+                sleep_duration_sec INTEGER,
+                sleep_score INTEGER,
+                sleep_start TEXT,
+                sleep_end TEXT,
+                sleep_deep_sec INTEGER,
+                sleep_light_sec INTEGER,
+                sleep_rem_sec INTEGER,
+                sleep_awake_sec INTEGER,
+                hrv_last_night INTEGER,
+                hrv_status TEXT,
+                hrv_weekly_avg INTEGER,
+                hrv_baseline_low INTEGER,
+                hrv_baseline_high INTEGER
+            );
+            INSERT INTO activities (
+                garmin_id, name, type_key, start_iso, distance_m, duration_sec, moving_duration_sec,
+                elevation_gain_m, average_hr, max_hr, cadence_spm, training_load, shoe_name
+            ) VALUES (
+                2001, 'v0.2.4 Base Run', 'running', '2026-11-24T07:00:00Z', 10000.0, 3000.0, 2980.0,
+                45.0, 142.0, 156.0, 174.0, 88.0, 'Superblast 3'
+            );
+            INSERT INTO days (
+                date, resting_hr, sleep_seconds, sleep_duration_sec, sleep_score,
+                sleep_start, sleep_end, sleep_deep_sec, sleep_light_sec, sleep_rem_sec, sleep_awake_sec,
+                hrv_last_night, hrv_status, hrv_weekly_avg, hrv_baseline_low, hrv_baseline_high
+            ) VALUES (
+                '2026-11-24', 50, 26400, 26400, 86,
+                '2026-11-23T23:00:00', '2026-11-24T06:30:00', 5400, 15000, 6000, 600,
+                66, 'BALANCED', 64, 56, 74
+            );",
+        )
+        .unwrap();
+    }
+
+    let db = Database::open(&db_path).unwrap();
+    let legacy_days = db.list_days(10).unwrap();
+    assert_eq!(legacy_days.len(), 1);
+    assert_eq!(legacy_days[0].sleep_score, Some(86));
+    assert_eq!(legacy_days[0].sleep_need_minutes, None);
+    assert_eq!(legacy_days[0].hrv_last_night_5min_high, None);
+
+    let legacy_acts = db.list_activities(10).unwrap();
+    assert_eq!(legacy_acts.len(), 1);
+    assert_eq!(legacy_acts[0].garmin_id, 2001);
+    assert_eq!(legacy_acts[0].is_pr, None);
+
+    // Parse extended Garmin sleep + HRV + intraday 5-min HRV payloads
+    let mut parsed_days = std::collections::HashMap::new();
+    let sleep_json = serde_json::json!({
+        "dailySleepDTO": {
+            "calendarDate": "2026-11-25",
+            "sleepTimeSeconds": 27000,
+            "deepSleepSeconds": 5700,
+            "lightSleepSeconds": 15300,
+            "remSleepSeconds": 6000,
+            "awakeSleepSeconds": 480,
+            "sleepStartTimestampLocal": "2026-11-24T23:10:00",
+            "sleepEndTimestampLocal": "2026-11-25T06:48:00",
+            "avgHeartRate": 48.5,
+            "avgSleepStress": 14.2,
+            "awakeCount": 2,
+            "averageRespirationValue": 14.6,
+            "lowestRespirationValue": 12.0,
+            "highestRespirationValue": 17.5,
+            "sleepScores": { "overall": { "value": 90, "qualifierKey": "GOOD" } },
+            "sleepNeed": { "baseline": 450, "actual": 480 }
+        }
+    });
+    parse_sleep_summaries_json(&serde_json::to_vec(&sleep_json).unwrap(), &mut parsed_days);
+
+    let hrv_json = serde_json::json!({
+        "hrvSummaries": [{
+            "calendarDate": "2026-11-25",
+            "lastNightAvg": 71,
+            "lastNight5MinHigh": 96,
+            "weeklyAvg": 67,
+            "status": "BALANCED",
+            "baseline": { "balancedLow": 56, "balancedUpper": 75 }
+        }]
+    });
+    parse_hrv_range_json(&serde_json::to_vec(&hrv_json).unwrap(), &mut parsed_days);
+
+    let d25 = parsed_days.get("2026-11-25").unwrap();
+    db.upsert_day(d25).unwrap();
+
+    // Partial update must NOT wipe extended sleep / HRV fields
+    db.upsert_day(&DayRecord {
+        date: "2026-11-25".to_string(),
+        steps: Some(9200),
+        ..Default::default()
+    })
+    .unwrap();
+
+    let rows = db.list_days(10).unwrap();
+    let stored = rows.iter().find(|r| r.date == "2026-11-25").unwrap();
+    assert_eq!(stored.steps, Some(9200));
+    assert_eq!(stored.sleep_need_minutes, Some(480));
+    assert_eq!(stored.sleep_baseline_minutes, Some(450));
+    assert_eq!(stored.sleep_awake_count, Some(2));
+    assert_eq!(stored.sleep_avg_hr, Some(48.5));
+    assert_eq!(stored.sleep_stress, Some(14.2));
+    assert_eq!(stored.sleep_respiration_avg, Some(14.6));
+    assert_eq!(stored.sleep_respiration_low, Some(12.0));
+    assert_eq!(stored.sleep_respiration_high, Some(17.5));
+    assert_eq!(stored.sleep_quality.as_deref(), Some("GOOD"));
+    assert_eq!(stored.hrv_last_night_5min_high, Some(96));
+
+    // Intraday 5-min HRV reading parser
+    let night_json = serde_json::json!({
+        "hrvSummary": {
+            "lastNightAvg": 71,
+            "lastNight5MinHigh": 96,
+            "baseline": { "balancedLow": 56, "balancedUpper": 75 }
+        },
+        "hrvReadings": [
+            { "hrvValue": 64, "readingTimeGMT": "2026-11-25T00:05:00.0" },
+            { "hrvValue": 96, "readingTimeGMT": "2026-11-25T03:30:00.0" }
+        ]
+    });
+    let detail = splits_win_lib::garmin::parse_hrv_night_json(
+        "2026-11-25",
+        &serde_json::to_vec(&night_json).unwrap(),
+    );
+    assert_eq!(detail.readings.len(), 2);
+    assert_eq!(detail.last_night_5min_high, Some(96));
+    assert_eq!(detail.readings[1].value_ms, 96.0);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn v0_2_5_records_aggregation_and_scoped_sleep_hrv_takes() {
+    let dir = make_temp_dir("records-takes-025");
+    let db = Database::open(&dir.join("splits.sqlite")).unwrap();
+
+    // Insert outdoor runs (one with cached 1Hz FIT track, one activity average) + indoor treadmill (must be ignored for distance PRs)
+    let now = Utc::now();
+    let d1 = (now - Duration::days(20)).format("%Y-%m-%dT07:00:00Z").to_string();
+    let d2 = (now - Duration::days(10)).format("%Y-%m-%dT07:00:00Z").to_string();
+    let d3 = (now - Duration::days(5)).format("%Y-%m-%dT07:00:00Z").to_string();
+
+    db.upsert_activity(&ActivityRecord {
+        garmin_id: 3001,
+        name: "10K Threshold Test".to_string(),
+        type_key: "running".to_string(),
+        start_iso: d1.clone(),
+        distance_m: 10_200.0,
+        duration_sec: 2_600.0,
+        moving_duration_sec: 2_550.0,
+        elevation_gain_m: 40.0,
+        average_hr: Some(166.0),
+        max_hr: Some(178.0),
+        cadence_spm: Some(180.0),
+        training_load: Some(140.0),
+        shoe_name: Some("Metaspeed".to_string()),
+        is_hyrox: None,
+        post_run_context: None,
+        fit_temp_source: None,
+        garmin_notes: None,
+        is_pr: Some(true),
+    })
+    .unwrap();
+
+    db.upsert_activity(&ActivityRecord {
+        garmin_id: 3002,
+        name: "Mountain Long Run".to_string(),
+        type_key: "trail_running".to_string(),
+        start_iso: d2.clone(),
+        distance_m: 22_000.0,
+        duration_sec: 7_200.0,
+        moving_duration_sec: 7_000.0,
+        elevation_gain_m: 650.0,
+        average_hr: Some(148.0),
+        max_hr: Some(168.0),
+        cadence_spm: Some(172.0),
+        training_load: Some(210.0),
+        shoe_name: Some("Trabuco".to_string()),
+        is_hyrox: None,
+        post_run_context: None,
+        fit_temp_source: None,
+        garmin_notes: None,
+        is_pr: Some(false),
+    })
+    .unwrap();
+
+    // Unrealistically fast treadmill run must be excluded from outdoor distance PRs
+    db.upsert_activity(&ActivityRecord {
+        garmin_id: 3003,
+        name: "Treadmill".to_string(),
+        type_key: "treadmill_running".to_string(),
+        start_iso: d3,
+        distance_m: 5_000.0,
+        duration_sec: 900.0,
+        moving_duration_sec: 900.0,
+        elevation_gain_m: 0.0,
+        average_hr: Some(150.0),
+        max_hr: None,
+        cadence_spm: None,
+        training_load: Some(60.0),
+        shoe_name: None,
+        is_hyrox: None,
+        post_run_context: None,
+        fit_temp_source: None,
+        garmin_notes: None,
+        is_pr: None,
+    })
+    .unwrap();
+
+    // Attach a 1Hz FIT track to activity 3001 with a 4:00/km (240s) 1K stretch inside a 10.2km run
+    let fit_points: Vec<FitTrackPoint> = (0..=2550)
+        .map(|s| {
+            let dist = (s as f64) * 4.0; // 4.0 m/s = 4:10/km, 2550*4 = 10200m
+            make_fit_point(s as f64, dist, 4.0, Some(166.0), Some(180.0), Some(10.0))
+        })
+        .collect();
+    let track = analyze_fit_points(3001, fit_points, &AthleteConfig::default());
+    db.upsert_fit_track(3001, &track).unwrap();
+
+    let records = db.compute_personal_records().unwrap();
+    assert_eq!(records.total_outdoor_runs, 2);
+    assert_eq!(records.scanned_fit_runs, 1);
+    assert_eq!(records.pr_activities.len(), 1);
+    assert_eq!(records.pr_activities[0].garmin_id, 3001);
+
+    let best_5k = records.distance_records.iter().find(|r| r.label == "5K").unwrap();
+    assert_eq!(best_5k.activity_id, 3001);
+    assert_eq!(best_5k.source, "fit_best_stretch");
+    assert!((best_5k.time_sec - 1250.0).abs() < 2.0);
+
+    let best_hm = records
+        .distance_records
+        .iter()
+        .find(|r| r.label == "Half Marathon")
+        .unwrap();
+    assert_eq!(best_hm.activity_id, 3002);
+    assert_eq!(best_hm.source, "activity_average");
+
+    assert!(records.milestones.iter().any(|m| m.key == "longest_run" && m.activity_id == Some(3002)));
+    assert!(records.milestones.iter().any(|m| m.key == "biggest_elevation" && m.activity_id == Some(3002)));
+    assert!(records.milestones.iter().any(|m| m.key == "highest_weekly_km"));
+    assert!(!records.predictions.is_empty());
+    assert!(!records.yearly_bests.is_empty());
+
+    // Scoped `sleep_take` and `hrv_take` persistence alongside daily briefing
+    let daily = DailyBriefingRecord {
+        date: "2026-11-25".to_string(),
+        headline: "Daily ready".to_string(),
+        body: "Daily body.".to_string(),
+        action_cue: "Run easy.".to_string(),
+        model_id: "gemini-4-hydrogen".to_string(),
+        thinking_level: "MEDIUM".to_string(),
+        had_sleep: true,
+        generated_at: "2026-11-25T07:00:00Z".to_string(),
+    };
+    let sleep_take = DailyBriefingRecord {
+        date: "2026-11-25".to_string(),
+        headline: "Solid sleep bank".to_string(),
+        body: "You slept 7 h 30 min.".to_string(),
+        action_cue: "Keep bedtime steady.".to_string(),
+        model_id: "gemini-4-hydrogen".to_string(),
+        thinking_level: "MEDIUM".to_string(),
+        had_sleep: true,
+        generated_at: "2026-11-25T07:01:00Z".to_string(),
+    };
+    let hrv_take = DailyBriefingRecord {
+        date: "2026-11-25".to_string(),
+        headline: "Balanced autonomic recovery".to_string(),
+        body: "Last night's HRV was 71 ms.".to_string(),
+        action_cue: "Carry on as planned.".to_string(),
+        model_id: "gemini-4-hydrogen".to_string(),
+        thinking_level: "MEDIUM".to_string(),
+        had_sleep: false,
+        generated_at: "2026-11-25T07:02:00Z".to_string(),
+    };
+
+    db.upsert_daily_briefing(&daily).unwrap();
+    db.upsert_scoped_briefing("sleep_take", &sleep_take).unwrap();
+    db.upsert_scoped_briefing("hrv_take", &hrv_take).unwrap();
+
+    assert_eq!(db.get_daily_briefing("2026-11-25").unwrap(), Some(daily));
+    assert_eq!(db.get_scoped_briefing("sleep_take", "2026-11-25").unwrap(), Some(sleep_take));
+    assert_eq!(db.get_scoped_briefing("hrv_take", "2026-11-25").unwrap(), Some(hrv_take));
+
+    // Deterministic health take fact builders
+    let sample_days: Vec<DayRecord> = (0..10)
+        .map(|i| {
+            let dt = (NaiveDate::from_ymd_opt(2026, 11, 16).unwrap() + Duration::days(i))
+                .format("%Y-%m-%d")
+                .to_string();
+            DayRecord {
+                date: dt,
+                resting_hr: Some(50),
+                sleep_seconds: Some(26_400),
+                sleep_need_minutes: Some(450),
+                sleep_start: Some("2026-11-24T23:05:00".to_string()),
+                sleep_end: Some("2026-11-25T06:35:00".to_string()),
+                sleep_deep_sec: Some(5_400),
+                sleep_light_sec: Some(15_000),
+                sleep_rem_sec: Some(6_000),
+                hrv_last_night: Some(68 + (i as i32 % 3)),
+                hrv_baseline_low: Some(56),
+                hrv_baseline_high: Some(74),
+                ..Default::default()
+            }
+        })
+        .collect();
+    let ref_date = NaiveDate::from_ymd_opt(2026, 11, 25).unwrap();
+    let sleep_facts = splits_win_lib::coach::build_sleep_take_facts(&sample_days, ref_date).unwrap();
+    assert!(sleep_facts.contains("Verdict:"));
+    let hrv_facts = splits_win_lib::coach::build_hrv_take_facts(&sample_days, &[], ref_date).unwrap();
+    assert!(hrv_facts.contains("Last night's HRV was"));
 
     let _ = std::fs::remove_dir_all(&dir);
 }

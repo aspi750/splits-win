@@ -1,8 +1,8 @@
 use crate::models::{
     default_temp_source, ActivityRecord, AthleteConfig, BodyBatteryPoint, ClassifiedLap,
     CompromisedRunAudit, DayRecord, FitBaselineProbe, FitGuardrailAudit, FitLap, FitSplit,
-    FitTrackAnalysis, FitTrackPoint, HyroxDissection, LapKind, WeightEntry, APP_SERVICE,
-    GARMIN_ACCOUNT, GARMIN_KEYRING_SERVICE,
+    FitTrackAnalysis, FitTrackPoint, HyroxDissection, LapKind, NightHrvDetail, NightHrvReading,
+    WeightEntry, APP_SERVICE, GARMIN_ACCOUNT, GARMIN_KEYRING_SERVICE,
 };
 use crate::storage::CredentialStore;
 use chrono::{DateTime, Duration, Local, NaiveDate, NaiveDateTime, TimeZone, Utc};
@@ -230,6 +230,7 @@ impl GarminClient {
                 post_run_context: None,
                 fit_temp_source: None,
                 garmin_notes: normalize_optional_text(dto.description),
+                is_pr: dto.is_pr,
             });
         }
 
@@ -288,6 +289,7 @@ impl GarminClient {
                     post_run_context: None,
                     fit_temp_source: None,
                     garmin_notes: normalize_optional_text(dto.description),
+                    is_pr: dto.is_pr,
                 });
             }
             if count < PAGE_SIZE {
@@ -413,6 +415,14 @@ impl GarminClient {
         }
 
         Ok(days_map.remove(&today_str))
+    }
+
+    /// Intraday 5-min overnight HRV readings for `date` (`GET /hrv-service/hrv/{date}`).
+    pub async fn fetch_hrv_night(&self, date: &str) -> Result<NightHrvDetail, GarminError> {
+        let bytes = self
+            .get_bytes(&format!("/hrv-service/hrv/{date}"), &[], "application/json")
+            .await?;
+        Ok(parse_hrv_night_json(date, &bytes))
     }
 
     /// Lightweight metadata-only fetch for a single activity (`/activity-service/activity/{activityId}`)
@@ -881,6 +891,25 @@ pub fn parse_sleep_summaries_json(bytes: &[u8], days_map: &mut HashMap<String, D
             .or_else(|| format_garmin_gmt_to_local_timestamp(dto.get("sleepEndTimestampGMT")))
             .or_else(|| format_garmin_gmt_to_local_timestamp(outer.get("sleepEndTimestampGMT")));
 
+        let sleep_need_min = json_opt_i32(dto.pointer("/sleepNeed/actual"))
+            .or_else(|| json_opt_i32(outer.pointer("/sleepNeed/actual")));
+        let sleep_baseline_min = json_opt_i32(dto.pointer("/sleepNeed/baseline"))
+            .or_else(|| json_opt_i32(outer.pointer("/sleepNeed/baseline")));
+        let awake_count = json_opt_i32(dto.get("awakeCount"))
+            .or_else(|| json_opt_i32(outer.get("awakeCount")));
+        let avg_hr = json_opt_f64(dto.get("avgHeartRate"))
+            .or_else(|| json_opt_f64(outer.get("avgHeartRate")));
+        let sleep_stress = json_opt_f64(dto.get("avgSleepStress"))
+            .or_else(|| json_opt_f64(outer.get("avgSleepStress")));
+        let resp_avg = json_opt_f64(dto.get("averageRespirationValue"))
+            .or_else(|| json_opt_f64(outer.get("averageRespirationValue")));
+        let resp_low = json_opt_f64(dto.get("lowestRespirationValue"))
+            .or_else(|| json_opt_f64(outer.get("lowestRespirationValue")));
+        let resp_high = json_opt_f64(dto.get("highestRespirationValue"))
+            .or_else(|| json_opt_f64(outer.get("highestRespirationValue")));
+        let quality = json_opt_nonempty_str(dto.pointer("/sleepScores/overall/qualifierKey"))
+            .or_else(|| json_opt_nonempty_str(outer.pointer("/sleepScores/overall/qualifierKey")));
+
         let entry = days_map.entry(date.clone()).or_insert_with(|| empty_day(&date));
         // Guard against shorter naps or partial records overwriting the main night's sleep
         if let Some(existing_sec) = entry.sleep_seconds.filter(|&s| s > sleep_sec) {
@@ -914,6 +943,33 @@ pub fn parse_sleep_summaries_json(bytes: &[u8], days_map: &mut HashMap<String, D
         if awake.is_some() {
             entry.sleep_awake_sec = awake;
         }
+        if sleep_need_min.is_some() {
+            entry.sleep_need_minutes = sleep_need_min;
+        }
+        if sleep_baseline_min.is_some() {
+            entry.sleep_baseline_minutes = sleep_baseline_min;
+        }
+        if awake_count.is_some() {
+            entry.sleep_awake_count = awake_count;
+        }
+        if avg_hr.is_some() {
+            entry.sleep_avg_hr = avg_hr;
+        }
+        if sleep_stress.is_some() {
+            entry.sleep_stress = sleep_stress;
+        }
+        if resp_avg.is_some() {
+            entry.sleep_respiration_avg = resp_avg;
+        }
+        if resp_low.is_some() {
+            entry.sleep_respiration_low = resp_low;
+        }
+        if resp_high.is_some() {
+            entry.sleep_respiration_high = resp_high;
+        }
+        if quality.is_some() {
+            entry.sleep_quality = quality;
+        }
     }
 }
 
@@ -937,6 +993,9 @@ pub fn parse_hrv_range_json(bytes: &[u8], days_map: &mut HashMap<String, DayReco
         if let Some(v) = json_opt_i32(h.get("lastNightAvg")) {
             entry.hrv_last_night = Some(v);
         }
+        if let Some(v) = json_opt_i32(h.get("lastNight5MinHigh")) {
+            entry.hrv_last_night_5min_high = Some(v);
+        }
         if let Some(v) = json_opt_i32(h.get("weeklyAvg")) {
             entry.hrv_weekly_avg = Some(v);
         }
@@ -954,6 +1013,55 @@ pub fn parse_hrv_range_json(bytes: &[u8], days_map: &mut HashMap<String, DayReco
             }
         }
     }
+}
+
+pub fn parse_hrv_night_json(date: &str, bytes: &[u8]) -> NightHrvDetail {
+    let mut detail = NightHrvDetail {
+        date: date.to_string(),
+        ..Default::default()
+    };
+    let Ok(val) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+        return detail;
+    };
+    if let Some(summary) = val.get("hrvSummary") {
+        detail.last_night_avg = json_opt_i32(summary.get("lastNightAvg"));
+        detail.last_night_5min_high = json_opt_i32(summary.get("lastNight5MinHigh"));
+        if let Some(baseline) = summary.get("baseline") {
+            detail.baseline_low = json_opt_i32(baseline.get("balancedLow"));
+            detail.baseline_high = json_opt_i32(baseline.get("balancedUpper"))
+                .or_else(|| json_opt_i32(baseline.get("balancedHigh")));
+        }
+    }
+    if let Some(readings) = val.get("hrvReadings").and_then(|v| v.as_array()) {
+        let mut parsed: Vec<NightHrvReading> = Vec::new();
+        for r in readings {
+            let Some(value_ms) = json_opt_f64(r.get("hrvValue")).filter(|&v| v > 0.0) else {
+                continue;
+            };
+            let Some(raw_ts) = json_opt_nonempty_str(r.get("readingTimeGMT")) else {
+                continue;
+            };
+            let prefix: String = raw_ts.chars().take(19).collect();
+            let dt_utc = if let Ok(dt) = DateTime::parse_from_rfc3339(&raw_ts) {
+                Some(dt.with_timezone(&Utc))
+            } else if let Ok(ndt) = NaiveDateTime::parse_from_str(&prefix, "%Y-%m-%dT%H:%M:%S") {
+                Some(DateTime::<Utc>::from_naive_utc_and_offset(ndt, Utc))
+            } else {
+                None
+            };
+            let Some(dt) = dt_utc else {
+                continue;
+            };
+            parsed.push(NightHrvReading {
+                timestamp_iso: dt.with_timezone(&Local).format("%Y-%m-%dT%H:%M:%S").to_string(),
+                timestamp_ms: dt.timestamp_millis(),
+                value_ms,
+            });
+        }
+        parsed.sort_by_key(|r| r.timestamp_ms);
+        detail.readings = parsed;
+    }
+    detail
 }
 
 pub fn parse_steps_json(bytes: &[u8], days_map: &mut HashMap<String, DayRecord>) {
@@ -1101,6 +1209,8 @@ struct ActivityDTO {
     max_hr: Option<f64>,
     average_running_cadence_in_steps_per_minute: Option<f64>,
     activity_training_load: Option<f64>,
+    #[serde(default, rename = "isPR")]
+    is_pr: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]

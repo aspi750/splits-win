@@ -1,7 +1,7 @@
 use crate::models::*;
 use crate::readiness::{ReadinessEngine, ReadinessInput};
 use crate::storage::{CredentialStore, Database, SharedStore};
-use chrono::{DateTime, Datelike, Duration, Local, NaiveDate, Utc};
+use chrono::{DateTime, Datelike, Duration, Local, NaiveDate, NaiveDateTime, Utc};
 use std::collections::BTreeMap;
 use futures_util::StreamExt;
 use reqwest::Client;
@@ -2747,6 +2747,678 @@ pub async fn generate_daily_briefing(
         model_id: resolved.model_id,
         thinking_level: resolved.thinking_level.as_str().to_string(),
         had_sleep,
+        generated_at: Utc::now().to_rfc3339(),
+    })
+}
+
+fn mean_f64(xs: &[f64]) -> Option<f64> {
+    if xs.is_empty() {
+        None
+    } else {
+        Some(xs.iter().sum::<f64>() / xs.len() as f64)
+    }
+}
+
+fn std_dev_f64(xs: &[f64]) -> Option<f64> {
+    if xs.len() < 2 {
+        return None;
+    }
+    let m = mean_f64(xs)?;
+    let var = xs.iter().map(|x| (x - m) * (x - m)).sum::<f64>() / (xs.len() - 1) as f64;
+    Some(var.sqrt())
+}
+
+fn median_f64(xs: &[f64]) -> Option<f64> {
+    if xs.is_empty() {
+        return None;
+    }
+    let mut s = xs.to_vec();
+    s.sort_by(|a, b| a.total_cmp(b));
+    let mid = s.len() / 2;
+    if s.len() % 2 == 1 {
+        Some(s[mid])
+    } else {
+        Some((s[mid - 1] + s[mid]) / 2.0)
+    }
+}
+
+fn clock_hours_relative_to_wake_day(iso: &str, wake_day: NaiveDate) -> Option<f64> {
+    let trimmed = iso.trim();
+    let prefix: String = trimmed.chars().take(19).collect();
+    let ndt = NaiveDateTime::parse_from_str(&prefix, "%Y-%m-%dT%H:%M:%S")
+        .or_else(|_| NaiveDateTime::parse_from_str(&prefix, "%Y-%m-%d %H:%M:%S"))
+        .ok()?;
+    let prev_midnight = (wake_day - Duration::days(1)).and_hms_opt(0, 0, 0)?;
+    let diff = ndt.signed_duration_since(prev_midnight).num_seconds() as f64 / 3600.0;
+    Some(diff)
+}
+
+fn format_clock_hours(hours: f64) -> String {
+    let mut mins = (hours * 60.0).round() as i32 % (24 * 60);
+    if mins < 0 {
+        mins += 24 * 60;
+    }
+    format!("{:02}:{:02}", mins / 60, mins % 60)
+}
+
+pub fn build_sleep_take_facts(days: &[DayRecord], today_date: NaiveDate) -> Option<String> {
+    struct NightRow {
+        date: NaiveDate,
+        asleep_sec: f64,
+        need_sec: Option<f64>,
+        deep: f64,
+        light: f64,
+        rem: f64,
+        bedtime_h: Option<f64>,
+        midsleep_h: Option<f64>,
+        is_free_day: bool,
+    }
+
+    let mut nights: Vec<NightRow> = days
+        .iter()
+        .filter_map(|d| {
+            let nd = NaiveDate::parse_from_str(&d.date, "%Y-%m-%d").ok()?;
+            let asleep = d.sleep_seconds.or(d.sleep_duration_sec).filter(|&s| s > 0)? as f64;
+            let need_min = d.sleep_need_minutes.or(d.sleep_baseline_minutes);
+            let need_sec = need_min.filter(|&m| m > 0).map(|m| (m as f64) * 60.0);
+            let start_h = d
+                .sleep_start
+                .as_deref()
+                .and_then(|s| clock_hours_relative_to_wake_day(s, nd));
+            let end_h = d
+                .sleep_end
+                .as_deref()
+                .and_then(|s| clock_hours_relative_to_wake_day(s, nd));
+            let (bedtime_h, midsleep_h) = match (start_h, end_h) {
+                (Some(s), Some(e)) if e > s => {
+                    let dur = e - s;
+                    (Some(s - 24.0), Some((s + dur / 2.0) - 24.0))
+                }
+                _ => (None, None),
+            };
+            let wd = nd.weekday();
+            let is_free_day = matches!(wd, chrono::Weekday::Sat | chrono::Weekday::Sun);
+            Some(NightRow {
+                date: nd,
+                asleep_sec: asleep,
+                need_sec,
+                deep: d.sleep_deep_sec.unwrap_or(0).max(0) as f64,
+                light: d.sleep_light_sec.unwrap_or(0).max(0) as f64,
+                rem: d.sleep_rem_sec.unwrap_or(0).max(0) as f64,
+                bedtime_h,
+                midsleep_h,
+                is_free_day,
+            })
+        })
+        .collect();
+
+    nights.sort_by_key(|n| n.date);
+    let last = nights.last()?;
+    let mut reasons: Vec<String> = Vec::new();
+    let mut observations: Vec<String> = Vec::new();
+
+    let hm = |s: f64| format_hours_minutes_text(s.round() as i32);
+    if let Some(need) = last.need_sec {
+        let diff = last.asleep_sec - need;
+        if diff.abs() < 15.0 * 60.0 {
+            reasons.push(format!(
+                "Last night they slept {}, about what their watch says they needed.",
+                hm(last.asleep_sec)
+            ));
+        } else if diff < 0.0 {
+            reasons.push(format!(
+                "Last night they slept {}, {} less than their watch says they needed.",
+                hm(last.asleep_sec),
+                hm(-diff)
+            ));
+        } else {
+            reasons.push(format!(
+                "Last night they slept {}, {} more than their watch says they needed.",
+                hm(last.asleep_sec),
+                hm(diff)
+            ));
+        }
+    } else {
+        reasons.push(format!("Last night they slept {}.", hm(last.asleep_sec)));
+    }
+
+    let debt_start = today_date - Duration::days(14);
+    let balance_14: Vec<f64> = nights
+        .iter()
+        .filter(|n| n.date > debt_start)
+        .filter_map(|n| n.need_sec.map(|need| n.asleep_sec - need))
+        .collect();
+    let debt_sec = if balance_14.len() >= 5 {
+        let owed = (-balance_14.iter().sum::<f64>()).max(0.0);
+        if owed < 30.0 * 60.0 {
+            reasons.push("Over the last 14 nights there's no sleep debt to speak of.".to_string());
+        } else {
+            reasons.push(format!(
+                "Over the last 14 nights they're {} short in total.",
+                hm(owed)
+            ));
+        }
+        Some(owed)
+    } else {
+        None
+    };
+
+    let month_ago = today_date - Duration::days(30);
+    let recent: Vec<&NightRow> = nights.iter().filter(|n| n.date > month_ago).collect();
+    let bedtimes: Vec<f64> = recent.iter().filter_map(|n| n.bedtime_h).collect();
+    let mut bedtime_spread_min: Option<f64> = None;
+    let mut usual_bedtime_h: Option<f64> = None;
+    if bedtimes.len() >= 7 {
+        if let (Some(med), Some(sd)) = (median_f64(&bedtimes), std_dev_f64(&bedtimes)) {
+            let spread = sd * 60.0;
+            bedtime_spread_min = Some(spread);
+            usual_bedtime_h = Some(med);
+            let judgement = if spread < 30.0 {
+                "very regular"
+            } else if spread < 60.0 {
+                "fairly regular"
+            } else {
+                "irregular"
+            };
+            observations.push(format!(
+                "Their bedtime is usually around {} and is {} from night to night.",
+                format_clock_hours(med),
+                judgement
+            ));
+        }
+    }
+
+    let last_60: Vec<&NightRow> = nights.iter().rev().take(60).collect();
+    let free_mids: Vec<f64> = last_60
+        .iter()
+        .filter(|n| n.is_free_day)
+        .filter_map(|n| n.midsleep_h)
+        .collect();
+    let work_mids: Vec<f64> = last_60
+        .iter()
+        .filter(|n| !n.is_free_day)
+        .filter_map(|n| n.midsleep_h)
+        .collect();
+    let mut social_jetlag_h: Option<f64> = None;
+    if free_mids.len() >= 3 && work_mids.len() >= 5 {
+        if let (Some(msf), Some(msw)) = (mean_f64(&free_mids), mean_f64(&work_mids)) {
+            let jetlag = msf - msw;
+            social_jetlag_h = Some(jetlag);
+            if jetlag.abs() >= 0.75 {
+                observations.push(format!(
+                    "On weekends they sleep {} {} than on weekdays (social jetlag).",
+                    hm(jetlag.abs() * 3600.0),
+                    if jetlag > 0.0 { "later" } else { "earlier" }
+                ));
+            }
+        }
+    }
+
+    let with_stages: Vec<&&NightRow> = recent
+        .iter()
+        .filter(|n| n.deep + n.light + n.rem > 0.0)
+        .collect();
+    let mut low_stages: Vec<&str> = Vec::new();
+    if !with_stages.is_empty() {
+        let deep_share = mean_f64(
+            &with_stages
+                .iter()
+                .map(|n| n.deep / n.asleep_sec * 100.0)
+                .collect::<Vec<_>>(),
+        )
+        .unwrap_or(0.0);
+        let rem_share = mean_f64(
+            &with_stages
+                .iter()
+                .map(|n| n.rem / n.asleep_sec * 100.0)
+                .collect::<Vec<_>>(),
+        )
+        .unwrap_or(0.0);
+        if deep_share < 16.0 {
+            low_stages.push("Deep");
+        }
+        if rem_share < 21.0 {
+            low_stages.push("REM");
+        }
+        if !low_stages.is_empty() {
+            let joined = low_stages
+                .iter()
+                .map(|s| if *s == "REM" { "REM" } else { "deep" })
+                .collect::<Vec<_>>()
+                .join(" and ");
+            observations.push(format!(
+                "{} sleep {} below the share of the night considered optimal.",
+                if joined.starts_with("REM") { "REM" } else { "Deep" },
+                if low_stages.len() > 1 { "are" } else { "is" }
+            ));
+        }
+    }
+
+    let verdict = match debt_sec.unwrap_or(0.0) {
+        d if d < 3600.0 => {
+            if last
+                .need_sec
+                .map_or(true, |need| last.asleep_sec >= need - 30.0 * 60.0)
+            {
+                "Well rested"
+            } else {
+                "Short night, solid fortnight"
+            }
+        }
+        d if d < 3.0 * 3600.0 => "Running a little short",
+        _ => "Short on sleep",
+    };
+
+    let low_stage = if low_stages.contains(&"REM") {
+        Some("REM")
+    } else {
+        low_stages.first().copied()
+    };
+    let advice = if debt_sec.unwrap_or(0.0) >= 2.0 * 3600.0 {
+        "Pay some of it back: go to bed 30 to 45 minutes earlier for the next few nights.".to_string()
+    } else if bedtime_spread_min.unwrap_or(0.0) >= 60.0 {
+        format!(
+            "Try to fall asleep within half an hour of {} every night, weekends too.",
+            format_clock_hours(usual_bedtime_h.unwrap_or(-1.0))
+        )
+    } else if social_jetlag_h.unwrap_or(0.0) >= 1.0 {
+        "On weekends, get up within an hour of the weekday time so Monday feels easier.".to_string()
+    } else if low_stage == Some("REM") {
+        "Most REM sleep comes in the last hours of the night, so protect the end of the night: a steady wake time and enough time in bed.".to_string()
+    } else if low_stage == Some("Deep") {
+        "Deep sleep comes early in the night; a calm last hour before bed and a regular bedtime help it most.".to_string()
+    } else {
+        "Keep doing what you're doing.".to_string()
+    };
+
+    let mut lines = vec![
+        "Topic: their sleep, measured by the watch.".to_string(),
+        format!("Verdict: {verdict}."),
+    ];
+    lines.extend(reasons);
+    if !observations.is_empty() {
+        lines.push("Observations:".to_string());
+        lines.extend(observations);
+    }
+    lines.push(format!("Advice: {advice}"));
+    Some(lines.join("\n"))
+}
+
+pub fn build_hrv_take_facts(
+    days: &[DayRecord],
+    activities: &[ActivityRecord],
+    today_date: NaiveDate,
+) -> Option<String> {
+    struct Morning {
+        date: NaiveDate,
+        ms: f64,
+        ln_ms: f64,
+        baseline_low: Option<i32>,
+        baseline_high: Option<i32>,
+    }
+
+    let mut mornings: Vec<Morning> = days
+        .iter()
+        .filter_map(|d| {
+            let nd = NaiveDate::parse_from_str(&d.date, "%Y-%m-%d").ok()?;
+            let ms = d.hrv_last_night.filter(|&v| v > 0)? as f64;
+            Some(Morning {
+                date: nd,
+                ms,
+                ln_ms: ms.ln(),
+                baseline_low: d.hrv_baseline_low,
+                baseline_high: d.hrv_baseline_high,
+            })
+        })
+        .collect();
+    mornings.sort_by_key(|m| m.date);
+    let last = mornings.last()?;
+
+    struct SeriesPt {
+        date: NaiveDate,
+        mean_ln: f64,
+        cv: f64,
+        low_ln: Option<f64>,
+        high_ln: Option<f64>,
+        usual_cv: Option<f64>,
+    }
+
+    let mut series: Vec<SeriesPt> = Vec::new();
+    for (i, m) in mornings.iter().enumerate() {
+        let week_start = m.date - Duration::days(6);
+        let week_lns: Vec<f64> = mornings[..=i]
+            .iter()
+            .rev()
+            .take_while(|x| x.date >= week_start)
+            .map(|x| x.ln_ms)
+            .collect();
+        if week_lns.len() < 4 {
+            continue;
+        }
+        let Some(w_mean) = mean_f64(&week_lns) else { continue };
+        let Some(w_sd) = std_dev_f64(&week_lns) else { continue };
+
+        let base_start = m.date - Duration::days(60);
+        let base_lns: Vec<f64> = mornings[..i]
+            .iter()
+            .filter(|x| x.date >= base_start)
+            .map(|x| x.ln_ms)
+            .collect();
+        let (low_ln, high_ln) = if base_lns.len() >= 20 {
+            if let (Some(bm), Some(bsd)) = (mean_f64(&base_lns), std_dev_f64(&base_lns)) {
+                (Some(bm - 0.5 * bsd), Some(bm + 0.5 * bsd))
+            } else {
+                (None, None)
+            }
+        } else if let (Some(lo), Some(hi)) = (
+            m.baseline_low.filter(|&v| v > 0),
+            m.baseline_high.filter(|&v| v > 0),
+        ) {
+            (Some((lo as f64).ln()), Some((hi as f64).ln()))
+        } else {
+            (None, None)
+        };
+
+        let earlier_cvs: Vec<f64> = series
+            .iter()
+            .filter(|p| p.date >= base_start)
+            .map(|p| p.cv)
+            .collect();
+        let usual_cv = if earlier_cvs.len() >= 10 {
+            mean_f64(&earlier_cvs)
+        } else {
+            None
+        };
+        series.push(SeriesPt {
+            date: m.date,
+            mean_ln: w_mean,
+            cv: if w_mean > 0.0 { w_sd / w_mean * 100.0 } else { 0.0 },
+            low_ln,
+            high_ln,
+            usual_cv,
+        });
+    }
+
+    let latest = series.last();
+    let mut reasons = vec![format!("Last night's HRV was {} ms.", last.ms.round() as i32)];
+    let mut observations: Vec<String> = Vec::new();
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum HrvLevel {
+        Below,
+        Within,
+        Above,
+    }
+
+    let level = latest.and_then(|pt| match (pt.low_ln, pt.high_ln) {
+        (Some(lo), Some(hi)) => {
+            if pt.mean_ln < lo {
+                Some(HrvLevel::Below)
+            } else if pt.mean_ln > hi {
+                Some(HrvLevel::Above)
+            } else {
+                Some(HrvLevel::Within)
+            }
+        }
+        _ => None,
+    });
+
+    match level {
+        Some(HrvLevel::Below) => reasons.push("The 7-day average is below their normal range.".to_string()),
+        Some(HrvLevel::Above) => reasons.push("The 7-day average is above their normal range.".to_string()),
+        Some(HrvLevel::Within) => reasons.push("The 7-day average is inside their normal range.".to_string()),
+        None => {}
+    }
+
+    if let Some(pt) = latest {
+        let week_ago = pt.date - Duration::days(7);
+        if let Some(earlier) = series.iter().rev().find(|p| p.date <= week_ago) {
+            let change = ((pt.mean_ln - earlier.mean_ln).exp() - 1.0) * 100.0;
+            if change.abs() < 3.0 {
+                reasons.push("It's been steady over the past week.".to_string());
+            } else {
+                reasons.push(format!(
+                    "It has {} {}% over the past week.",
+                    if change > 0.0 { "risen" } else { "fallen" },
+                    change.abs().round() as i32
+                ));
+            }
+        }
+    }
+
+    let jumpy = latest
+        .and_then(|pt| pt.usual_cv.map(|u| pt.cv > u * 1.5))
+        .unwrap_or(false);
+    if jumpy {
+        reasons.push("It's swinging more than usual from one morning to the next.".to_string());
+    }
+
+    let mut rhr_vals: Vec<i32> = days
+        .iter()
+        .filter_map(|d| NaiveDate::parse_from_str(&d.date, "%Y-%m-%d").ok().zip(d.resting_hr))
+        .filter(|&(_, r)| r > 0)
+        .map(|(nd, r)| (nd, r))
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .map(|(_, r)| r)
+        .collect();
+    if rhr_vals.len() >= 24 {
+        let rhr_now: Vec<f64> = rhr_vals.drain(..7).map(|v| v as f64).collect();
+        let rhr_before: Vec<f64> = rhr_vals.into_iter().take(60).map(|v| v as f64).collect();
+        if let (Some(now_m), Some(prev_m)) = (mean_f64(&rhr_now), mean_f64(&rhr_before)) {
+            let diff = now_m - prev_m;
+            if diff.abs() >= 2.0 {
+                reasons.push(format!(
+                    "Resting heart rate is {} bpm {} usual.",
+                    diff.abs().round() as i32,
+                    if diff > 0.0 { "above" } else { "below" }
+                ));
+            }
+        }
+    }
+
+    let week_cutoff = (today_date - Duration::days(6)).format("%Y-%m-%d").to_string();
+    let month_cutoff = (today_date - Duration::days(27)).format("%Y-%m-%d").to_string();
+    let acute: f64 = activities
+        .iter()
+        .filter(|a| a.start_iso.get(..10).unwrap_or("") >= week_cutoff.as_str())
+        .filter_map(|a| a.training_load)
+        .sum();
+    let chronic: f64 = activities
+        .iter()
+        .filter(|a| a.start_iso.get(..10).unwrap_or("") >= month_cutoff.as_str())
+        .filter_map(|a| a.training_load)
+        .sum::<f64>()
+        / 4.0;
+    if chronic > 0.0 {
+        let ratio = acute / chronic;
+        if ratio > 1.3 {
+            observations.push(format!(
+                "This week's training load is {ratio:.1} times the usual week, a big step up."
+            ));
+        } else if ratio < 0.7 {
+            observations.push("This week's training has been lighter than usual.".to_string());
+        }
+    }
+
+    let resting_up = reasons.iter().any(|r| r.contains("Resting heart rate is") && r.contains("above"));
+    let (verdict, advice) = match level {
+        Some(HrvLevel::Below) if jumpy || resting_up => (
+            "Under strain",
+            "Keep the next two or three days easy and give sleep priority, until the average is back in range.",
+        ),
+        Some(HrvLevel::Below) => (
+            "A little low",
+            "Go easy today and see where it is tomorrow; one hard session can wait.",
+        ),
+        Some(HrvLevel::Within) if jumpy => (
+            "In range, but jumpy",
+            "Train as planned but keep the easy days easy, and watch how it settles.",
+        ),
+        Some(HrvLevel::Within) => (
+            "In balance",
+            "The body is handling the training well, so carry on as planned.",
+        ),
+        Some(HrvLevel::Above) => (
+            "Above normal",
+            "A good window for a hard session, if the legs agree.",
+        ),
+        None => (
+            "Still learning your normal",
+            "Keep wearing the watch at night; after about 60 days there's a normal range to compare with.",
+        ),
+    };
+
+    let mut lines = vec![
+        "Topic: heart rate variability (HRV), measured overnight by the watch. Higher than your normal usually means well recovered.".to_string(),
+        format!("Verdict: {verdict}."),
+    ];
+    lines.extend(reasons);
+    if !observations.is_empty() {
+        lines.push("Observations:".to_string());
+        lines.extend(observations);
+    }
+    lines.push(format!("Advice: {advice}"));
+    Some(lines.join("\n"))
+}
+
+pub async fn generate_health_take(
+    scope: &str,
+    api_key: &str,
+    store: &SharedStore,
+    config: &AthleteConfig,
+    activities: &[ActivityRecord],
+    days: &[DayRecord],
+    model_settings: &ModelSettings,
+    night_date: &str,
+    today_date: NaiveDate,
+) -> Result<DailyBriefingRecord, String> {
+    let resolved = resolve_model(ModelScope::Background, model_settings);
+    let facts = match scope {
+        "sleep_take" => build_sleep_take_facts(days, today_date)
+            .ok_or_else(|| "No sleep data available yet to summarize.".to_string())?,
+        "hrv_take" => build_hrv_take_facts(days, activities, today_date)
+            .ok_or_else(|| "No HRV data available yet to summarize.".to_string())?,
+        other => return Err(format!("Unsupported health take scope: {other}")),
+    };
+
+    let name = config.specs.display_name.trim();
+    let who = if name.is_empty() { "someone" } else { name };
+    #[allow(unused_mut)]
+    let mut sys_parts = vec![format!(
+        "You are a friendly, sharp coach explaining {who}'s watch data to them like a smart friend would.\nReturn valid JSON matching the schema: headline, body, action_cue.\n- headline: one short, playful line (under 8 words, one relevant emoji) that puts the verdict in your own words.\n- body: 2 short paragraphs (1-2 sentences each, under 85 words total, plain text without markdown lists or bold) covering where things stand and the pattern behind it, using only numbers present in the facts.\n- action_cue: the advice, concisely worded.\nNever invent numbers or medical diagnoses. Never use em dashes (—); use commas or full stops instead."
+    )];
+    #[cfg(feature = "beta-coach")]
+    sys_parts.push(
+        "BETA COACH PERSONA DIRECTIVE: Keep every physiological metric 100% accurate while adding dry, deadpan wit."
+            .to_string(),
+    );
+
+    let endpoint = format!(
+        "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={api_key}",
+        resolved.model_id
+    );
+    let body = json!({
+        "systemInstruction": { "parts": [{ "text": sys_parts.join("\n\n") }] },
+        "contents": [{ "role": "user", "parts": [{ "text": facts }] }],
+        "generationConfig": {
+            "temperature": 0.4,
+            "maxOutputTokens": 2048,
+            "thinkingConfig": { "thinkingLevel": resolved.thinking_level.as_str() },
+            "responseMimeType": "application/json",
+            "responseSchema": {
+                "type": "OBJECT",
+                "properties": {
+                    "headline": { "type": "STRING" },
+                    "body": { "type": "STRING" },
+                    "action_cue": { "type": "STRING" }
+                },
+                "required": ["headline", "body", "action_cue"]
+            }
+        }
+    });
+
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let resp = client
+        .post(&endpoint)
+        .header("x-goog-api-key", api_key)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("Network error: {e}"))?;
+
+    if !resp.status().is_success() {
+        let code = resp.status();
+        if code.as_u16() == 429 {
+            return Err("Gemini rate limit reached (HTTP 429). Please wait a moment before trying again.".to_string());
+        }
+        let text = resp.text().await.unwrap_or_default();
+        return Err(format!("Gemini API error ({code}): {text}"));
+    }
+
+    let envelope: Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("Failed to decode Gemini response: {e}"))?;
+
+    if let Some(usage) = envelope.get("usageMetadata") {
+        let entry = CoachUsageEntry {
+            timestamp: Utc::now().to_rfc3339(),
+            profile: scope.to_uppercase(),
+            model: resolved.model_id.clone(),
+            prompt_tokens: usage["promptTokenCount"].as_i64().unwrap_or(0) as i32,
+            candidates_tokens: usage["candidatesTokenCount"].as_i64().unwrap_or(0) as i32,
+            thoughts_tokens: usage["thoughtsTokenCount"].as_i64().unwrap_or(0) as i32,
+            total_tokens: usage["totalTokenCount"].as_i64().unwrap_or(0) as i32,
+            finish_reason: envelope["candidates"][0]["finishReason"]
+                .as_str()
+                .unwrap_or("STOP")
+                .to_string(),
+        };
+        let _ = store.append_usage_log(&entry);
+    }
+
+    let parts = envelope["candidates"][0]["content"]["parts"]
+        .as_array()
+        .ok_or_else(|| "Gemini returned no candidate parts.".to_string())?;
+    let raw_text = parts
+        .iter()
+        .filter(|p| p["thought"].as_bool() != Some(true))
+        .filter_map(|p| p["text"].as_str())
+        .map(str::trim)
+        .find(|s| !s.is_empty())
+        .ok_or_else(|| "Gemini returned empty text.".to_string())?;
+
+    let mut clean = raw_text.trim();
+    if let Some(rest) = clean.strip_prefix("```json") {
+        clean = rest.trim();
+    } else if let Some(rest) = clean.strip_prefix("```") {
+        clean = rest.trim();
+    }
+    if let Some(rest) = clean.strip_suffix("```") {
+        clean = rest.trim();
+    }
+
+    let parsed: Value = serde_json::from_str(clean)
+        .map_err(|e| format!("Failed to parse structured health take JSON: {e}"))?;
+
+    let default_head = if scope == "sleep_take" { "Your sleep" } else { "Your HRV" };
+    let headline = without_dashes(parsed["headline"].as_str().unwrap_or(default_head).trim());
+    let body_text = without_dashes(parsed["body"].as_str().unwrap_or("").trim());
+    let action_cue = without_dashes(parsed["action_cue"].as_str().unwrap_or("").trim());
+
+    Ok(DailyBriefingRecord {
+        date: night_date.to_string(),
+        headline,
+        body: body_text,
+        action_cue,
+        model_id: resolved.model_id,
+        thinking_level: resolved.thinking_level.as_str().to_string(),
+        had_sleep: scope == "sleep_take",
         generated_at: Utc::now().to_rfc3339(),
     })
 }
