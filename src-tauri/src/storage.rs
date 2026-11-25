@@ -2,7 +2,7 @@ use crate::models::*;
 use chrono::{Datelike, Duration, Local, NaiveDate};
 use rusqlite::{params, Connection};
 use serde::{de::DeserializeOwned, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -582,6 +582,8 @@ impl Database {
             fs::create_dir_all(parent)?;
         }
         let conn = Connection::open(path)?;
+        let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
+        let _ = conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;");
         let db = Self { conn: Mutex::new(conn) };
         db.migrate()?;
         Ok(db)
@@ -1008,6 +1010,68 @@ impl Database {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
+    pub fn upsert_activities_batch(&self, acts: &[ActivityRecord]) -> Result<(), StorageError> {
+        if acts.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO activities (
+                    garmin_id, name, type_key, start_iso, distance_m, duration_sec, moving_duration_sec,
+                    elevation_gain_m, average_hr, max_hr, cadence_spm, training_load, shoe_name, is_hyrox, post_run_context_json, fit_temp_source, garmin_notes, is_pr, start_latitude, start_longitude
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)
+                ON CONFLICT(garmin_id) DO UPDATE SET
+                    name=excluded.name, type_key=excluded.type_key, start_iso=excluded.start_iso,
+                    distance_m=excluded.distance_m, duration_sec=excluded.duration_sec,
+                    moving_duration_sec=excluded.moving_duration_sec, elevation_gain_m=excluded.elevation_gain_m,
+                    average_hr=excluded.average_hr, max_hr=excluded.max_hr, cadence_spm=excluded.cadence_spm,
+                    training_load=excluded.training_load, shoe_name=excluded.shoe_name,
+                    is_hyrox=COALESCE(excluded.is_hyrox, activities.is_hyrox),
+                    post_run_context_json=COALESCE(excluded.post_run_context_json, activities.post_run_context_json),
+                    fit_temp_source=COALESCE(excluded.fit_temp_source, activities.fit_temp_source),
+                    garmin_notes=COALESCE(excluded.garmin_notes, activities.garmin_notes),
+                    is_pr=COALESCE(excluded.is_pr, activities.is_pr),
+                    start_latitude=COALESCE(excluded.start_latitude, activities.start_latitude),
+                    start_longitude=COALESCE(excluded.start_longitude, activities.start_longitude)",
+            )?;
+            for act in acts {
+                let hyrox_int = act.is_hyrox.map(|b| if b { 1i64 } else { 0i64 });
+                let is_pr_int = act.is_pr.map(|b| if b { 1i64 } else { 0i64 });
+                let post_run_json = act
+                    .post_run_context
+                    .as_ref()
+                    .and_then(|c| serde_json::to_string(c).ok());
+                let cleaned_notes = act.normalized_notes();
+                stmt.execute(params![
+                    act.garmin_id,
+                    act.name,
+                    act.type_key,
+                    act.start_iso,
+                    act.distance_m,
+                    act.duration_sec,
+                    act.moving_duration_sec,
+                    act.elevation_gain_m,
+                    act.average_hr,
+                    act.max_hr,
+                    act.cadence_spm,
+                    act.training_load,
+                    act.shoe_name,
+                    hyrox_int,
+                    post_run_json,
+                    act.fit_temp_source,
+                    cleaned_notes,
+                    is_pr_int,
+                    act.start_latitude,
+                    act.start_longitude
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn upsert_activity(&self, act: &ActivityRecord) -> Result<(), StorageError> {
         let hyrox_int = act.is_hyrox.map(|b| if b { 1i64 } else { 0i64 });
         let is_pr_int = act.is_pr.map(|b| if b { 1i64 } else { 0i64 });
@@ -1423,20 +1487,39 @@ impl Database {
     }
 
     pub fn compute_personal_records(&self) -> Result<RecordsPayload, StorageError> {
-        let activities = self.list_activities(10_000)?;
-        let mut tracks_map: HashMap<i64, Vec<FitTrackPoint>> = HashMap::new();
-        {
-            let conn = self.conn.lock().unwrap();
-            let mut stmt = conn.prepare("SELECT garmin_id, track_json FROM fit_tracks")?;
-            let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
-            for row in rows.flatten() {
-                if let Ok(parsed) = serde_json::from_str::<FitTrackAnalysis>(&row.1) {
-                    if !parsed.full_points.is_empty() {
-                        tracks_map.insert(row.0, parsed.full_points);
-                    }
-                }
-            }
+        self.compute_personal_records_with_progress(|_, _, _| {})
+    }
+
+    pub fn compute_personal_records_with_progress<F>(
+        &self,
+        mut on_progress: F,
+    ) -> Result<RecordsPayload, StorageError>
+    where
+        F: FnMut(usize, usize, &str),
+    {
+        #[derive(serde::Deserialize)]
+        struct MinimalFitPoints {
+            #[serde(default)]
+            full_points: Vec<FitTrackPoint>,
         }
+
+        let activities = self.list_activities(20_000)?;
+        let fit_track_ids: HashSet<i64> = {
+            let conn = self.conn.lock().unwrap();
+            let mut stmt = conn.prepare("SELECT garmin_id FROM fit_tracks")?;
+            let rows = stmt.query_map([], |r| r.get::<_, i64>(0))?;
+            rows.filter_map(Result::ok).collect()
+        };
+
+        let outdoor_candidates_total = activities
+            .iter()
+            .filter(|a| is_outdoor_run(a) && a.distance_m >= 1_000.0)
+            .count();
+        on_progress(
+            0,
+            outdoor_candidates_total,
+            "Scanning synced activities & cached FIT tracks…",
+        );
 
         const STANDARD_DISTANCES: [(&str, f64); 5] = [
             ("1K", 1_000.0),
@@ -1468,12 +1551,28 @@ impl Database {
                 a.duration_sec
             };
 
-            if let Some(points) = tracks_map.get(&a.garmin_id).filter(|p| p.len() >= 10) {
+            let fit_points_opt: Option<Vec<FitTrackPoint>> = if fit_track_ids.contains(&a.garmin_id) {
+                let raw_json: Option<String> = {
+                    let conn = self.conn.lock().unwrap();
+                    let mut stmt =
+                        conn.prepare_cached("SELECT track_json FROM fit_tracks WHERE garmin_id = ?1 LIMIT 1")?;
+                    let mut rows = stmt.query_map(params![a.garmin_id], |r| r.get::<_, String>(0))?;
+                    rows.next().and_then(Result::ok)
+                };
+                raw_json
+                    .and_then(|txt| serde_json::from_str::<MinimalFitPoints>(&txt).ok())
+                    .map(|m| m.full_points)
+                    .filter(|p| p.len() >= 10)
+            } else {
+                None
+            };
+
+            if let Some(points) = fit_points_opt {
                 scanned_fit_runs += 1;
                 let max_track_dist = points.last().map(|p| p.distance_m).unwrap_or(0.0);
                 for &(label, target_m) in &STANDARD_DISTANCES {
                     if max_track_dist >= target_m {
-                        if let Some((best_sec, seg_hr)) = fastest_stretch_in_points(points, target_m) {
+                        if let Some((best_sec, seg_hr)) = fastest_stretch_in_points(&points, target_m) {
                             efforts.push(DistanceRecordEntry {
                                 label: label.to_string(),
                                 distance_m: target_m,
@@ -1505,10 +1604,7 @@ impl Database {
                         }
                     }
                 }
-            } else {
-                if active_sec <= 0.0 || a.distance_m <= 0.0 {
-                    continue;
-                }
+            } else if active_sec > 0.0 && a.distance_m > 0.0 {
                 for &(label, target_m) in &STANDARD_DISTANCES {
                     if a.distance_m < target_m * 0.99 {
                         continue;
@@ -1529,7 +1625,23 @@ impl Database {
                     }
                 }
             }
+
+            if total_outdoor_runs % 25 == 0 {
+                on_progress(
+                    total_outdoor_runs,
+                    outdoor_candidates_total,
+                    &format!(
+                        "Scanning activities & candidate FIT tracks ({total_outdoor_runs} / {outdoor_candidates_total})…"
+                    ),
+                );
+            }
         }
+
+        on_progress(
+            outdoor_candidates_total,
+            outdoor_candidates_total,
+            "Finalizing personal records & milestones…",
+        );
 
         let mut distance_records = Vec::new();
         for &(label, _) in &STANDARD_DISTANCES {

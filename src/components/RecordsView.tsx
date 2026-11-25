@@ -1,10 +1,11 @@
 import { Award, Download, Flag, RefreshCw, Trophy } from "lucide-react";
-import type { RecordsPayload } from "../types";
+import type { RecordsPayload, RecordsProgressEvent } from "../types";
 
 interface RecordsViewProps {
   records: RecordsPayload | null;
   loading: boolean;
   error: string | null;
+  progress?: RecordsProgressEvent | null;
   onRefresh: () => void;
   onOpenActivity: (activityId: number) => void;
   hasGarminKey?: boolean;
@@ -36,6 +37,7 @@ export function RecordsView({
   records,
   loading,
   error,
+  progress = null,
   onRefresh,
   onOpenActivity,
   hasGarminKey = false,
@@ -43,11 +45,29 @@ export function RecordsView({
   backfillBusy = false,
   onBackfillHistory,
 }: RecordsViewProps) {
+  const pct =
+    progress && progress.total > 0
+      ? Math.min(100, Math.max(4, Math.round((progress.processed / progress.total) * 100)))
+      : null;
+
   if (loading && !records) {
     return (
-      <div className="card">
-        <h3 style={{ marginTop: 0 }}>Records</h3>
-        <div className="muted">Scanning your synced activities and cached FIT tracks…</div>
+      <div className="card records-progress-card">
+        <div className="card-header" style={{ marginBottom: 8 }}>
+          <h3 style={{ margin: 0 }}>Records</h3>
+          <span className="muted" style={{ fontSize: 12, fontVariantNumeric: "tabular-nums" }}>
+            {progress && progress.total > 0 ? `${progress.processed} / ${progress.total}` : "Preparing…"}
+          </span>
+        </div>
+        <div className="muted" style={{ fontSize: 13, marginBottom: 10 }}>
+          {progress?.message || "Scanning your synced activities and cached FIT tracks…"}
+        </div>
+        <div className="progress-track">
+          <div
+            className={`progress-fill ${pct == null ? "indeterminate" : ""}`}
+            style={pct != null ? { width: `${pct}%` } : undefined}
+          />
+        </div>
       </div>
     );
   }
@@ -139,6 +159,37 @@ export function RecordsView({
           </button>
         </div>
       </div>
+
+      {loading && (
+        <div className="backfill-progress-strip" style={{ marginBottom: 12 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, marginBottom: 5 }}>
+            <span className="muted">
+              {progress?.message || "Recomputing personal records…"}
+            </span>
+            <span className="muted" style={{ fontVariantNumeric: "tabular-nums" }}>
+              {progress && progress.total > 0 ? `${progress.processed} / ${progress.total}` : ""}
+            </span>
+          </div>
+          <div className="progress-track">
+            <div
+              className={`progress-fill ${pct == null ? "indeterminate" : ""}`}
+              style={pct != null ? { width: `${pct}%` } : undefined}
+            />
+          </div>
+        </div>
+      )}
+
+      {error && (
+        <div
+          className="card"
+          style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, marginBottom: 12 }}
+        >
+          <span className="key-status-err">{error}</span>
+          <button type="button" className="secondary" onClick={onRefresh}>
+            Retry
+          </button>
+        </div>
+      )}
 
       {/* Standard Distance Personal Records */}
       <div className="card">

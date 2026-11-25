@@ -50,6 +50,7 @@ import {
   type AnalyticsDatasetPayload,
   type AthleteConfig,
   type AthleteType,
+  type BackfillProgressEvent,
   type BodyBatteryPoint,
   type BootstrapState,
   type CachedHealthTakes,
@@ -67,6 +68,7 @@ import {
   type PostRunContext,
   type RaceDistancePreset,
   type RecordsPayload,
+  type RecordsProgressEvent,
   type ThemeMode,
   type ThinkingLevel,
   type TrainingDiscipline,
@@ -374,14 +376,19 @@ export default function App() {
   const [recordsData, setRecordsData] = useState<RecordsPayload | null>(null);
   const [recordsLoading, setRecordsLoading] = useState(false);
   const [recordsError, setRecordsError] = useState<string | null>(null);
+  const [recordsProgress, setRecordsProgress] = useState<RecordsProgressEvent | null>(null);
   const [explorerFilter, setExplorerFilter] = useState<ExplorerSportFilter>("run");
   const [explorerData, setExplorerData] = useState<ExplorerSummaryPayload | null>(null);
   const [explorerLoading, setExplorerLoading] = useState(false);
   const [explorerError, setExplorerError] = useState<string | null>(null);
   const [backfillBusy, setBackfillBusy] = useState(false);
+  const [syncWatchBusy, setSyncWatchBusy] = useState(false);
+  const [backfillProgress, setBackfillProgress] = useState<BackfillProgressEvent | null>(null);
   const [backfillStatus, setBackfillStatus] = useState<string | null>(null);
   const [syncEpoch, setSyncEpoch] = useState(0);
   const autoBackfillTriggeredRef = useRef(false);
+  const recordsReqIdRef = useRef(0);
+  const analyticsReqIdRef = useRef(0);
   const [sleepTake, setSleepTake] = useState<DailyBriefingRecord | null>(null);
   const [hrvTake, setHrvTake] = useState<DailyBriefingRecord | null>(null);
 
@@ -411,7 +418,7 @@ export default function App() {
   const [confirmCleanSlate, setConfirmCleanSlate] = useState(false);
   const [cleanSlateBusy, setCleanSlateBusy] = useState(false);
 
-  const [appVersion, setAppVersion] = useState<string>("0.2.5.1-beta");
+  const [appVersion, setAppVersion] = useState<string>("0.2.5.2-beta");
   const [bootstrapError, setBootstrapError] = useState<string | null>(null);
   const [themeMode, setThemeMode] = useState<ThemeMode>(() => {
     try {
@@ -611,28 +618,25 @@ export default function App() {
 
   useEffect(() => {
     if (!isOnboarded) return;
-    if (
-      (tab === "trends" || tab === "sleep" || tab === "hrv") &&
-      !analyticsData &&
-      !analyticsLoading
-    ) {
-      let cancelled = false;
+    if ((tab === "trends" || tab === "sleep" || tab === "hrv") && !analyticsData) {
+      const reqId = ++analyticsReqIdRef.current;
       setAnalyticsLoading(true);
-      void invoke<AnalyticsDatasetPayload>("get_analytics_dataset")
-        .then((res) => {
-          if (!cancelled) setAnalyticsData(res);
-        })
-        .catch(() => {
+      void (async () => {
+        try {
+          const res = await invoke<AnalyticsDatasetPayload>("get_analytics_dataset");
+          if (analyticsReqIdRef.current === reqId) {
+            setAnalyticsData(res);
+          }
+        } catch {
           // Falls back to bootstrap activities/days if lazy fetch fails
-        })
-        .finally(() => {
-          if (!cancelled) setAnalyticsLoading(false);
-        });
-      return () => {
-        cancelled = true;
-      };
+        } finally {
+          if (analyticsReqIdRef.current === reqId) {
+            setAnalyticsLoading(false);
+          }
+        }
+      })();
     }
-  }, [isOnboarded, tab, analyticsData, analyticsLoading, syncEpoch]);
+  }, [isOnboarded, tab, analyticsData, syncEpoch]);
 
   useEffect(() => {
     if (!isOnboarded) return;
@@ -653,24 +657,29 @@ export default function App() {
 
   useEffect(() => {
     if (!isOnboarded || tab !== "records") return;
-    if (recordsData || recordsLoading) return;
-    let cancelled = false;
+    if (recordsData) return;
+    const reqId = ++recordsReqIdRef.current;
     setRecordsLoading(true);
     setRecordsError(null);
-    void invoke<RecordsPayload>("get_records_summary")
-      .then((res) => {
-        if (!cancelled) setRecordsData(res);
-      })
-      .catch((err) => {
-        if (!cancelled) setRecordsError(err instanceof Error ? err.message : String(err));
-      })
-      .finally(() => {
-        if (!cancelled) setRecordsLoading(false);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [isOnboarded, tab, recordsData, recordsLoading, syncEpoch]);
+    setRecordsProgress(null);
+    void (async () => {
+      try {
+        const res = await invoke<RecordsPayload>("get_records_summary");
+        if (recordsReqIdRef.current === reqId) {
+          setRecordsData(res);
+        }
+      } catch (err) {
+        if (recordsReqIdRef.current === reqId) {
+          setRecordsError(err instanceof Error ? err.message : String(err));
+        }
+      } finally {
+        if (recordsReqIdRef.current === reqId) {
+          setRecordsLoading(false);
+          setRecordsProgress(null);
+        }
+      }
+    })();
+  }, [isOnboarded, tab, recordsData, syncEpoch]);
 
   useEffect(() => {
     if (!isOnboarded || tab !== "explorer") return;
@@ -697,6 +706,12 @@ export default function App() {
   async function handleFullHistoryBackfill() {
     if (backfillBusy) return;
     setBackfillBusy(true);
+    setBackfillProgress({
+      phase: "fetching",
+      page: 1,
+      fetched: 0,
+      message: "Syncing full Garmin history & GPS coordinates…",
+    });
     setBackfillStatus("Syncing full Garmin history & GPS coordinates…");
     try {
       const res = await invoke<{
@@ -714,6 +729,7 @@ export default function App() {
       setBackfillStatus(`Backfill failed: ${err instanceof Error ? err.message : String(err)}`);
     } finally {
       setBackfillBusy(false);
+      setTimeout(() => setBackfillProgress(null), 1200);
     }
   }
 
@@ -748,9 +764,23 @@ export default function App() {
       }
     );
 
+    const unlistenRecords = listen<RecordsProgressEvent>("records-progress", (event) => {
+      if (event.payload) {
+        setRecordsProgress(event.payload);
+      }
+    });
+
+    const unlistenBackfill = listen<BackfillProgressEvent>("backfill-progress", (event) => {
+      if (event.payload) {
+        setBackfillProgress(event.payload);
+      }
+    });
+
     return () => {
       void unlistenDelta.then((f) => f());
       void unlistenTool.then((f) => f());
+      void unlistenRecords.then((f) => f());
+      void unlistenBackfill.then((f) => f());
     };
   }, []);
 
@@ -1293,15 +1323,24 @@ export default function App() {
   }
 
   async function refreshRecordsSummary() {
+    const reqId = ++recordsReqIdRef.current;
     setRecordsLoading(true);
     setRecordsError(null);
+    setRecordsProgress(null);
     try {
       const res = await invoke<RecordsPayload>("get_records_summary");
-      setRecordsData(res);
+      if (recordsReqIdRef.current === reqId) {
+        setRecordsData(res);
+      }
     } catch (err) {
-      setRecordsError(err instanceof Error ? err.message : String(err));
+      if (recordsReqIdRef.current === reqId) {
+        setRecordsError(err instanceof Error ? err.message : String(err));
+      }
     } finally {
-      setRecordsLoading(false);
+      if (recordsReqIdRef.current === reqId) {
+        setRecordsLoading(false);
+        setRecordsProgress(null);
+      }
     }
   }
 
@@ -1615,9 +1654,16 @@ export default function App() {
           <button
             className="secondary"
             style={{ width: "100%", display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }}
-            disabled={busy}
+            disabled={busy || syncWatchBusy || backfillBusy}
             onClick={async () => {
               setBusy(true);
+              setSyncWatchBusy(true);
+              setBackfillProgress({
+                phase: "fetching",
+                page: 1,
+                fetched: 0,
+                message: "Syncing watch activities & wellness…",
+              });
               try {
                 await invoke("sync_garmin_now");
                 setAnalyticsData(null);
@@ -1629,11 +1675,36 @@ export default function App() {
                 await reload();
               } finally {
                 setBusy(false);
+                setSyncWatchBusy(false);
+                setTimeout(() => setBackfillProgress(null), 1200);
               }
             }}
           >
-            <RefreshCw size={14} /> Sync Watch
+            <RefreshCw size={14} /> {syncWatchBusy || backfillBusy ? "Syncing…" : "Sync Watch"}
           </button>
+          {(syncWatchBusy || backfillBusy) && (
+            <div className="sidebar-sync-progress">
+              <div className="sidebar-sync-msg">
+                {backfillProgress?.message || "Syncing Garmin data…"}
+              </div>
+              <div className="progress-track">
+                <div
+                  className={`progress-fill ${
+                    backfillProgress?.phase === "saving" || backfillProgress?.phase === "done"
+                      ? ""
+                      : "indeterminate"
+                  }`}
+                  style={
+                    backfillProgress?.phase === "done"
+                      ? { width: "100%" }
+                      : backfillProgress?.phase === "saving"
+                      ? { width: "90%" }
+                      : undefined
+                  }
+                />
+              </div>
+            </div>
+          )}
         </div>
       </aside>
 
@@ -2401,6 +2472,7 @@ export default function App() {
               records={recordsData}
               loading={recordsLoading}
               error={recordsError}
+              progress={recordsProgress}
               onRefresh={() => void refreshRecordsSummary()}
               onOpenActivity={(id) => void openActivityById(id, "records")}
               hasGarminKey={state.has_garmin_key}
@@ -2425,6 +2497,7 @@ export default function App() {
               hasGarminKey={state.has_garmin_key}
               lifetimeBackfillCompleted={state.lifetime_backfill_completed ?? false}
               backfillBusy={backfillBusy}
+              backfillProgress={backfillProgress}
               onBackfillHistory={() => void handleFullHistoryBackfill()}
             />
           </ErrorBoundary>
@@ -2925,7 +2998,7 @@ export default function App() {
                       disabled={busy}
                       onClick={() => setChatInput(q.prompt)}
                     >
-                      <span className="starter-chip-tag">{q.tag}</span>
+                      <span className={`starter-chip-tag ${q.tag === "HYROX" ? "hyrox" : ""}`}>{q.tag}</span>
                       <span>{q.label}</span>
                     </button>
                   ))}

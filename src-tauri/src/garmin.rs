@@ -247,8 +247,33 @@ impl GarminClient {
         &self,
         initial_backfill: bool,
     ) -> Result<(Vec<ActivityRecord>, Vec<DayRecord>), GarminError> {
+        self.sync_lifetime_and_wellness_with_progress(initial_backfill, |_, _, _, _| {})
+            .await
+    }
+
+    pub async fn sync_lifetime_and_wellness_with_progress<F>(
+        &self,
+        initial_backfill: bool,
+        mut on_progress: F,
+    ) -> Result<(Vec<ActivityRecord>, Vec<DayRecord>), GarminError>
+    where
+        F: FnMut(&str, usize, usize, String),
+    {
         if !initial_backfill {
-            return self.sync_recent(35).await;
+            on_progress(
+                "fetching",
+                1,
+                0,
+                "Fetching recent Garmin activities & wellness…".to_string(),
+            );
+            let res = self.sync_recent(35).await?;
+            on_progress(
+                "fetching",
+                1,
+                res.0.len(),
+                format!("Fetched {} recent activities…", res.0.len()),
+            );
+            return Ok(res);
         }
 
         let now_utc = Utc::now();
@@ -257,9 +282,19 @@ impl GarminClient {
         const PAGE_SIZE: usize = 100;
         const MAX_PAGES: usize = 100;
 
-        for _ in 0..MAX_PAGES {
+        for page_idx in 0..MAX_PAGES {
+            let page_num = page_idx + 1;
             let start_param = start.to_string();
             let limit_param = PAGE_SIZE.to_string();
+            on_progress(
+                "fetching",
+                page_num,
+                activities.len(),
+                format!(
+                    "Fetching Garmin history page {page_num} ({} activities)…",
+                    activities.len()
+                ),
+            );
             let act_bytes = self
                 .get_bytes(
                     "/activitylist-service/activities/search/activities",
@@ -296,6 +331,15 @@ impl GarminClient {
                     start_longitude: dto.start_longitude,
                 });
             }
+            on_progress(
+                "fetching",
+                page_num,
+                activities.len(),
+                format!(
+                    "Fetching Garmin history page {page_num} ({} activities)…",
+                    activities.len()
+                ),
+            );
             if count < PAGE_SIZE {
                 break;
             }
@@ -303,6 +347,15 @@ impl GarminClient {
         }
 
         // 365-day wellness backfill in 28-day chunks (Garmin Personal API limit)
+        on_progress(
+            "fetching",
+            (activities.len() / PAGE_SIZE).max(1),
+            activities.len(),
+            format!(
+                "Fetching 365-day wellness & sleep history ({} activities fetched)…",
+                activities.len()
+            ),
+        );
         let end_date = Local::now().date_naive().max(now_utc.date_naive());
         let earliest = end_date - Duration::days(364);
         let days = self.sync_wellness_range(earliest, end_date).await;

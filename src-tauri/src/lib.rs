@@ -16,7 +16,7 @@ use storage::{AppSettings, CredentialStore, Database, SharedStore};
 use tauri::{
     menu::{Menu, MenuItem},
     tray::TrayIconBuilder,
-    AppHandle, Manager, State,
+    AppHandle, Emitter, Manager, State,
 };
 
 pub struct AppState {
@@ -308,17 +308,44 @@ fn recompute_readiness(state: State<'_, AppState>) -> Result<ReadinessState, Str
     Ok(output.readiness_state)
 }
 
+fn emit_backfill_progress(
+    app: Option<&AppHandle>,
+    phase: &str,
+    page: usize,
+    fetched: usize,
+    message: &str,
+) {
+    if let Some(handle) = app {
+        let _ = handle.emit(
+            "backfill-progress",
+            serde_json::json!({
+                "phase": phase,
+                "page": page,
+                "fetched": fetched,
+                "message": message,
+            }),
+        );
+    }
+}
+
 async fn perform_full_garmin_sync(
+    app: Option<&AppHandle>,
     store: &SharedStore,
-    db: &Database,
     force_lifetime: bool,
 ) -> Result<(usize, usize, usize, ReadinessState), String> {
-    let needs_lifetime = force_lifetime
-        || !db.is_lifetime_backfill_completed().unwrap_or(false)
-        || db.list_activities(1).map_err(|e| e.to_string())?.is_empty();
+    let db_path = store.root().join("state").join("splits.sqlite");
+    let needs_lifetime = {
+        let db = Database::open(&db_path).map_err(|e| e.to_string())?;
+        force_lifetime
+            || !db.is_lifetime_backfill_completed().unwrap_or(false)
+            || db.list_activities(1).map_err(|e| e.to_string())?.is_empty()
+    };
+
     let client = garmin::GarminClient::new(None);
     let (synced_activities, synced_days) = client
-        .sync_lifetime_and_wellness(needs_lifetime)
+        .sync_lifetime_and_wellness_with_progress(needs_lifetime, |phase, page, fetched, msg| {
+            emit_backfill_progress(app, phase, page, fetched, &msg);
+        })
         .await
         .map_err(|e| e.to_string())?;
 
@@ -329,9 +356,20 @@ async fn perform_full_garmin_sync(
     let acts = synced_activities.len();
     let days_count = synced_days.len();
     let weights_count = synced_weights.len();
-    for a in &synced_activities {
-        let _ = db.upsert_activity(a);
-    }
+    emit_backfill_progress(
+        app,
+        "saving",
+        0,
+        acts,
+        &format!("Saving {acts} activities and {days_count} wellness days to SQLite…"),
+    );
+
+    // Lightweight metadata-only upsert on rolling last 7 days before acquiring DB write lock
+    let recent_meta = client.fetch_recent_activity_metadata(7).await.ok();
+
+    let db = Database::open(&db_path).map_err(|e| e.to_string())?;
+    db.upsert_activities_batch(&synced_activities)
+        .map_err(|e| e.to_string())?;
     for d in &synced_days {
         let _ = db.upsert_day(d);
     }
@@ -342,9 +380,8 @@ async fn perform_full_garmin_sync(
         let _ = db.set_lifetime_backfill_completed(true);
     }
 
-    // Lightweight metadata-only upsert on rolling last 7 days to capture late Garmin Connect edits/notes
-    if let Ok(recent_meta) = client.fetch_recent_activity_metadata(7).await {
-        for m in recent_meta {
+    if let Some(meta_list) = recent_meta {
+        for m in meta_list {
             let _ = db.update_activity_metadata(
                 m.garmin_id,
                 m.name.as_deref(),
@@ -397,16 +434,25 @@ async fn perform_full_garmin_sync(
         gear_inventory: gear.as_ref(),
     });
     output.persist(store.root()).map_err(|e| e.to_string())?;
+    emit_backfill_progress(
+        app,
+        "done",
+        0,
+        acts,
+        &format!("Synced {acts} activities and {days_count} days."),
+    );
 
     Ok((acts, days_count, weights_count, output.readiness_state))
 }
 
 #[tauri::command]
-async fn sync_garmin_now(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+async fn sync_garmin_now(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
     let store = state.load_store()?;
-    let db = state.open_db()?;
     let (acts, days_count, weights_count, readiness_state) =
-        perform_full_garmin_sync(&store, &db, false).await?;
+        perform_full_garmin_sync(Some(&app), &store, false).await?;
 
     Ok(serde_json::json!({
         "synced_activities": acts,
@@ -417,11 +463,14 @@ async fn sync_garmin_now(state: State<'_, AppState>) -> Result<serde_json::Value
 }
 
 #[tauri::command]
-async fn backfill_lifetime_history(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+async fn backfill_lifetime_history(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
     let store = state.load_store()?;
-    let db = state.open_db()?;
     let (acts, days_count, weights_count, readiness_state) =
-        perform_full_garmin_sync(&store, &db, true).await?;
+        perform_full_garmin_sync(Some(&app), &store, true).await?;
+    let db = state.open_db()?;
     let total_activities = db.count_activities().unwrap_or(acts);
 
     Ok(serde_json::json!({
@@ -824,14 +873,15 @@ fn advance_first_use_stage(
 
 #[tauri::command]
 async fn complete_history_sync_stage(
+    app: AppHandle,
     state: State<'_, AppState>,
     run_garmin_sync: bool,
 ) -> Result<serde_json::Value, String> {
     let store = state.load_store()?;
-    let db = state.open_db()?;
     if run_garmin_sync {
-        perform_full_garmin_sync(&store, &db, false).await?;
+        perform_full_garmin_sync(Some(&app), &store, false).await?;
     }
+    let db = state.open_db()?;
 
     let mut flow = store.load_first_use_state().map_err(|e| e.to_string())?;
     let mut config = store.load_athlete_config().map_err(|e| e.to_string())?.unwrap_or_default();
@@ -1200,9 +1250,28 @@ fn get_analytics_dataset(state: State<'_, AppState>) -> Result<AnalyticsDatasetP
 }
 
 #[tauri::command]
-fn get_records_summary(state: State<'_, AppState>) -> Result<RecordsPayload, String> {
-    let db = state.open_db()?;
-    db.compute_personal_records().map_err(|e| e.to_string())
+async fn get_records_summary(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<RecordsPayload, String> {
+    let store = state.load_store()?;
+    let db_path = store.root().join("state").join("splits.sqlite");
+    tokio::task::spawn_blocking(move || {
+        let db = Database::open(&db_path).map_err(|e| e.to_string())?;
+        db.compute_personal_records_with_progress(|processed, total, msg| {
+            let _ = app.emit(
+                "records-progress",
+                serde_json::json!({
+                    "processed": processed,
+                    "total": total,
+                    "message": msg,
+                }),
+            );
+        })
+        .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("Records worker failed: {e}"))?
 }
 
 #[tauri::command]

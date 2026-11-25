@@ -2,6 +2,7 @@ import { useMemo, useRef, useState } from "react";
 import { Compass, Download, Minus, Plus, RefreshCw, RotateCcw } from "lucide-react";
 import worldCountriesRaw from "../data/worldCountries.json";
 import type {
+  BackfillProgressEvent,
   ExplorerCityVisit,
   ExplorerCountryVisit,
   ExplorerSportFilter,
@@ -31,6 +32,7 @@ interface ExplorerViewProps {
   hasGarminKey: boolean;
   lifetimeBackfillCompleted: boolean;
   backfillBusy: boolean;
+  backfillProgress?: BackfillProgressEvent | null;
   onBackfillHistory: () => void;
 }
 
@@ -180,6 +182,7 @@ export function ExplorerView({
   hasGarminKey,
   lifetimeBackfillCompleted,
   backfillBusy,
+  backfillProgress = null,
   onBackfillHistory,
 }: ExplorerViewProps) {
   const [selectedYear, setSelectedYear] = useState<number | null>(null);
@@ -457,6 +460,37 @@ export function ExplorerView({
       {error && (
         <div className="key-status-err" style={{ marginBottom: 10 }}>
           {error}
+        </div>
+      )}
+
+      {backfillBusy && (
+        <div className="backfill-progress-strip" style={{ marginBottom: 10 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, marginBottom: 5 }}>
+            <span className="muted">
+              {backfillProgress?.message || "Syncing full Garmin history & GPS coordinates…"}
+            </span>
+            <span className="muted" style={{ fontVariantNumeric: "tabular-nums" }}>
+              {backfillProgress && backfillProgress.fetched > 0
+                ? `${backfillProgress.fetched.toLocaleString()} fetched`
+                : ""}
+            </span>
+          </div>
+          <div className="progress-track">
+            <div
+              className={`progress-fill ${
+                backfillProgress?.phase === "saving" || backfillProgress?.phase === "done"
+                  ? ""
+                  : "indeterminate"
+              }`}
+              style={
+                backfillProgress?.phase === "done"
+                  ? { width: "100%" }
+                  : backfillProgress?.phase === "saving"
+                  ? { width: "90%" }
+                  : undefined
+              }
+            />
+          </div>
         </div>
       )}
 

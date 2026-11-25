@@ -743,6 +743,19 @@ export interface ExplorerSummaryPayload {
   total_activities_in_filter: number;
 }
 
+export interface BackfillProgressEvent {
+  phase: "fetching" | "saving" | "done" | string;
+  page: number;
+  fetched: number;
+  message: string;
+}
+
+export interface RecordsProgressEvent {
+  processed: number;
+  total: number;
+  message: string;
+}
+
 export function isHyroxDisciplineEnabled(
   profile: UserProfile | null | undefined,
   config: AthleteConfig | null | undefined

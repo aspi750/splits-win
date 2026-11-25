@@ -2554,3 +2554,81 @@ fn v0_2_5_1_explorer_multi_year_country_city_and_backfill_flag() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn v0_2_5_2_records_650_activities_completes_under_500ms_with_progress() {
+    let dir = make_temp_dir("records-perf-0252");
+    let db = Database::open(&dir.join("splits.sqlite")).unwrap();
+
+    let now = Utc::now();
+    let type_keys = ["running", "street_running", "trail_running", "track_running"];
+    let mut acts = Vec::with_capacity(660);
+    for i in 0..660i64 {
+        let tk = type_keys[(i as usize) % type_keys.len()];
+        let dist_m = match i % 5 {
+            0 => 42_250.0,
+            1 => 21_150.0,
+            2 => 10_050.0,
+            3 => 5_050.0,
+            _ => 1_200.0,
+        };
+        let dur_s = (dist_m / 3.8_f64).round();
+        acts.push(ActivityRecord {
+            garmin_id: 10_000 + i,
+            name: format!("Run #{i}"),
+            type_key: tk.to_string(),
+            start_iso: (now - Duration::days(i)).format("%Y-%m-%dT07:00:00Z").to_string(),
+            distance_m: dist_m,
+            duration_sec: dur_s,
+            moving_duration_sec: dur_s,
+            elevation_gain_m: 35.0 + (i % 80) as f64,
+            average_hr: Some(146.0),
+            max_hr: Some(166.0),
+            cadence_spm: Some(176.0),
+            training_load: Some(85.0),
+            shoe_name: Some("Superblast 3".to_string()),
+            is_hyrox: None,
+            post_run_context: None,
+            fit_temp_source: None,
+            garmin_notes: None,
+            is_pr: None,
+            start_latitude: Some(40.4168),
+            start_longitude: Some(-3.7038),
+        });
+    }
+    db.upsert_activities_batch(&acts).unwrap();
+
+    // Cache 1Hz FIT tracks on 5 runs to exercise MinimalFitPoints decoding
+    for i in 0..5i64 {
+        let pts: Vec<FitTrackPoint> = (0..=1400)
+            .map(|s| make_fit_point(s as f64, (s as f64) * 4.0, 4.0, Some(160.0), Some(180.0), Some(15.0)))
+            .collect();
+        let track = analyze_fit_points(10_000 + i, pts, &AthleteConfig::default());
+        db.upsert_fit_track(10_000 + i, &track).unwrap();
+    }
+
+    let mut progress_events = Vec::new();
+    let t0 = std::time::Instant::now();
+    let payload = db
+        .compute_personal_records_with_progress(|processed, total, msg| {
+            progress_events.push((processed, total, msg.to_string()));
+        })
+        .unwrap();
+    let elapsed = t0.elapsed();
+
+    assert!(
+        elapsed.as_millis() < 500,
+        "compute_personal_records across 660 activities took {:?} (expected < 500ms)",
+        elapsed
+    );
+    assert_eq!(payload.total_outdoor_runs, 660);
+    assert_eq!(payload.scanned_fit_runs, 5);
+    assert_eq!(payload.distance_records.len(), 5);
+    assert!(!payload.milestones.is_empty());
+    assert!(progress_events.len() >= 2);
+    let last = progress_events.last().unwrap();
+    assert_eq!(last.0, 660);
+    assert_eq!(last.1, 660);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
