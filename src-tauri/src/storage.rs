@@ -1595,22 +1595,29 @@ impl Database {
 
             let fit_points_opt: Option<Vec<FitTrackPoint>> = cached_fit
                 .map(|m| m.full_points)
-                .filter(|p| p.len() >= 10);
-
-            let whole_run_plausible = elapsed_sec > 0.0
-                && a.distance_m > 0.0
-                && plausible_run_effort(a.distance_m, elapsed_sec, a.average_hr);
+                .filter(|p| {
+                    p.len() >= 10
+                        && p.iter()
+                            .filter(|pt| has_valid_gps_coord(pt.latitude_deg, pt.longitude_deg))
+                            .count()
+                            >= 10
+                });
 
             if let Some(points) = fit_points_opt {
                 scanned_fit_runs += 1;
-                let max_track_dist = points.last().map(|p| p.distance_m).unwrap_or(0.0);
+                let track_span = points
+                    .last()
+                    .zip(points.first())
+                    .map(|(last, first)| last.distance_m - first.distance_m)
+                    .unwrap_or(0.0);
                 for &(label, target_m) in &STANDARD_DISTANCES {
-                    if max_track_dist >= target_m {
+                    if track_span >= target_m {
                         if let Some((best_sec, seg_hr)) = fastest_stretch_in_points(
                             &points,
                             target_m,
                             activity_avg_speed_mps,
                             a.cadence_spm,
+                            a.average_hr,
                         ) {
                             let effective_hr = seg_hr.or(a.average_hr);
                             if plausible_run_effort(target_m, best_sec, effective_hr) {
@@ -1625,61 +1632,8 @@ impl Database {
                                     average_hr: effective_hr,
                                     source: "fit_best_stretch".to_string(),
                                 });
-                                continue;
                             }
                         }
-                    }
-                    if whole_run_plausible && a.distance_m >= target_m * 0.99 {
-                        let scaled_sec = elapsed_sec * (target_m / a.distance_m);
-                        if plausible_run_effort(target_m, scaled_sec, a.average_hr)
-                            && !is_low_cadence_speed_spike(
-                                target_m,
-                                scaled_sec,
-                                activity_avg_speed_mps,
-                                a.cadence_spm,
-                                a.cadence_spm,
-                            )
-                        {
-                            efforts.push(DistanceRecordEntry {
-                                label: label.to_string(),
-                                distance_m: target_m,
-                                time_sec: scaled_sec,
-                                pace_sec_per_km: scaled_sec / (target_m / 1000.0),
-                                date: date_str.clone(),
-                                activity_id: a.garmin_id,
-                                activity_name: display_name.clone(),
-                                average_hr: a.average_hr,
-                                source: "activity_average".to_string(),
-                            });
-                        }
-                    }
-                }
-            } else if whole_run_plausible {
-                for &(label, target_m) in &STANDARD_DISTANCES {
-                    if a.distance_m < target_m * 0.99 {
-                        continue;
-                    }
-                    let scaled_sec = elapsed_sec * (target_m / a.distance_m);
-                    if plausible_run_effort(target_m, scaled_sec, a.average_hr)
-                        && !is_low_cadence_speed_spike(
-                            target_m,
-                            scaled_sec,
-                            activity_avg_speed_mps,
-                            a.cadence_spm,
-                            a.cadence_spm,
-                        )
-                    {
-                        efforts.push(DistanceRecordEntry {
-                            label: label.to_string(),
-                            distance_m: target_m,
-                            time_sec: scaled_sec,
-                            pace_sec_per_km: scaled_sec / (target_m / 1000.0),
-                            date: date_str.clone(),
-                            activity_id: a.garmin_id,
-                            activity_name: display_name.clone(),
-                            average_hr: a.average_hr,
-                            source: "activity_average".to_string(),
-                        });
                     }
                 }
             }
@@ -2321,22 +2275,82 @@ pub fn hr_plausible_for_speed(speed_mps: f64, avg_hr: Option<f64>) -> bool {
     true
 }
 
-pub fn is_gps_glitch_step(dd: f64, dt: f64) -> bool {
-    if dd < -5.0 {
-        return true;
-    }
-    if dd <= 0.0 {
+pub fn has_valid_gps_coord(lat: Option<f64>, lon: Option<f64>) -> bool {
+    let (Some(la), Some(lo)) = (lat, lon) else {
+        return false;
+    };
+    if !la.is_finite()
+        || !lo.is_finite()
+        || !(-90.0..=90.0).contains(&la)
+        || !(-180.0..=180.0).contains(&lo)
+    {
         return false;
     }
-    if dt <= 0.0 {
-        return dd > 25.0;
+    la.abs() > 1e-6 || lo.abs() > 1e-6
+}
+
+pub fn gps_glitch_step_meters(dd: f64, dt: f64) -> f64 {
+    if !dd.is_finite() || !dt.is_finite() {
+        return 0.0;
     }
-    (dd / dt) > 7.5 || (dt <= 1.5 && dd > 25.0) || (dt <= 5.0 && dd > 30.0)
+    if dd < -5.0 {
+        return dd.abs();
+    }
+    if dd <= 0.0 {
+        return 0.0;
+    }
+    if dt <= 0.0 {
+        return if dd > 7.5 { dd } else { 0.0 };
+    }
+    if (dd / dt) > 7.5 {
+        dd
+    } else {
+        0.0
+    }
+}
+
+pub fn max_glitch_meters_for_distance(distance_m: f64) -> f64 {
+    if distance_m <= 1_500.0 {
+        25.0
+    } else if distance_m <= 7_500.0 {
+        75.0
+    } else if distance_m <= 15_000.0 {
+        150.0
+    } else if distance_m <= 30_000.0 {
+        300.0
+    } else {
+        500.0
+    }
+}
+
+pub fn is_gps_glitch_step(dd: f64, dt: f64) -> bool {
+    gps_glitch_step_meters(dd, dt) > 0.0
 }
 
 pub fn normalize_cadence_spm(raw: Option<f64>) -> Option<f64> {
     let c = raw.filter(|v| v.is_finite() && *v > 0.0)?;
     Some(if c < 120.0 { c * 2.0 } else { c })
+}
+
+pub fn is_sparse_1k_speed_drift(
+    target_m: f64,
+    sec: f64,
+    activity_avg_speed_mps: Option<f64>,
+    median_sample_gap_sec: Option<f64>,
+) -> bool {
+    if target_m > 1_500.0 {
+        return false;
+    }
+    if !sec.is_finite() || sec <= 0.0 {
+        return true;
+    }
+    let Some(avg_spd) = activity_avg_speed_mps.filter(|v| v.is_finite() && *v > 0.0) else {
+        return false;
+    };
+    let Some(gap) = median_sample_gap_sec.filter(|v| v.is_finite()) else {
+        return false;
+    };
+    gap > 4.0 && (target_m / sec) > 1.55 * avg_spd
 }
 
 pub fn is_low_cadence_speed_spike(
@@ -2356,12 +2370,12 @@ pub fn is_low_cadence_speed_spike(
         return false;
     };
     let win_spd = target_m / sec;
-    if win_spd <= 1.85 * avg_spd {
+    if win_spd <= 1.75 * avg_spd {
         return false;
     }
     let eff_cad = normalize_cadence_spm(window_cadence_spm)
         .or_else(|| normalize_cadence_spm(activity_cadence_spm));
-    eff_cad.map_or(false, |c| c < 155.0)
+    eff_cad.map_or(true, |c| c < 160.0)
 }
 
 pub fn plausible_run_effort(distance_m: f64, sec: f64, avg_hr: Option<f64>) -> bool {
@@ -2380,22 +2394,36 @@ fn fastest_stretch_in_points(
     target_m: f64,
     activity_avg_speed_mps: Option<f64>,
     activity_cadence_spm: Option<f64>,
+    activity_avg_hr: Option<f64>,
 ) -> Option<(f64, Option<f64>)> {
     if points.len() < 2 || target_m <= 0.0 {
         return None;
     }
     let n = points.len();
-    let mut bad_prefix = vec![0usize; n];
+    let mut has_gps = vec![false; n];
+    let mut glitch_prefix = vec![0.0_f64; n];
+    let mut gps_count_prefix = vec![0usize; n + 1];
+    let mut gps_dist_prefix = vec![0.0_f64; n];
+    let mut sparse_gap_prefix = vec![0usize; n];
     let mut hr_sum = vec![0.0_f64; n + 1];
     let mut hr_cnt = vec![0usize; n + 1];
     let mut cad_sum = vec![0.0_f64; n + 1];
     let mut cad_cnt = vec![0usize; n + 1];
 
     for idx in 0..n {
+        has_gps[idx] = has_valid_gps_coord(points[idx].latitude_deg, points[idx].longitude_deg);
+        gps_count_prefix[idx + 1] = gps_count_prefix[idx] + usize::from(has_gps[idx]);
         if idx > 0 {
             let dd = points[idx].distance_m - points[idx - 1].distance_m;
             let dt = points[idx].timestamp_sec - points[idx - 1].timestamp_sec;
-            bad_prefix[idx] = bad_prefix[idx - 1] + usize::from(is_gps_glitch_step(dd, dt));
+            glitch_prefix[idx] = glitch_prefix[idx - 1] + gps_glitch_step_meters(dd, dt);
+            let step_gps_dist = if has_gps[idx] && has_gps[idx - 1] && dd.is_finite() && dd > 0.0 {
+                dd
+            } else {
+                0.0
+            };
+            gps_dist_prefix[idx] = gps_dist_prefix[idx - 1] + step_gps_dist;
+            sparse_gap_prefix[idx] = sparse_gap_prefix[idx - 1] + usize::from(dt > 4.0);
         }
         let hr = points[idx].heart_rate_bpm.filter(|v| v.is_finite() && *v > 0.0);
         hr_sum[idx + 1] = hr_sum[idx] + hr.unwrap_or(0.0);
@@ -2404,6 +2432,10 @@ fn fastest_stretch_in_points(
         let cad = normalize_cadence_spm(points[idx].cadence_spm);
         cad_sum[idx + 1] = cad_sum[idx] + cad.unwrap_or(0.0);
         cad_cnt[idx + 1] = cad_cnt[idx] + usize::from(cad.is_some());
+    }
+
+    if gps_count_prefix[n] < 10 {
+        return None;
     }
 
     let resolved_avg_speed = activity_avg_speed_mps.filter(|v| v.is_finite() && *v > 0.0).or_else(|| {
@@ -2423,6 +2455,7 @@ fn fastest_stretch_in_points(
         }
     });
 
+    let glitch_budget = max_glitch_meters_for_distance(target_m);
     let mut best_sec: Option<f64> = None;
     let mut best_hr: Option<f64> = None;
     let mut j = 0usize;
@@ -2435,9 +2468,16 @@ fn fastest_stretch_in_points(
         if j >= n {
             break;
         }
-        if bad_prefix[j] > bad_prefix[i] {
+        if (glitch_prefix[j] - glitch_prefix[i]) > glitch_budget {
             continue;
         }
+        if (gps_count_prefix[j + 1] - gps_count_prefix[i]) < 10 {
+            continue;
+        }
+        if (gps_dist_prefix[j] - gps_dist_prefix[i]) < target_m * 0.85 {
+            continue;
+        }
+
         let end_d = points[j].distance_m - start_d;
         let dt = if j > i && end_d > target_m {
             let prev_d = points[j - 1].distance_m - start_d;
@@ -2454,12 +2494,42 @@ fn fastest_stretch_in_points(
             points[j].timestamp_sec - points[i].timestamp_sec
         };
 
+        if !dt.is_finite() || dt <= 0.0 || best_sec.map_or(false, |b| dt >= b) {
+            continue;
+        }
+
+        let win_median_gap = if target_m <= 1_500.0 && j > i {
+            let steps = j - i;
+            let sparse_steps = sparse_gap_prefix[j] - sparse_gap_prefix[i];
+            if sparse_steps == 0 {
+                Some(1.0)
+            } else if sparse_steps * 2 > steps {
+                Some(5.0)
+            } else {
+                let mut gaps = Vec::with_capacity(steps);
+                for k in (i + 1)..=j {
+                    gaps.push(points[k].timestamp_sec - points[k - 1].timestamp_sec);
+                }
+                gaps.sort_by(|a, b| a.total_cmp(b));
+                let mid = gaps.len() / 2;
+                let med = if gaps.len() % 2 == 1 {
+                    gaps[mid]
+                } else {
+                    0.5 * (gaps[mid - 1] + gaps[mid])
+                };
+                Some(med)
+            }
+        } else {
+            None
+        };
+
         let h_count = hr_cnt[j + 1] - hr_cnt[i];
         let seg_hr = if h_count > 0 {
             Some((hr_sum[j + 1] - hr_sum[i]) / h_count as f64)
         } else {
             None
         };
+        let effective_hr = seg_hr.or(activity_avg_hr);
 
         let c_count = cad_cnt[j + 1] - cad_cnt[i];
         let seg_cad = if c_count > 0 {
@@ -2468,7 +2538,7 @@ fn fastest_stretch_in_points(
             None
         };
 
-        if plausible_run_effort(target_m, dt, seg_hr)
+        if plausible_run_effort(target_m, dt, effective_hr)
             && !is_low_cadence_speed_spike(
                 target_m,
                 dt,
@@ -2476,7 +2546,7 @@ fn fastest_stretch_in_points(
                 seg_cad,
                 resolved_act_cad,
             )
-            && best_sec.map_or(true, |b| dt < b)
+            && !is_sparse_1k_speed_drift(target_m, dt, resolved_avg_speed, win_median_gap)
         {
             best_sec = Some(dt);
             best_hr = seg_hr;

@@ -60,6 +60,53 @@ fn make_fit_point(
     }
 }
 
+fn make_gps_fit_point(
+    timestamp_sec: f64,
+    distance_m: f64,
+    speed_mps: f64,
+    hr_bpm: Option<f64>,
+    cadence_spm: Option<f64>,
+    altitude_m: Option<f64>,
+) -> FitTrackPoint {
+    let mut pt = make_fit_point(
+        timestamp_sec,
+        distance_m,
+        speed_mps,
+        hr_bpm,
+        cadence_spm,
+        altitude_m,
+    );
+    pt.latitude_deg = Some(40.4168 + distance_m * 0.00000898);
+    pt.longitude_deg = Some(-3.7038);
+    pt
+}
+
+fn make_gps_fit_track(
+    garmin_id: i64,
+    total_dist_m: f64,
+    total_sec: f64,
+    steps: usize,
+    hr_bpm: Option<f64>,
+    cadence_spm: Option<f64>,
+) -> FitTrackAnalysis {
+    let n = steps.max(15);
+    let spd = total_dist_m / total_sec.max(1.0);
+    let pts: Vec<FitTrackPoint> = (0..=n)
+        .map(|k| {
+            let frac = k as f64 / n as f64;
+            make_gps_fit_point(
+                total_sec * frac,
+                total_dist_m * frac,
+                spd,
+                hr_bpm,
+                cadence_spm,
+                Some(20.0),
+            )
+        })
+        .collect();
+    analyze_fit_points(garmin_id, pts, &AthleteConfig::default())
+}
+
 #[test]
 fn test_athlete_config_30d_median_rhr_calibration() {
     let now = Utc.with_ymd_and_hms(2026, 11, 16, 10, 0, 0).unwrap();
@@ -2281,11 +2328,11 @@ fn v0_2_5_records_aggregation_and_scoped_sleep_hrv_takes() {
     })
     .unwrap();
 
-    // Attach a 1Hz FIT track to activity 3001 with a 4:00/km (240s) 1K stretch inside a 10.2km run
+    // Attach a 1Hz GPS FIT track to activity 3001 with 4:10/km pace inside a 10.2km run
     let fit_points: Vec<FitTrackPoint> = (0..=2550)
         .map(|s| {
             let dist = (s as f64) * 4.0; // 4.0 m/s = 4:10/km, 2550*4 = 10200m
-            make_fit_point(s as f64, dist, 4.0, Some(166.0), Some(180.0), Some(10.0))
+            make_gps_fit_point(s as f64, dist, 4.0, Some(166.0), Some(180.0), Some(10.0))
         })
         .collect();
     let track = analyze_fit_points(3001, fit_points, &AthleteConfig::default());
@@ -2302,13 +2349,12 @@ fn v0_2_5_records_aggregation_and_scoped_sleep_hrv_takes() {
     assert_eq!(best_5k.source, "fit_best_stretch");
     assert!((best_5k.time_sec - 1250.0).abs() < 2.0);
 
-    let best_hm = records
+    // 3002 has no cached GPS FIT track -> must NOT receive a Run Avg / activity_average fallback PR,
+    // while still counting toward volume/elevation milestones.
+    assert!(records
         .distance_records
         .iter()
-        .find(|r| r.label == "Half Marathon")
-        .unwrap();
-    assert_eq!(best_hm.activity_id, 3002);
-    assert_eq!(best_hm.source, "activity_average");
+        .all(|r| r.label != "Half Marathon" && r.source == "fit_best_stretch"));
 
     assert!(records.milestones.iter().any(|m| m.key == "longest_run" && m.activity_id == Some(3002)));
     assert!(records.milestones.iter().any(|m| m.key == "biggest_elevation" && m.activity_id == Some(3002)));
@@ -2423,8 +2469,15 @@ fn v0_2_5_1_records_type_keys_and_bootstrap_onboarded_fix() {
     db.upsert_activity(&make_run(4003, "Morning 10K", "running", 20, 10_100.0, 2_550.0, 45.0)).unwrap();
     db.upsert_activity(&make_run(4004, "Trail Half", "trail_running", 12, 21_200.0, 6_000.0, 540.0)).unwrap();
     db.upsert_activity(&make_run(4005, "Marathon", "running", 5, 42_300.0, 12_600.0, 220.0)).unwrap();
-    // Treadmill run must be excluded from outdoor distance PRs
+    // Treadmill run must be excluded from outdoor distance PRs even if it has a FIT track
     db.upsert_activity(&make_run(4006, "Fast Treadmill", "treadmill_running", 2, 5_000.0, 900.0, 0.0)).unwrap();
+
+    db.upsert_fit_track(4001, &make_gps_fit_track(4001, 1_050.0, 220.0, 40, Some(165.0), Some(178.0))).unwrap();
+    db.upsert_fit_track(4002, &make_gps_fit_track(4002, 5_050.0, 1_200.0, 60, Some(168.0), Some(178.0))).unwrap();
+    db.upsert_fit_track(4003, &make_gps_fit_track(4003, 10_100.0, 2_550.0, 80, Some(165.0), Some(176.0))).unwrap();
+    db.upsert_fit_track(4004, &make_gps_fit_track(4004, 21_200.0, 6_000.0, 100, Some(158.0), Some(174.0))).unwrap();
+    db.upsert_fit_track(4005, &make_gps_fit_track(4005, 42_300.0, 12_600.0, 120, Some(155.0), Some(172.0))).unwrap();
+    db.upsert_fit_track(4006, &make_gps_fit_track(4006, 5_000.0, 900.0, 50, Some(160.0), Some(180.0))).unwrap();
 
     let records = db.compute_personal_records().unwrap();
     assert_eq!(records.total_outdoor_runs, 5);
@@ -2598,12 +2651,9 @@ fn v0_2_5_2_records_650_activities_completes_under_500ms_with_progress() {
     }
     db.upsert_activities_batch(&acts).unwrap();
 
-    // Cache 1Hz FIT tracks on 5 runs to exercise MinimalFitPoints decoding
+    // Cache GPS FIT tracks on 5 runs (including Marathon-length, <=95m/step so 1K has >=10 GPS points)
     for i in 0..5i64 {
-        let pts: Vec<FitTrackPoint> = (0..=1400)
-            .map(|s| make_fit_point(s as f64, (s as f64) * 4.0, 4.0, Some(160.0), Some(180.0), Some(15.0)))
-            .collect();
-        let track = analyze_fit_points(10_000 + i, pts, &AthleteConfig::default());
+        let track = make_gps_fit_track(10_000 + i, 42_250.0, 42_250.0 / 3.8, 450, Some(160.0), Some(180.0));
         db.upsert_fit_track(10_000 + i, &track).unwrap();
     }
 
@@ -2689,7 +2739,7 @@ fn v0_2_5_3_records_rejects_gps_corrupted_outlier_and_builds_progression() {
     ))
     .unwrap();
 
-    // Real PR runs matching macOS Records view + historical progression
+    // Real PR runs matching macOS Records view + historical progression (with GPS FIT tracks)
     db.upsert_activity(&make_run(9100, "2020 Base 5K", "2020-03-10T08:00:00Z".to_string(), 5_000.0, 1_500.0, Some(165.0))).unwrap();
     db.upsert_activity(&make_run(9101, "2022 Tempo 5K", "2022-06-12T08:00:00Z".to_string(), 5_000.0, 1_380.0, Some(172.0))).unwrap();
     db.upsert_activity(&make_run(9102, "Real 1K Effort", recent_iso(20), 1_000.0, 195.0, Some(176.0))).unwrap(); // 3:15
@@ -2697,6 +2747,16 @@ fn v0_2_5_3_records_rejects_gps_corrupted_outlier_and_builds_progression() {
     db.upsert_activity(&make_run(9104, "Real 10K PR", recent_iso(10), 10_000.0, 2_751.0, Some(174.0))).unwrap(); // 45:51
     db.upsert_activity(&make_run(9105, "Real Half PR", recent_iso(6), 21_097.5, 6_435.0, Some(168.0))).unwrap(); // 1:47:15
     db.upsert_activity(&make_run(9106, "Real Marathon PR", "2024-04-14T08:00:00Z".to_string(), 42_195.0, 15_011.0, Some(164.0))).unwrap(); // 4:10:11
+
+    db.upsert_fit_track(9001, &make_gps_fit_track(9001, 11_230.0, 1_860.0, 60, Some(76.0), Some(176.0))).unwrap();
+    db.upsert_fit_track(9002, &make_gps_fit_track(9002, 11_230.0, 1_860.0, 60, None, Some(176.0))).unwrap();
+    db.upsert_fit_track(9100, &make_gps_fit_track(9100, 5_000.0, 1_500.0, 50, Some(165.0), Some(176.0))).unwrap();
+    db.upsert_fit_track(9101, &make_gps_fit_track(9101, 5_000.0, 1_380.0, 50, Some(172.0), Some(176.0))).unwrap();
+    db.upsert_fit_track(9102, &make_gps_fit_track(9102, 1_000.0, 195.0, 40, Some(176.0), Some(176.0))).unwrap();
+    db.upsert_fit_track(9103, &make_gps_fit_track(9103, 5_000.0, 1_316.0, 60, Some(178.0), Some(176.0))).unwrap();
+    db.upsert_fit_track(9104, &make_gps_fit_track(9104, 10_000.0, 2_751.0, 80, Some(174.0), Some(176.0))).unwrap();
+    db.upsert_fit_track(9105, &make_gps_fit_track(9105, 21_097.5, 6_435.0, 100, Some(168.0), Some(176.0))).unwrap();
+    db.upsert_fit_track(9106, &make_gps_fit_track(9106, 42_195.0, 15_011.0, 120, Some(164.0), Some(176.0))).unwrap();
 
     let records = db.compute_personal_records().unwrap();
 
@@ -2773,7 +2833,7 @@ fn v0_2_6_gps_spike_guard_rejects_barcelona_jump_accepts_clean_339_and_excludes_
                 dist += 2.41;
             }
         }
-        spike_pts.push(make_fit_point(
+        spike_pts.push(make_gps_fit_point(
             s as f64,
             dist,
             2.52,
@@ -2821,7 +2881,7 @@ fn v0_2_6_gps_spike_guard_rejects_barcelona_jump_accepts_clean_339_and_excludes_
         if s > 0 {
             clean_dist += spd;
         }
-        clean_pts.push(make_fit_point(
+        clean_pts.push(make_gps_fit_point(
             s as f64,
             clean_dist,
             spd,
@@ -2861,19 +2921,26 @@ fn v0_2_6_gps_spike_guard_rejects_barcelona_jump_accepts_clean_339_and_excludes_
     };
     db.upsert_activity(&hyrox_act).unwrap();
 
-    // Low-cadence 1.85x speed spike helper check
+    // Low-cadence / missing-cadence 1.75x speed spike helper check
     assert!(splits_win_lib::storage::is_low_cadence_speed_spike(
         1000.0,
         195.0,
         Some(11_510.0 / 4_572.0),
+        Some(155.0),
         Some(144.0),
-        Some(144.0),
+    ));
+    assert!(splits_win_lib::storage::is_low_cadence_speed_spike(
+        1000.0,
+        195.0,
+        Some(11_510.0 / 4_572.0),
+        None,
+        None,
     ));
     assert!(!splits_win_lib::storage::is_low_cadence_speed_spike(
         1000.0,
         195.0,
         Some(11_510.0 / 4_572.0),
-        Some(180.0),
+        Some(165.0),
         Some(152.0),
     ));
 
@@ -3097,6 +3164,232 @@ fn v0_2_6_hyrox_records_aggregation_and_runner_gating() {
     let mut hybrid_goal_config = AthleteConfig::default();
     hybrid_goal_config.objective.goal_type = GoalType::HybridHyrox;
     assert!(is_hyrox_discipline_enabled(&runner_profile, &hybrid_goal_config));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn v0_2_6_glitch_distance_budget_marathon_survival_sparse_2014_and_no_gps_exclusion() {
+    let dir = make_temp_dir("records-glitch-budget-026");
+    let db = Database::open(&dir.join("splits.sqlite")).unwrap();
+
+    let make_act = |id: i64, name: &str, type_key: &str, iso: &str, dist_m: f64, dur_s: f64, hr: Option<f64>, cad: Option<f64>| ActivityRecord {
+        garmin_id: id,
+        name: name.to_string(),
+        type_key: type_key.to_string(),
+        start_iso: iso.to_string(),
+        distance_m: dist_m,
+        duration_sec: dur_s,
+        moving_duration_sec: dur_s,
+        elevation_gain_m: 30.0,
+        average_hr: hr,
+        max_hr: hr.map(|h| h + 15.0),
+        cadence_spm: cad,
+        training_load: Some(120.0),
+        shoe_name: None,
+        is_hyrox: Some(false),
+        post_run_context: None,
+        fit_temp_source: None,
+        garmin_notes: None,
+        is_pr: None,
+        start_latitude: Some(41.3851),
+        start_longitude: Some(2.1734),
+    };
+
+    // 1. 42.2 km Marathon (4:10:11 = 15,011s) with 2 isolated 1-sec 30m GPS jitter blips (60m <= 500m budget)
+    let marathon_sec = 15_011.0;
+    let base_step = (42_200.0 - 60.0) / 15_009.0;
+    let mut marathon_pts = Vec::with_capacity(15_012);
+    let mut m_dist = 0.0_f64;
+    for s in 0..=15_011 {
+        if s > 0 {
+            m_dist += if s == 3_000 || s == 11_000 { 30.0 } else { base_step };
+        }
+        marathon_pts.push(make_gps_fit_point(
+            s as f64,
+            m_dist,
+            base_step,
+            Some(162.0),
+            Some(86.0),
+            Some(25.0),
+        ));
+    }
+    db.upsert_activity(&make_act(
+        9401,
+        "Valencia Marathon",
+        "running",
+        "2024-04-14T08:00:00Z",
+        m_dist,
+        marathon_sec,
+        Some(162.0),
+        Some(172.0),
+    ))
+    .unwrap();
+    db.upsert_fit_track(9401, &analyze_fit_points(9401, marathon_pts, &AthleteConfig::default()))
+        .unwrap();
+
+    // 2. 1 km run with a single 40m jump (> 25m 1K budget) that would create a fake ~226s 1K
+    let mut jump1k_pts = Vec::with_capacity(401);
+    let mut j_dist = 0.0_f64;
+    for s in 0..=400 {
+        if s > 0 {
+            j_dist += if s == 200 { 40.0 } else { 4.25 };
+        }
+        jump1k_pts.push(make_gps_fit_point(
+            s as f64,
+            j_dist,
+            4.25,
+            Some(170.0),
+            Some(88.0),
+            Some(15.0),
+        ));
+    }
+    db.upsert_activity(&make_act(
+        9402,
+        "Noisy 40m Jump Run",
+        "running",
+        "2022-05-01T08:00:00Z",
+        j_dist,
+        550.0, // avg 3.0 m/s
+        Some(170.0),
+        Some(176.0),
+    ))
+    .unwrap();
+    db.upsert_fit_track(9402, &analyze_fit_points(9402, jump1k_pts, &AthleteConfig::default()))
+        .unwrap();
+
+    // 3. 24 Aug 2014 sparse Smart-Recording run (6s gaps, 3:32 = 212s 1K spike > 1.55x avg speed)
+    let mut sparse_pts = Vec::new();
+    let mut sp_dist = 0.0_f64;
+    let mut t_sec = 0.0_f64;
+    while t_sec <= 1800.0 {
+        sparse_pts.push(make_gps_fit_point(
+            t_sec,
+            sp_dist,
+            2.8,
+            Some(162.0),
+            Some(86.0),
+            Some(20.0),
+        ));
+        let dt = 6.0;
+        let rate = if (600.0..816.0).contains(&t_sec) {
+            1000.0 / 212.0
+        } else {
+            2.56
+        };
+        sp_dist += rate * dt;
+        t_sec += dt;
+    }
+    db.upsert_activity(&make_act(
+        9403,
+        "2014 Smart-Recording Spike",
+        "running",
+        "2014-08-24T08:00:00Z",
+        sp_dist,
+        t_sec,
+        Some(162.0),
+        Some(172.0),
+    ))
+    .unwrap();
+    db.upsert_fit_track(9403, &analyze_fit_points(9403, sparse_pts, &AthleteConfig::default()))
+        .unwrap();
+
+    // 4. Clean 16 Sep 2023 3:39 (219s) 1K effort at 1 Hz and 178 spm
+    let mut clean_pts = Vec::with_capacity(1801);
+    let mut c_dist = 0.0_f64;
+    for s in 0..=1800 {
+        let spd = if (600..=818).contains(&s) { 1000.0 / 219.0 } else { 3.20 };
+        if s > 0 {
+            c_dist += spd;
+        }
+        clean_pts.push(make_gps_fit_point(
+            s as f64,
+            c_dist,
+            spd,
+            Some(if (600..=818).contains(&s) { 176.0 } else { 150.0 }),
+            Some(if (600..=818).contains(&s) { 89.0 } else { 84.0 }),
+            Some(20.0),
+        ));
+    }
+    db.upsert_activity(&make_act(
+        9404,
+        "Clean Sep 2023 1K",
+        "running",
+        "2023-09-16T08:00:00Z",
+        c_dist,
+        1800.0,
+        Some(156.0),
+        Some(170.0),
+    ))
+    .unwrap();
+    db.upsert_fit_track(9404, &analyze_fit_points(9404, clean_pts, &AthleteConfig::default()))
+        .unwrap();
+
+    // 5. Excluded runs: no-GPS FIT, (0,0) FIT, <85% GPS coverage FIT, indoor treadmill, uncached outdoor
+    db.upsert_activity(&make_act(9405, "No GPS FIT", "running", "2025-01-10T08:00:00Z", 5_000.0, 950.0, Some(165.0), Some(180.0))).unwrap();
+    let no_gps_pts: Vec<FitTrackPoint> = (0..=950)
+        .map(|s| make_fit_point(s as f64, (s as f64) * (5000.0 / 950.0), 5.2, Some(165.0), Some(180.0), Some(0.0)))
+        .collect();
+    db.upsert_fit_track(9405, &analyze_fit_points(9405, no_gps_pts, &AthleteConfig::default())).unwrap();
+
+    db.upsert_activity(&make_act(9406, "Zero-Zero GPS", "running", "2025-01-11T08:00:00Z", 5_000.0, 950.0, Some(165.0), Some(180.0))).unwrap();
+    let zero_pts: Vec<FitTrackPoint> = (0..=950)
+        .map(|s| {
+            let mut pt = make_fit_point(s as f64, (s as f64) * (5000.0 / 950.0), 5.2, Some(165.0), Some(180.0), Some(0.0));
+            pt.latitude_deg = Some(0.0);
+            pt.longitude_deg = Some(0.0);
+            pt
+        })
+        .collect();
+    db.upsert_fit_track(9406, &analyze_fit_points(9406, zero_pts, &AthleteConfig::default())).unwrap();
+
+    db.upsert_activity(&make_act(9407, "Partial GPS (<85%)", "running", "2025-01-12T08:00:00Z", 5_000.0, 950.0, Some(165.0), Some(180.0))).unwrap();
+    let partial_pts: Vec<FitTrackPoint> = (0..=950)
+        .map(|s| {
+            let dist = (s as f64) * (5000.0 / 950.0);
+            if s < 150 {
+                make_gps_fit_point(s as f64, dist, 5.2, Some(165.0), Some(180.0), Some(0.0))
+            } else {
+                make_fit_point(s as f64, dist, 5.2, Some(165.0), Some(180.0), Some(0.0))
+            }
+        })
+        .collect();
+    db.upsert_fit_track(9407, &analyze_fit_points(9407, partial_pts, &AthleteConfig::default())).unwrap();
+
+    db.upsert_activity(&make_act(9408, "Indoor Treadmill", "treadmill_running", "2025-01-13T08:00:00Z", 5_000.0, 950.0, Some(165.0), Some(180.0))).unwrap();
+    db.upsert_fit_track(9408, &make_gps_fit_track(9408, 5_000.0, 950.0, 50, Some(165.0), Some(180.0))).unwrap();
+
+    db.upsert_activity(&make_act(9409, "Uncached Fast Run", "running", "2025-01-14T08:00:00Z", 10_000.0, 1_900.0, Some(165.0), Some(180.0))).unwrap();
+
+    let records = db.compute_personal_records().unwrap();
+    let by_label: std::collections::HashMap<&str, &DistanceRecordEntry> = records
+        .distance_records
+        .iter()
+        .map(|r| (r.label.as_str(), r))
+        .collect();
+
+    // Marathon survived 2 isolated 30m GPS jitter blips
+    let marathon = by_label.get("Marathon").expect("Marathon must survive isolated GPS blips");
+    assert_eq!(marathon.activity_id, 9401);
+    assert!((marathon.time_sec - 15_011.0).abs() < 30.0);
+    assert!(by_label.contains_key("Half Marathon"));
+    assert!(by_label.contains_key("10K"));
+    assert!(by_label.contains_key("5K"));
+
+    // Clean 16 Sep 2023 3:39 beats rejected 2014 sparse 3:32 and 40m-jump 1K
+    let one_k = by_label.get("1K").expect("Clean 1K must qualify");
+    assert_eq!(one_k.activity_id, 9404);
+    assert!((one_k.time_sec - 219.0).abs() < 2.0);
+
+    // Excluded IDs never enter distance_records, predictions, or progression
+    let excluded = [9405_i64, 9406, 9407, 9408, 9409];
+    assert!(records.distance_records.iter().all(|r| !excluded.contains(&r.activity_id)));
+    assert!(records.predictions.iter().all(|p| !excluded.contains(&p.source_activity_id)));
+    for series in &records.progression {
+        assert!(series.points.iter().all(|p| !excluded.contains(&p.activity_id)));
+    }
+    // 9401..9404 + 9407 have >=10 track-level GPS points (9407 still yields 0 records due to <85% window coverage)
+    assert_eq!(records.scanned_fit_runs, 5);
 
     let _ = std::fs::remove_dir_all(&dir);
 }

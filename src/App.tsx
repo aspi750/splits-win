@@ -1345,7 +1345,7 @@ export default function App() {
             ? ` (+${res.newly_downloaded_fits} new)`
             : "";
         setRecordsStatusMsg(
-          `Updated · ${res.total_outdoor_runs} runs · ${res.scanned_fit_runs} with 1Hz FIT analysis${newSuffix}`
+          `Updated · ${res.total_outdoor_runs} runs · ${res.scanned_fit_runs} with GPS FIT analysis${newSuffix}`
         );
         setRecordsWarning(res.prefetch_warning ?? null);
       }

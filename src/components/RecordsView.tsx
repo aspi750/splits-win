@@ -190,7 +190,7 @@ export function RecordsView({
           <span className="today-subtitle">
             {statusMessage
               ? statusMessage
-              : `${records.total_outdoor_runs} outdoor runs · ${records.scanned_fit_runs} with 1Hz FIT best-stretch analysis`}
+              : `${records.total_outdoor_runs} outdoor runs · ${records.scanned_fit_runs} with GPS FIT track analysis`}
           </span>
         </div>
         <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
@@ -272,10 +272,41 @@ export function RecordsView({
           <div>
             <strong>Personal Records</strong>
             <div className="muted" style={{ fontSize: 12 }}>
-              Fastest stretches from cached 1Hz FIT tracks or full outdoor run averages · Click any record to inspect
+              Fastest stretches from verified GPS FIT tracks · Click any record to inspect
             </div>
           </div>
         </div>
+        {records.total_outdoor_runs > 0 && records.scanned_fit_runs === 0 && (
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "space-between",
+              gap: 12,
+              flexWrap: "wrap",
+              padding: "10px 12px",
+              marginBottom: 12,
+              borderRadius: 8,
+              background: "var(--accent-soft-bg)",
+              border: "1px solid var(--accent-border)",
+            }}
+          >
+            <span style={{ fontSize: 13 }}>
+              No cached GPS <code>.fit</code> tracks found yet. Personal records require real GPS tracks — click{" "}
+              <strong>Recompute</strong> to download and analyze your candidate <code>.fit</code> files.
+            </span>
+            <button
+              type="button"
+              className="primary"
+              disabled={loading}
+              onClick={onRefresh}
+              style={{ display: "inline-flex", alignItems: "center", gap: 6, flexShrink: 0 }}
+            >
+              <RefreshCw size={14} className={loading ? "spin" : undefined} />
+              {loading ? "Recomputing…" : "Recompute"}
+            </button>
+          </div>
+        )}
         <div className="record-grid">
           {STANDARD_LABELS.map((label) => {
             const entry = byLabel.get(label);
@@ -294,7 +325,7 @@ export function RecordsView({
                   </span>
                   {entry && (
                     <span className="pill green" style={{ fontSize: 10.5, padding: "1px 7px" }}>
-                      {entry.source === "fit_best_stretch" ? "1Hz FIT" : "Run Avg"}
+                      GPS FIT
                     </span>
                   )}
                 </div>
@@ -313,7 +344,9 @@ export function RecordsView({
                   </>
                 ) : (
                   <div className="muted" style={{ fontSize: 12 }}>
-                    No outdoor run this distance yet
+                    {records.scanned_fit_runs === 0
+                      ? "Click Recompute to scan GPS FIT tracks"
+                      : "No GPS FIT track this distance yet"}
                   </div>
                 )}
               </button>
