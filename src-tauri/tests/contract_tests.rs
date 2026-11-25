@@ -2632,3 +2632,102 @@ fn v0_2_5_2_records_650_activities_completes_under_500ms_with_progress() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn v0_2_5_3_records_rejects_gps_corrupted_outlier_and_builds_progression() {
+    let dir = make_temp_dir("records-outlier-0253");
+    let db = Database::open(&dir.join("splits.sqlite")).unwrap();
+
+    let now = Utc::now();
+    let recent_iso = |days_ago: i64| -> String {
+        (now - Duration::days(days_ago))
+            .format("%Y-%m-%dT07:30:00Z")
+            .to_string()
+    };
+    let make_run = |id: i64, name: &str, start_iso: String, dist_m: f64, sec: f64, hr: Option<f64>| ActivityRecord {
+        garmin_id: id,
+        name: name.to_string(),
+        type_key: "running".to_string(),
+        start_iso,
+        distance_m: dist_m,
+        duration_sec: sec,
+        moving_duration_sec: sec,
+        elevation_gain_m: 30.0,
+        average_hr: hr,
+        max_hr: hr.map(|h| h + 15.0),
+        cadence_spm: Some(176.0),
+        training_load: Some(90.0),
+        shoe_name: Some("Superblast 3".to_string()),
+        is_hyrox: None,
+        post_run_context: None,
+        fit_temp_source: None,
+        garmin_notes: None,
+        is_pr: None,
+        start_latitude: None,
+        start_longitude: None,
+    };
+
+    // Exact QA GPS-corrupted 2014 outlier: 11.23 km in 31:00 (2:46/km = 6.038 m/s) at 76 bpm avg HR
+    db.upsert_activity(&make_run(
+        9001,
+        "Madrid Corrupted 2014",
+        "2014-10-11T08:00:00Z".to_string(),
+        11_230.0,
+        1_860.0,
+        Some(76.0),
+    ))
+    .unwrap();
+
+    // Unstrapped GPS/bike-logged-as-run outlier: 11.23 km in 31:00 with no HR (must still fail 5K/10K speed ceiling)
+    db.upsert_activity(&make_run(
+        9002,
+        "Vehicular Commute Outlier",
+        "2016-05-01T08:00:00Z".to_string(),
+        11_230.0,
+        1_860.0,
+        None,
+    ))
+    .unwrap();
+
+    // Real PR runs matching macOS Records view + historical progression
+    db.upsert_activity(&make_run(9100, "2020 Base 5K", "2020-03-10T08:00:00Z".to_string(), 5_000.0, 1_500.0, Some(165.0))).unwrap();
+    db.upsert_activity(&make_run(9101, "2022 Tempo 5K", "2022-06-12T08:00:00Z".to_string(), 5_000.0, 1_380.0, Some(172.0))).unwrap();
+    db.upsert_activity(&make_run(9102, "Real 1K Effort", recent_iso(20), 1_000.0, 195.0, Some(176.0))).unwrap(); // 3:15
+    db.upsert_activity(&make_run(9103, "Real 5K PR", recent_iso(14), 5_000.0, 1_316.0, Some(178.0))).unwrap(); // 21:56
+    db.upsert_activity(&make_run(9104, "Real 10K PR", recent_iso(10), 10_000.0, 2_751.0, Some(174.0))).unwrap(); // 45:51
+    db.upsert_activity(&make_run(9105, "Real Half PR", recent_iso(6), 21_097.5, 6_435.0, Some(168.0))).unwrap(); // 1:47:15
+    db.upsert_activity(&make_run(9106, "Real Marathon PR", "2024-04-14T08:00:00Z".to_string(), 42_195.0, 15_011.0, Some(164.0))).unwrap(); // 4:10:11
+
+    let records = db.compute_personal_records().unwrap();
+
+    let by_label: std::collections::HashMap<&str, &DistanceRecordEntry> = records
+        .distance_records
+        .iter()
+        .map(|r| (r.label.as_str(), r))
+        .collect();
+
+    assert_eq!(by_label["1K"].activity_id, 9102);
+    assert!((by_label["1K"].time_sec - 195.0).abs() < 0.5);
+    assert_eq!(by_label["5K"].activity_id, 9103);
+    assert!((by_label["5K"].time_sec - 1316.0).abs() < 0.5);
+    assert_eq!(by_label["10K"].activity_id, 9104);
+    assert!((by_label["10K"].time_sec - 2751.0).abs() < 0.5);
+    assert_eq!(by_label["Half Marathon"].activity_id, 9105);
+    assert_eq!(by_label["Marathon"].activity_id, 9106);
+
+    // Outlier must not appear in predictions or progression
+    assert!(!records.predictions.is_empty());
+    assert_eq!(records.prediction_window_months, 4);
+    assert!(records.predictions.iter().all(|p| p.source_activity_id != 9001 && p.source_activity_id != 9002));
+
+    let five_k_prog = records
+        .progression
+        .iter()
+        .find(|s| s.label == "5K")
+        .expect("5K progression series must be present");
+    assert!(five_k_prog.broken_count >= 2);
+    assert!(five_k_prog.points.iter().all(|p| p.activity_id != 9001 && p.activity_id != 9002));
+    assert!(five_k_prog.points.iter().any(|p| p.activity_id == 9103 && p.is_record_break));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

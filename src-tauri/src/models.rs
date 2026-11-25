@@ -1739,6 +1739,25 @@ pub struct YearlyDistanceBest {
     pub bests: HashMap<String, DistanceRecordEntry>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProgressionPoint {
+    pub date: String,
+    pub time_sec: f64,
+    pub pace_sec_per_km: f64,
+    pub activity_id: i64,
+    pub activity_name: String,
+    pub is_record_break: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DistanceProgressionSeries {
+    pub label: String,
+    pub distance_m: f64,
+    pub total_runs: usize,
+    pub broken_count: usize,
+    pub points: Vec<ProgressionPoint>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct RecordsPayload {
     pub distance_records: Vec<DistanceRecordEntry>,
@@ -1746,6 +1765,8 @@ pub struct RecordsPayload {
     pub predictions: Vec<RacePredictionEntry>,
     pub prediction_window_months: i32,
     pub yearly_bests: Vec<YearlyDistanceBest>,
+    #[serde(default)]
+    pub progression: Vec<DistanceProgressionSeries>,
     pub pr_activities: Vec<ActivityRecord>,
     pub total_outdoor_runs: usize,
     pub scanned_fit_runs: usize,

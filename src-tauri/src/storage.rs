@@ -1567,29 +1567,36 @@ impl Database {
                 None
             };
 
+            let whole_run_plausible = active_sec > 0.0
+                && a.distance_m > 0.0
+                && plausible_run_effort(a.distance_m, active_sec, a.average_hr);
+
             if let Some(points) = fit_points_opt {
                 scanned_fit_runs += 1;
                 let max_track_dist = points.last().map(|p| p.distance_m).unwrap_or(0.0);
                 for &(label, target_m) in &STANDARD_DISTANCES {
                     if max_track_dist >= target_m {
                         if let Some((best_sec, seg_hr)) = fastest_stretch_in_points(&points, target_m) {
-                            efforts.push(DistanceRecordEntry {
-                                label: label.to_string(),
-                                distance_m: target_m,
-                                time_sec: best_sec,
-                                pace_sec_per_km: best_sec / (target_m / 1000.0),
-                                date: date_str.clone(),
-                                activity_id: a.garmin_id,
-                                activity_name: display_name.clone(),
-                                average_hr: seg_hr.or(a.average_hr),
-                                source: "fit_best_stretch".to_string(),
-                            });
-                            continue;
+                            let effective_hr = seg_hr.or(a.average_hr);
+                            if plausible_run_effort(target_m, best_sec, effective_hr) {
+                                efforts.push(DistanceRecordEntry {
+                                    label: label.to_string(),
+                                    distance_m: target_m,
+                                    time_sec: best_sec,
+                                    pace_sec_per_km: best_sec / (target_m / 1000.0),
+                                    date: date_str.clone(),
+                                    activity_id: a.garmin_id,
+                                    activity_name: display_name.clone(),
+                                    average_hr: effective_hr,
+                                    source: "fit_best_stretch".to_string(),
+                                });
+                                continue;
+                            }
                         }
                     }
-                    if active_sec > 0.0 && a.distance_m >= target_m * 0.99 {
+                    if whole_run_plausible && a.distance_m >= target_m * 0.99 {
                         let scaled_sec = active_sec * (target_m / a.distance_m);
-                        if plausible_run_effort(target_m, scaled_sec) {
+                        if plausible_run_effort(target_m, scaled_sec, a.average_hr) {
                             efforts.push(DistanceRecordEntry {
                                 label: label.to_string(),
                                 distance_m: target_m,
@@ -1604,13 +1611,13 @@ impl Database {
                         }
                     }
                 }
-            } else if active_sec > 0.0 && a.distance_m > 0.0 {
+            } else if whole_run_plausible {
                 for &(label, target_m) in &STANDARD_DISTANCES {
                     if a.distance_m < target_m * 0.99 {
                         continue;
                     }
                     let scaled_sec = active_sec * (target_m / a.distance_m);
-                    if plausible_run_effort(target_m, scaled_sec) {
+                    if plausible_run_effort(target_m, scaled_sec, a.average_hr) {
                         efforts.push(DistanceRecordEntry {
                             label: label.to_string(),
                             distance_m: target_m,
@@ -1673,6 +1680,53 @@ impl Database {
             .map(|(year, bests)| YearlyDistanceBest { year, bests })
             .collect();
         yearly_bests.sort_by(|a, b| b.year.cmp(&a.year));
+
+        // Chronological progression series per standard distance ("How your record came down"),
+        // matching macOS RecordsView.swift (trimming the slowest 5% outliers while keeping record breaks).
+        let mut progression = Vec::with_capacity(STANDARD_DISTANCES.len());
+        for &(label, dist_m) in &STANDARD_DISTANCES {
+            let mut list: Vec<&DistanceRecordEntry> =
+                efforts.iter().filter(|e| e.label == label).collect();
+            list.sort_by(|a, b| a.date.cmp(&b.date).then_with(|| a.activity_id.cmp(&b.activity_id)));
+            let total_runs = list.len();
+            let mut record_breaks = 0usize;
+            let mut best_so_far = f64::INFINITY;
+            let mut raw_points = Vec::with_capacity(total_runs);
+            for e in &list {
+                let is_break = e.time_sec < best_so_far;
+                if is_break {
+                    best_so_far = e.time_sec;
+                    record_breaks += 1;
+                }
+                raw_points.push(ProgressionPoint {
+                    date: e.date.clone(),
+                    time_sec: e.time_sec,
+                    pace_sec_per_km: e.pace_sec_per_km,
+                    activity_id: e.activity_id,
+                    activity_name: e.activity_name.clone(),
+                    is_record_break: is_break,
+                });
+            }
+            let points = if raw_points.is_empty() {
+                Vec::new()
+            } else {
+                let mut sorted_times: Vec<f64> = raw_points.iter().map(|p| p.time_sec).collect();
+                sorted_times.sort_by(|a, b| a.total_cmp(b));
+                let p95_idx = ((sorted_times.len() * 95) / 100).min(sorted_times.len() - 1);
+                let slowest = sorted_times[p95_idx];
+                raw_points
+                    .into_iter()
+                    .filter(|p| p.time_sec <= slowest || p.is_record_break)
+                    .collect()
+            };
+            progression.push(DistanceProgressionSeries {
+                label: label.to_string(),
+                distance_m: dist_m,
+                total_runs,
+                broken_count: record_breaks.saturating_sub(1),
+                points,
+            });
+        }
 
         // Riegel race predictions from efforts >= 5K in last 4 months (fallback 12 months)
         let today = Local::now().date_naive();
@@ -1875,6 +1929,7 @@ impl Database {
             predictions,
             prediction_window_months: pred_window_months,
             yearly_bests,
+            progression,
             pr_activities,
             total_outdoor_runs,
             scanned_fit_runs,
@@ -1895,12 +1950,54 @@ fn is_outdoor_run(a: &ActivityRecord) -> bool {
     lower.contains("run") && !is_indoor_activity(&lower)
 }
 
-fn plausible_run_effort(distance_m: f64, sec: f64) -> bool {
-    if sec <= 0.0 || distance_m <= 0.0 {
+/// Per-distance human plausibility speed ceiling (m/s), matching and tightening
+/// `splits-mac/Splits/Store/Records.swift` (`distance / seconds < 6.7` for 1 km,
+/// with realistic endurance drop-off for 5 km through Marathon so GPS jumps or
+/// bike/car commutes logged as runs never sweep distance PRs).
+pub fn max_plausible_speed_mps(distance_m: f64) -> f64 {
+    if distance_m <= 1_500.0 {
+        6.70 // 2:29/km (exact splits-mac Records.plausible bound)
+    } else if distance_m <= 7_500.0 {
+        5.95 // 2:48/km (~14:00 5K)
+    } else if distance_m <= 15_000.0 {
+        5.80 // 2:52/km (~28:44 10K)
+    } else if distance_m <= 30_000.0 {
+        5.60 // 2:59/km (~1:02:47 Half)
+    } else {
+        5.40 // 3:05/km (~2:10:14 Marathon)
+    }
+}
+
+/// Rejects GPS-corrupted or vehicular runs where blazing pace pairs with
+/// resting/walking heart rate (e.g., 2:46/km at 76 bpm) or non-physiological HR.
+pub fn hr_plausible_for_speed(speed_mps: f64, avg_hr: Option<f64>) -> bool {
+    let Some(hr) = avg_hr.filter(|v| v.is_finite() && *v > 0.0) else {
+        return true;
+    };
+    if !(40.0..=235.0).contains(&hr) {
+        return false;
+    }
+    if speed_mps >= 5.0 && hr < 130.0 {
+        return false;
+    }
+    if speed_mps >= 4.0 && hr < 105.0 {
+        return false;
+    }
+    if speed_mps >= 3.33 && hr < 85.0 {
+        return false;
+    }
+    true
+}
+
+pub fn plausible_run_effort(distance_m: f64, sec: f64, avg_hr: Option<f64>) -> bool {
+    if !sec.is_finite() || !distance_m.is_finite() || sec <= 0.0 || distance_m <= 0.0 {
         return false;
     }
     let speed_mps = distance_m / sec;
-    speed_mps > 0.5 && speed_mps < 6.7
+    if speed_mps <= 0.5 || speed_mps >= max_plausible_speed_mps(distance_m) {
+        return false;
+    }
+    hr_plausible_for_speed(speed_mps, avg_hr)
 }
 
 fn fastest_stretch_in_points(points: &[FitTrackPoint], target_m: f64) -> Option<(f64, Option<f64>)> {
@@ -1935,7 +2032,16 @@ fn fastest_stretch_in_points(points: &[FitTrackPoint], target_m: f64) -> Option<
             points[j].timestamp_sec - points[i].timestamp_sec
         };
 
-        if plausible_run_effort(target_m, dt) && best_sec.map_or(true, |b| dt < b) {
+        let seg_hr = {
+            let hrs: Vec<f64> = points[i..=j].iter().filter_map(|p| p.heart_rate_bpm).collect();
+            if hrs.is_empty() {
+                None
+            } else {
+                Some(hrs.iter().sum::<f64>() / hrs.len() as f64)
+            }
+        };
+
+        if plausible_run_effort(target_m, dt, seg_hr) && best_sec.map_or(true, |b| dt < b) {
             best_sec = Some(dt);
             best_range = Some((i, j));
         }

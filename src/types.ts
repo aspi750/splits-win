@@ -646,12 +646,30 @@ export interface YearlyDistanceBest {
   bests: Record<string, DistanceRecordEntry>;
 }
 
+export interface ProgressionPoint {
+  date: string;
+  time_sec: number;
+  pace_sec_per_km: number;
+  activity_id: number;
+  activity_name: string;
+  is_record_break: boolean;
+}
+
+export interface DistanceProgressionSeries {
+  label: string;
+  distance_m: number;
+  total_runs: number;
+  broken_count: number;
+  points: ProgressionPoint[];
+}
+
 export interface RecordsPayload {
   distance_records: DistanceRecordEntry[];
   milestones: MilestoneRecordEntry[];
   predictions: RacePredictionEntry[];
   prediction_window_months: number;
   yearly_bests: YearlyDistanceBest[];
+  progression?: DistanceProgressionSeries[];
   pr_activities: ActivityRecord[];
   total_outdoor_runs: number;
   scanned_fit_runs: number;

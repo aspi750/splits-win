@@ -418,7 +418,7 @@ export default function App() {
   const [confirmCleanSlate, setConfirmCleanSlate] = useState(false);
   const [cleanSlateBusy, setCleanSlateBusy] = useState(false);
 
-  const [appVersion, setAppVersion] = useState<string>("0.2.5.2-beta");
+  const [appVersion, setAppVersion] = useState<string>("0.2.5.3-beta");
   const [bootstrapError, setBootstrapError] = useState<string | null>(null);
   const [themeMode, setThemeMode] = useState<ThemeMode>(() => {
     try {
