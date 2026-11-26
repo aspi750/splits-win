@@ -4228,3 +4228,132 @@ fn test_deterministic_plan_auto_rollover_and_shoe_parity() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn test_prescription_distance_clamped_to_today_max_and_scales_duration() {
+    let eval_now = Utc.with_ymd_and_hms(2026, 11, 26, 10, 0, 0).unwrap();
+    let mut cfg = AthleteConfig::default();
+    cfg.specs.resting_hr_baseline = Some(52);
+    cfg.specs.vt1_ceiling_bpm = Some(138);
+    cfg.medical.min_rest_hours_between_runs = Some(36);
+
+    let healthy_day = DayRecord {
+        date: "2026-11-26".to_string(),
+        resting_hr: Some(52),
+        sleep_seconds: Some(27_000),
+        sleep_score: Some(84),
+        hrv_last_night: Some(62),
+        hrv_status: Some("BALANCED".to_string()),
+        ..Default::default()
+    };
+    let mut caution_day = healthy_day.clone();
+    caution_day.hrv_status = Some("LOW".to_string());
+
+    let make_plan = |max_weekly_km: f64, max_single_run_km: f64, session: Option<(f64, f64)>| PlanFile {
+        version: 1,
+        revision: 2,
+        updated_at: "2026-11-26T08:00:00Z".to_string(),
+        updated_by: "splits-coach".to_string(),
+        covers: PlanDateRange {
+            from: "2026-11-23".to_string(),
+            to: "2026-11-29".to_string(),
+        },
+        status: PlanStatus::Valid,
+        envelope: PlanEnvelope {
+            max_weekly_km,
+            max_single_run_km,
+            mesocycle_phase: "base".to_string(),
+            min_hours_between_runs: 36.0,
+            walk_hr_cap_bpm: None,
+        },
+        sessions: session
+            .map(|(km, min)| {
+                vec![PlanSession {
+                    id: "2026-11-26-rw-1".to_string(),
+                    date: "2026-11-26".to_string(),
+                    session_type: RunTypology::EasyAerobic,
+                    target: PlanTargetRange {
+                        duration_min: vec![min],
+                        distance_km: vec![km],
+                    },
+                    hr_cap_bpm: 135,
+                    shoe_constraints: vec!["Superblast 3".to_string()],
+                    alternatives: Vec::new(),
+                }]
+            })
+            .unwrap_or_default(),
+    };
+
+    // Case 1: 6.0 km / 40 min session capped by max_single_run_km = 3.9 (GREEN & AMBER)
+    let cap_plan = make_plan(15.0, 3.9, Some((6.0, 40.0)));
+    for day in [&healthy_day, &caution_day] {
+        let out = ReadinessEngine::evaluate(ReadinessInput {
+            now: eval_now,
+            athlete_config: &cfg,
+            activities: &[],
+            days: std::slice::from_ref(day),
+            plan: Some(&cap_plan),
+            gear_inventory: None,
+        });
+        assert!((out.readiness_state.gatekeeper.effective_today_max_km - 3.9).abs() < 0.001);
+        assert!(out.readiness_state.prescription_summary.distance_km <= out.readiness_state.gatekeeper.effective_today_max_km);
+        assert!((out.readiness_state.prescription_summary.distance_km - 3.9).abs() < 0.001);
+        assert_eq!(out.readiness_state.prescription_summary.duration_mins, 26);
+        let rx = out.authoritative_target.prescription.as_ref().unwrap();
+        assert!((rx.distance_km.unwrap() - 3.9).abs() < 0.001);
+        assert_eq!(rx.duration_mins, Some(26));
+    }
+
+    // Case 2: 6.0 km / 40 min session capped by remaining_7d_km = 2.5 (12.0 - 9.5)
+    let prior_run = ActivityRecord {
+        garmin_id: 777,
+        name: "Prior Run".to_string(),
+        type_key: "running".to_string(),
+        start_iso: (eval_now - Duration::hours(48)).to_rfc3339(),
+        distance_m: 9_500.0,
+        duration_sec: 3_600.0,
+        moving_duration_sec: 3_600.0,
+        elevation_gain_m: 20.0,
+        average_hr: Some(134.0),
+        max_hr: Some(140.0),
+        cadence_spm: Some(174.0),
+        training_load: None,
+        shoe_name: None,
+        is_hyrox: None,
+        post_run_context: None,
+        fit_temp_source: None,
+        garmin_notes: None,
+        is_pr: None,
+        start_latitude: None,
+        start_longitude: None,
+    };
+    let budget_plan = make_plan(12.0, 8.0, Some((6.0, 40.0)));
+    for day in [&healthy_day, &caution_day] {
+        let out = ReadinessEngine::evaluate(ReadinessInput {
+            now: eval_now,
+            athlete_config: &cfg,
+            activities: std::slice::from_ref(&prior_run),
+            days: std::slice::from_ref(day),
+            plan: Some(&budget_plan),
+            gear_inventory: None,
+        });
+        assert!((out.readiness_state.gatekeeper.remaining_weekly_budget_km - 2.5).abs() < 0.001);
+        assert!((out.readiness_state.gatekeeper.effective_today_max_km - 2.5).abs() < 0.001);
+        assert!(out.readiness_state.prescription_summary.distance_km <= out.readiness_state.gatekeeper.effective_today_max_km);
+        assert!((out.readiness_state.prescription_summary.distance_km - 2.5).abs() < 0.001);
+        assert_eq!(out.readiness_state.prescription_summary.duration_mins, 17);
+    }
+
+    // Case 3: No planned session today still clamps fallback distance to 3.9 km
+    let no_session_plan = make_plan(15.0, 3.9, None);
+    let no_session_out = ReadinessEngine::evaluate(ReadinessInput {
+        now: eval_now,
+        athlete_config: &cfg,
+        activities: &[],
+        days: &[healthy_day],
+        plan: Some(&no_session_plan),
+        gear_inventory: None,
+    });
+    assert!(no_session_out.readiness_state.prescription_summary.distance_km <= no_session_out.readiness_state.gatekeeper.effective_today_max_km);
+    assert!((no_session_out.readiness_state.prescription_summary.distance_km - 3.9).abs() < 0.001);
+}

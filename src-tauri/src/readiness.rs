@@ -237,7 +237,7 @@ impl ReadinessEngine {
             10.0
         };
         let single_run_cap_km = effective_plan.map_or(default_single_cap_km, |p| p.envelope.max_single_run_km);
-        let effective_today_max_km = round2(single_run_cap_km.min(remaining_7d_budget_km));
+        let effective_today_max_km = round2(single_run_cap_km.min(remaining_7d_budget_km).max(0.0));
 
         // 6. Deterministic Prescription & Guardrail Clamping (`CONTRACT.md §3.4`)
         let (status_badge, decision, prescribed_title, distance_km, duration_mins, shoe_platform, hr_ceiling_bpm, cadence_target_spm, execution_structure) =
@@ -254,8 +254,8 @@ impl ReadinessEngine {
                     "No running session prescribed due to active gatekeeper hard block(s).".to_string(),
                 )
             } else if !caution_flags.is_empty() {
-                let planned_dist = today_session.and_then(|s| s.target.distance_km.first().copied()).unwrap_or(5.0);
-                let dist = round2(planned_dist.min(remaining_7d_budget_km));
+                let raw_dist = today_session.and_then(|s| s.target.distance_km.first().copied()).unwrap_or(5.0);
+                let dist = clamp_distance_to_today_max(raw_dist, effective_today_max_km);
                 let configured_easy = input
                     .athlete_config
                     .medical
@@ -263,10 +263,10 @@ impl ReadinessEngine {
                     .or(input.athlete_config.specs.vt1_ceiling_bpm)
                     .unwrap_or(138);
                 let hr_cap = today_session.map_or(145, |s| s.hr_cap_bpm).min(configured_easy);
-                let dur = today_session
+                let raw_dur = today_session
                     .and_then(|s| s.target.duration_min.first().copied())
-                    .map(|v| v.round() as i32)
-                    .unwrap_or_else(|| ((dist * 6.5).round() as i32).max(20));
+                    .unwrap_or_else(|| (raw_dist * 6.5).max(20.0));
+                let dur = scaled_duration_mins(raw_dur, raw_dist, dist);
                 let shoe = resolved_shoe_platform.clone();
                 (
                     "🟡 AMBER - ADAPTED / CAUTION",
@@ -281,20 +281,20 @@ impl ReadinessEngine {
                 )
             } else {
                 let fallback_dist = if is_reentry_or_c25k { default_single_cap_km } else { 6.0 };
-                let planned_dist = today_session
+                let raw_dist = today_session
                     .and_then(|s| s.target.distance_km.first().copied())
                     .unwrap_or_else(|| fallback_dist.min(remaining_7d_budget_km));
-                let dist = round2(planned_dist.min(remaining_7d_budget_km));
+                let dist = clamp_distance_to_today_max(raw_dist, effective_today_max_km);
                 let hr_cap = today_session
                     .map(|s| s.hr_cap_bpm)
                     .or(input.athlete_config.specs.vt1_ceiling_bpm)
                     .or(input.athlete_config.medical.easy_hr_ceiling_bpm)
                     .unwrap_or(145);
                 let pace_min_per_km = input.athlete_config.medical.min_pace_sec_per_km.unwrap_or(360) as f64 / 60.0;
-                let dur = today_session
+                let raw_dur = today_session
                     .and_then(|s| s.target.duration_min.first().copied())
-                    .map(|v| v.round() as i32)
-                    .unwrap_or_else(|| ((dist * pace_min_per_km).round() as i32).max(20));
+                    .unwrap_or_else(|| (raw_dist * pace_min_per_km).max(20.0));
+                let dur = scaled_duration_mins(raw_dur, raw_dist, dist);
                 let shoe = resolved_shoe_platform.clone();
                 let default_title = match goal_type {
                     GoalType::CouchTo5k => "C25K Run-Walk Progression",
@@ -602,6 +602,27 @@ fn resolve_shoe_eligibility(
         from_acts.push("Daily Trainer".to_string());
     }
     (from_acts, Vec::new(), Vec::new())
+}
+
+fn clamp_distance_to_today_max(raw_distance_km: f64, today_max_km: f64) -> f64 {
+    let bounded = raw_distance_km.min(today_max_km).max(0.0);
+    let rounded = (bounded * 10.0).round() / 10.0;
+    if rounded > today_max_km {
+        ((today_max_km * 10.0) + 1e-9).floor() / 10.0
+    } else {
+        rounded
+    }
+}
+
+fn scaled_duration_mins(raw_duration_min: f64, raw_distance_km: f64, clamped_distance_km: f64) -> i32 {
+    if raw_distance_km > 0.0 && clamped_distance_km < raw_distance_km {
+        if clamped_distance_km <= 0.0 {
+            return 0;
+        }
+        ((raw_duration_min * (clamped_distance_km / raw_distance_km)).round() as i32).max(1)
+    } else {
+        raw_duration_min.round() as i32
+    }
 }
 
 fn round2(val: f64) -> f64 {
