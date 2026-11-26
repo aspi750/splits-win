@@ -174,6 +174,8 @@ export interface ReadinessState {
   telemetry_provenance: {
     source: string;
     date: string;
+    rhr_baseline_bpm?: number | null;
+    rhr_baseline_source?: "rolling_30d_median" | "manual_override" | null;
   };
   prescription_summary: {
     decision: string;

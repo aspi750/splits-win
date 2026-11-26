@@ -56,7 +56,8 @@ impl CoachPacketBuilder {
                     .map(|ndt| (DateTime::<Utc>::from_naive_utc_and_offset(ndt, Utc), d.resting_hr))
             })
             .collect();
-        let effective_rhr = config.effective_resting_hr_baseline(&rhr_samples, now);
+        let resolved_rhr = config.resolved_resting_hr_baseline(&rhr_samples, now);
+        let effective_rhr = resolved_rhr.map(|r| r.bpm);
 
         // 1. Athlete Profile & Active Guardrails
         let mut profile_sec = format!(
@@ -123,14 +124,17 @@ impl CoachPacketBuilder {
         } else {
             Some(rhr_vals.iter().sum::<i32>() as f64 / rhr_vals.len() as f64)
         };
+        let rhr_source_tag = resolved_rhr
+            .map(|r| format!(" [rhr_baseline_source: {}]", r.source))
+            .unwrap_or_default();
         let rhr_line = match (sorted_days.first().and_then(|d| d.resting_hr), effective_rhr) {
             (Some(latest), Some(base)) => {
                 let delta = latest - base;
                 let sign = if delta >= 0 { "+" } else { "" };
-                format!("latest {latest} bpm ({sign}{delta} vs {base} bpm baseline)")
+                format!("latest {latest} bpm ({sign}{delta} vs {base} bpm baseline){rhr_source_tag}")
             }
             (Some(latest), None) => format!("latest {latest} bpm"),
-            (None, Some(base)) => format!("baseline {base} bpm (no reading today)"),
+            (None, Some(base)) => format!("baseline {base} bpm (no reading today){rhr_source_tag}"),
             (None, None) => "N/A".to_string(),
         };
         let rhr_full = if let Some(avg) = rhr_avg {
@@ -1008,6 +1012,7 @@ pub fn build_garmin_weight_json(entry: &WeightEntry, now_epoch: i64) -> Value {
 }
 
 pub fn build_wellness_history_tool_payload(
+    config: &AthleteConfig,
     days: &[DayRecord],
     weights: &[WeightEntry],
     activities: &[ActivityRecord],
@@ -1024,6 +1029,17 @@ pub fn build_wellness_history_tool_payload(
             slim
         })
         .collect();
+    let ref_dt = chrono::DateTime::<Utc>::from_timestamp(now_epoch, 0).unwrap_or_else(Utc::now);
+    let rhr_samples: Vec<(DateTime<Utc>, Option<i32>)> = days
+        .iter()
+        .filter_map(|d| {
+            NaiveDate::parse_from_str(&d.date, "%Y-%m-%d")
+                .ok()
+                .and_then(|nd| nd.and_hms_opt(12, 0, 0))
+                .map(|ndt| (DateTime::<Utc>::from_naive_utc_and_offset(ndt, Utc), d.resting_hr))
+        })
+        .collect();
+    let resolved_rhr = config.resolved_resting_hr_baseline(&rhr_samples, ref_dt);
     let windows = scale_matcher::activity_windows(activities);
     let latest_garmin_weight = scale_matcher::latest_baseline_weigh_in(weights, &windows)
         .map(|w| build_garmin_weight_json(w, now_epoch));
@@ -1062,6 +1078,10 @@ pub fn build_wellness_history_tool_payload(
         "count": slice.len(),
         "days": slice,
     });
+    if let Some(r) = resolved_rhr {
+        payload["baseline_rhr_bpm"] = json!(r.bpm);
+        payload["rhr_baseline_source"] = json!(r.source);
+    }
     if let Some(latest) = latest_garmin_weight {
         payload["latest_garmin_weight"] = latest;
     }
@@ -1081,6 +1101,16 @@ pub fn build_readiness_and_plan_tool_payload(
     let config = store.load_athlete_config().ok().flatten().unwrap_or_default();
     let plan = store.read_json::<PlanFile>("plan.json").ok().flatten();
     let gear = store.read_json::<GearInventoryFile>("gear_inventory.json").ok().flatten();
+    let rhr_samples: Vec<(DateTime<Utc>, Option<i32>)> = days
+        .iter()
+        .filter_map(|d| {
+            NaiveDate::parse_from_str(&d.date, "%Y-%m-%d")
+                .ok()
+                .and_then(|nd| nd.and_hms_opt(12, 0, 0))
+                .map(|ndt| (DateTime::<Utc>::from_naive_utc_and_offset(ndt, Utc), d.resting_hr))
+        })
+        .collect();
+    let resolved_rhr = config.resolved_resting_hr_baseline(&rhr_samples, now);
     let output = ReadinessEngine::evaluate(ReadinessInput {
         now,
         athlete_config: &config,
@@ -1099,6 +1129,10 @@ pub fn build_readiness_and_plan_tool_payload(
         "today_adapted_target": output.authoritative_target,
         "plan": plan
     });
+    if let Some(r) = resolved_rhr {
+        payload["baseline_rhr_bpm"] = json!(r.bpm);
+        payload["rhr_baseline_source"] = json!(r.source);
+    }
     if let Some(latest) = latest_garmin_weight {
         payload["latest_garmin_weight"] = latest;
     }
@@ -1183,8 +1217,9 @@ fn execute_tool(
         }
         "get_wellness_history" => {
             let count = args["days"].as_u64().unwrap_or(14).min(60) as usize;
+            let config = store.load_athlete_config().ok().flatten().unwrap_or_default();
             let weights = db.and_then(|d| d.list_weight_entries(60).ok()).unwrap_or_default();
-            build_wellness_history_tool_payload(days, &weights, activities, count, Utc::now().timestamp())
+            build_wellness_history_tool_payload(&config, days, &weights, activities, count, Utc::now().timestamp())
         }
         "get_readiness_and_plan" => {
             let weights = db.and_then(|d| d.list_weight_entries(60).ok()).unwrap_or_default();
@@ -1805,26 +1840,13 @@ pub fn auto_calibrate_thresholds_from_history(
     config: &mut AthleteConfig,
     user_profile: &mut UserProfile,
     activities: &[ActivityRecord],
-    days: &[DayRecord],
-    now: DateTime<Utc>,
+    _days: &[DayRecord],
+    _now: DateTime<Utc>,
 ) -> bool {
     let mut changed = false;
 
-    if config.specs.resting_hr_baseline.is_none() {
-        let rhr_samples: Vec<(DateTime<Utc>, Option<i32>)> = days
-            .iter()
-            .filter_map(|d| {
-                NaiveDate::parse_from_str(&d.date, "%Y-%m-%d")
-                    .ok()
-                    .and_then(|nd| nd.and_hms_opt(12, 0, 0))
-                    .map(|ndt| (DateTime::<Utc>::from_naive_utc_and_offset(ndt, Utc), d.resting_hr))
-            })
-            .collect();
-        if let Some(cal_rhr) = AthleteConfig::calibrated_resting_hr(&rhr_samples, now) {
-            config.specs.resting_hr_baseline = Some(cal_rhr);
-            changed = true;
-        }
-    }
+    // Keep specs.resting_hr_baseline as None so the trailing 30-day median tracks automatically
+    // unless the athlete explicitly opts into a manual override.
 
     if config.specs.max_hr.is_none() {
         if let Some(observed_max) = activities
@@ -2620,8 +2642,9 @@ pub fn build_daily_briefing_facts_with_weights(
             .and_hms_opt(12, 0, 0)
             .map(|ndt| DateTime::<Utc>::from_naive_utc_and_offset(ndt, Utc))
             .unwrap_or_else(Utc::now);
-        let baseline_rhr = config
-            .effective_resting_hr_baseline(&rhr_samples, ref_dt)
+        let resolved_rhr = config.resolved_resting_hr_baseline(&rhr_samples, ref_dt);
+        let baseline_rhr = resolved_rhr
+            .map(|r| r.bpm)
             .or_else(|| avg_i32(before.iter().filter_map(|x| x.resting_hr).collect()));
         if let (Some(rhr), Some(usual)) = (d.resting_hr, baseline_rhr) {
             let diff = rhr - usual;
@@ -2635,7 +2658,10 @@ pub fn build_daily_briefing_facts_with_weights(
                 fresh.push("resting heart rate normal".to_string());
                 format!("about their usual {usual}")
             };
-            lines.push(format!("Resting heart rate {rhr} bpm, {desc}."));
+            let source_tag = resolved_rhr
+                .map(|r| format!(" (rhr_baseline_source: {})", r.source))
+                .unwrap_or_default();
+            lines.push(format!("Resting heart rate {rhr} bpm, {desc}{source_tag}."));
         }
 
         if let Some(high) = d.body_battery_high {

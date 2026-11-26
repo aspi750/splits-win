@@ -346,6 +346,15 @@ impl Default for AthleteConfig {
     }
 }
 
+pub const RHR_SOURCE_ROLLING_30D_MEDIAN: &str = "rolling_30d_median";
+pub const RHR_SOURCE_MANUAL_OVERRIDE: &str = "manual_override";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolvedRhrBaseline {
+    pub bpm: i32,
+    pub source: &'static str,
+}
+
 impl AthleteConfig {
     pub fn resolved_discipline(&self) -> TrainingDiscipline {
         if let Some(d) = self.discipline {
@@ -397,11 +406,27 @@ impl AthleteConfig {
         }
     }
 
-    pub fn effective_resting_hr_baseline(&self, samples: &[(DateTime<Utc>, Option<i32>)], reference_date: DateTime<Utc>) -> Option<i32> {
+    pub fn resolved_resting_hr_baseline(
+        &self,
+        samples: &[(DateTime<Utc>, Option<i32>)],
+        reference_date: DateTime<Utc>,
+    ) -> Option<ResolvedRhrBaseline> {
         if let Some(explicit) = self.specs.resting_hr_baseline.filter(|&v| v > 0) {
-            return Some(explicit);
+            return Some(ResolvedRhrBaseline {
+                bpm: explicit,
+                source: RHR_SOURCE_MANUAL_OVERRIDE,
+            });
         }
-        Self::calibrated_resting_hr(samples, reference_date)
+        let median = Self::calibrated_resting_hr(samples, reference_date)?;
+        Some(ResolvedRhrBaseline {
+            bpm: median,
+            source: RHR_SOURCE_ROLLING_30D_MEDIAN,
+        })
+    }
+
+    pub fn effective_resting_hr_baseline(&self, samples: &[(DateTime<Utc>, Option<i32>)], reference_date: DateTime<Utc>) -> Option<i32> {
+        self.resolved_resting_hr_baseline(samples, reference_date)
+            .map(|r| r.bpm)
     }
 
     pub fn format_pace(seconds_per_km: i32) -> String {
@@ -437,8 +462,16 @@ impl AthleteConfig {
             lines.push(format!("- Max HR: {m} bpm"));
         }
         if let Some(rhr) = effective_rhr.or(self.specs.resting_hr_baseline).filter(|&r| r > 0) {
-            let source = if self.specs.resting_hr_baseline.is_some() { "configured" } else { "30d median" };
-            lines.push(format!("- Resting HR baseline: {rhr} bpm ({source})"));
+            let is_manual = self.specs.resting_hr_baseline.filter(|&v| v > 0).is_some();
+            let source = if is_manual { "configured" } else { "30d median" };
+            let provenance = if is_manual {
+                RHR_SOURCE_MANUAL_OVERRIDE
+            } else {
+                RHR_SOURCE_ROLLING_30D_MEDIAN
+            };
+            lines.push(format!(
+                "- Resting HR baseline: {rhr} bpm ({source}) [rhr_baseline_source: {provenance}]"
+            ));
         }
         if let Some(vt1) = self.specs.vt1_ceiling_bpm.filter(|&v| v > 0) {
             lines.push(format!("- VT1 aerobic ceiling: {vt1} bpm"));
@@ -584,6 +617,10 @@ pub struct ReadinessShoeEligibility {
 pub struct TelemetryProvenance {
     pub source: String,
     pub date: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rhr_baseline_bpm: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rhr_baseline_source: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -616,6 +653,10 @@ pub struct DeterministicMetrics {
     pub remaining_7d_budget_km: Option<f64>,
     pub hard_blocks: Vec<String>,
     pub caution_flags: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rhr_baseline_bpm: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rhr_baseline_source: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

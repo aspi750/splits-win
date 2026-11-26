@@ -106,7 +106,8 @@ impl ReadinessEngine {
                     .map(|ndt| (DateTime::<Utc>::from_naive_utc_and_offset(ndt, Utc), d.resting_hr))
             })
             .collect();
-        let baseline_rhr = input.athlete_config.effective_resting_hr_baseline(&rhr_samples, now);
+        let resolved_rhr = input.athlete_config.resolved_resting_hr_baseline(&rhr_samples, now);
+        let baseline_rhr = resolved_rhr.map(|r| r.bpm);
 
         // 3. Hard Blocks (`CONTRACT.md §3.2`)
         let mut hard_blocks = Vec::new();
@@ -415,6 +416,8 @@ impl ReadinessEngine {
             telemetry_provenance: TelemetryProvenance {
                 source: "garmin".to_string(),
                 date: today_str.clone(),
+                rhr_baseline_bpm: resolved_rhr.map(|r| r.bpm),
+                rhr_baseline_source: resolved_rhr.map(|r| r.source.to_string()),
             },
             prescription_summary: PrescriptionSummary {
                 decision: decision.to_string(),
@@ -442,6 +445,8 @@ impl ReadinessEngine {
                 remaining_7d_budget_km: Some(remaining_7d_budget_km),
                 hard_blocks,
                 caution_flags,
+                rhr_baseline_bpm: resolved_rhr.map(|r| r.bpm),
+                rhr_baseline_source: resolved_rhr.map(|r| r.source.to_string()),
             }),
             prescription: Some(Prescription {
                 status_badge: Some(status_badge.to_string()),

@@ -343,7 +343,7 @@ export function OnboardingWizard({
           z3_range_bpm: initialProfile.runner_config.z3_range_bpm,
           lthr_bpm: parseValidHrBpm(lthrBpm),
           max_hr_bpm: parseValidHrBpm(maxHR) ?? initialProfile.runner_config.max_hr_bpm ?? null,
-          resting_hr_bpm: parseValidHrBpm(rhrBaseline) ?? initialProfile.runner_config.resting_hr_bpm ?? null,
+          resting_hr_bpm: parseValidHrBpm(rhrBaseline),
         },
         hyrox_config: {
           division: athleteType === "runner" ? null : division,
@@ -597,14 +597,14 @@ export function OnboardingWizard({
                   />
                 </div>
                 <div>
-                  <label className="muted">Resting HR Baseline (bpm, optional)</label>
+                  <label className="muted">Resting HR Override (bpm, optional)</label>
                   <input
                     type="text"
                     inputMode="numeric"
                     maxLength={3}
                     value={rhrBaseline}
                     onChange={(e) => setRhrBaseline(sanitizeHrInput(e.target.value))}
-                    placeholder="Auto-calibrated if blank"
+                    placeholder="Auto (30-day median)"
                   />
                 </div>
                 <div>

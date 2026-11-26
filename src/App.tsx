@@ -806,18 +806,36 @@ export default function App() {
     return out;
   }, [state]);
 
-  const rhrBaseline30d = useMemo(() => {
+  const autoRhrMedian30d = useMemo(() => {
     if (!state) return null;
-    const cfgBase = state.athlete_config.specs.restingHRBaseline;
-    if (cfgBase && cfgBase > 0) return cfgBase;
+    const cutoff = new Date();
+    cutoff.setDate(cutoff.getDate() - 30);
+    const cutoffIso = toLocalIsoDate(cutoff);
     const vals = state.days
-      .slice(0, 30)
+      .filter((d) => d.date >= cutoffIso)
       .map((d) => d.resting_hr)
       .filter((v): v is number => v != null && v > 0)
       .sort((a, b) => a - b);
-    if (vals.length === 0) return null;
-    return vals[Math.floor(vals.length / 2)];
+    if (vals.length < 5) return null;
+    const mid = Math.floor(vals.length / 2);
+    if (vals.length % 2 === 0) {
+      return Math.round((vals[mid - 1] + vals[mid]) / 2);
+    }
+    return vals[mid];
   }, [state]);
+
+  const effectiveRhrBaseline = useMemo<
+    { bpm: number; source: "manual_override" | "rolling_30d_median" } | null
+  >(() => {
+    const manual = state?.athlete_config.specs.restingHRBaseline;
+    if (manual != null && manual > 0) {
+      return { bpm: manual, source: "manual_override" };
+    }
+    if (autoRhrMedian30d != null && autoRhrMedian30d > 0) {
+      return { bpm: autoRhrMedian30d, source: "rolling_30d_median" };
+    }
+    return null;
+  }, [state, autoRhrMedian30d]);
 
   const todayIsoForEffects = toLocalIsoDate(new Date());
   const todayDayForEffects = state?.days.find((d) => d.date === todayIsoForEffects) ?? state?.days[0];
@@ -2134,18 +2152,18 @@ export default function App() {
               <div className="bio-card">
                 <div className="bio-card-head">
                   <span className="bio-card-label">Resting Heart Rate</span>
-                  {todayDay?.resting_hr != null && rhrBaseline30d != null && (
+                  {todayDay?.resting_hr != null && effectiveRhrBaseline != null && (
                     <span
                       className={`pill ${
-                        todayDay.resting_hr - rhrBaseline30d >= 5
+                        todayDay.resting_hr - effectiveRhrBaseline.bpm >= 5
                           ? "red"
-                          : todayDay.resting_hr - rhrBaseline30d >= 2
+                          : todayDay.resting_hr - effectiveRhrBaseline.bpm >= 2
                           ? "amber"
                           : "green"
                       }`}
                     >
-                      {todayDay.resting_hr - rhrBaseline30d >= 0 ? "+" : ""}
-                      {todayDay.resting_hr - rhrBaseline30d} vs {rhrBaseline30d}
+                      {todayDay.resting_hr - effectiveRhrBaseline.bpm >= 0 ? "+" : ""}
+                      {todayDay.resting_hr - effectiveRhrBaseline.bpm} vs {effectiveRhrBaseline.bpm}
                     </span>
                   )}
                 </div>
@@ -2155,7 +2173,13 @@ export default function App() {
                 </div>
                 <SparklineSvg values={rhrSeriesPoints} color="#E06C75" unit="bpm" />
                 <div className="bio-footer">
-                  <span>30d median {rhrBaseline30d != null ? `${rhrBaseline30d} bpm` : "–"}</span>
+                  <span>
+                    {effectiveRhrBaseline != null
+                      ? effectiveRhrBaseline.source === "manual_override"
+                        ? `Manual baseline ${effectiveRhrBaseline.bpm} bpm`
+                        : `30d median ${effectiveRhrBaseline.bpm} bpm`
+                      : "30d median –"}
+                  </span>
                   <span>{rhrSeriesPoints.length}d curve</span>
                 </div>
               </div>
@@ -3973,19 +3997,21 @@ export default function App() {
                           />
                         </div>
                         <div>
-                          <label className="muted">Resting HR (bpm)</label>
+                          <label className="muted">Resting HR baseline (bpm)</label>
                           <input
                             type="text"
                             inputMode="numeric"
                             maxLength={3}
-                            value={
-                              activeProfile.runner_config.resting_hr_bpm ??
-                              draftConfig.specs.restingHRBaseline ??
-                              ""
+                            placeholder={
+                              autoRhrMedian30d != null
+                                ? `Auto (30-day median: ${autoRhrMedian30d} bpm)`
+                                : "Auto (30-day median)"
                             }
+                            value={draftConfig.specs.restingHRBaseline ?? ""}
                             onChange={(e) => {
                               const cleaned = sanitizeHrInput(e.target.value);
-                              const v = cleaned ? Number(cleaned) : null;
+                              const parsed = cleaned ? Number(cleaned) : null;
+                              const v = parsed && parsed > 0 ? parsed : null;
                               setDraftConfig({
                                 ...draftConfig,
                                 specs: { ...draftConfig.specs, restingHRBaseline: v },
@@ -3996,6 +4022,58 @@ export default function App() {
                               });
                             }}
                           />
+                          {draftConfig.specs.restingHRBaseline != null &&
+                          draftConfig.specs.restingHRBaseline > 0 ? (
+                            <div
+                              style={{
+                                display: "flex",
+                                alignItems: "center",
+                                gap: 8,
+                                marginTop: 4,
+                                flexWrap: "wrap",
+                              }}
+                            >
+                              <span className="muted" style={{ fontSize: 11, color: "#E9A84C" }}>
+                                Manual override active
+                              </span>
+                              <button
+                                type="button"
+                                className="secondary"
+                                style={{ padding: "2px 8px", fontSize: 11 }}
+                                onClick={async () => {
+                                  const nextConfig: AthleteConfig = {
+                                    ...draftConfig,
+                                    specs: { ...draftConfig.specs, restingHRBaseline: null },
+                                  };
+                                  const nextProfile: UserProfile = {
+                                    ...activeProfile,
+                                    runner_config: {
+                                      ...activeProfile.runner_config,
+                                      resting_hr_bpm: null,
+                                    },
+                                  };
+                                  setDraftConfig(nextConfig);
+                                  setDraftProfile(nextProfile);
+                                  await invoke("save_athlete_config", { config: nextConfig });
+                                  await invoke("save_user_profile", { profile: nextProfile });
+                                  setStatusMsg(
+                                    autoRhrMedian30d != null
+                                      ? `Resting HR baseline set to Auto (30-day median: ${autoRhrMedian30d} bpm).`
+                                      : "Resting HR baseline set to Auto (30-day median)."
+                                  );
+                                  await reload();
+                                }}
+                              >
+                                Use Auto (30-day median)
+                              </button>
+                            </div>
+                          ) : (
+                            <div className="muted" style={{ fontSize: 11, marginTop: 4 }}>
+                              {autoRhrMedian30d != null
+                                ? `Auto-tracking 30-day median (${autoRhrMedian30d} bpm). Enter a number only to pin an override.`
+                                : "Auto 30-day median activates once >= 5 valid days are synced."}
+                            </div>
+                          )}
                         </div>
                         <div>
                           <label className="muted">Z2 Min (bpm)</label>
@@ -4273,7 +4351,7 @@ export default function App() {
                         activeProfile.runner_config.max_hr_bpm ?? draftConfig.specs.maxHR ?? null
                       );
                       const syncedRhr = parseValidHrBpm(
-                        activeProfile.runner_config.resting_hr_bpm ?? draftConfig.specs.restingHRBaseline ?? null
+                        draftConfig.specs.restingHRBaseline ?? null
                       );
                       const validEasyCeiling = parseValidHrBpm(draftConfig.medical.easyHRCeilingBPM ?? null);
                       const sanitizeZonePair = (

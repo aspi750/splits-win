@@ -3671,7 +3671,7 @@ fn test_garmin_weight_authority_recency_guard_and_blank_shoe_filter() {
     let activities = db.list_activities(10).unwrap();
     let days = db.list_days(14).unwrap();
     let weights = db.list_weight_entries(20).unwrap();
-    let wellness = build_wellness_history_tool_payload(&days, &weights, &activities, 14, eval_now);
+    let wellness = build_wellness_history_tool_payload(&updated_cfg, &days, &weights, &activities, 14, eval_now);
     assert_eq!(wellness["latest_garmin_weight"]["weight_kg"].as_f64(), Some(109.4));
     assert_eq!(wellness["latest_garmin_weight"]["is_fresh"].as_bool(), Some(true));
     let recent = wellness["recent_weight_entries"].as_array().unwrap();
@@ -3832,6 +3832,138 @@ fn test_garmin_weight_authority_recency_guard_and_blank_shoe_filter() {
         out.readiness_state.shoe_eligibility.eligible_run_shoes,
         vec!["Superblast 3".to_string()]
     );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_rolling_30d_median_rhr_default_no_false_positive_elevated_rhr_and_source_parity() {
+    let dir = make_temp_dir("win-rhr-30d-median");
+    let store = SharedStore::new(Some(dir.clone())).unwrap();
+    let now = Utc.with_ymd_and_hms(2026, 11, 20, 14, 0, 0).unwrap();
+
+    // 1. Default config has resting_hr_baseline == None and auto-calibration does NOT freeze it
+    let mut auto_cfg = AthleteConfig::default();
+    assert_eq!(auto_cfg.specs.resting_hr_baseline, None);
+
+    // Build 6 trailing days with RHR [56, 57, 58, 59, 60, 62] -> sorted: [56, 57, 58, 59, 60, 62] -> median = 59
+    let sample_rhrs = [62, 56, 60, 57, 59, 58];
+    let mut days: Vec<DayRecord> = sample_rhrs
+        .iter()
+        .enumerate()
+        .map(|(idx, &rhr)| {
+            let date_str = (now.date_naive() - Duration::days(idx as i64))
+                .format("%Y-%m-%d")
+                .to_string();
+            DayRecord {
+                date: date_str,
+                resting_hr: Some(rhr),
+                body_battery_high: Some(80),
+                body_battery_low: Some(40),
+                sleep_seconds: Some(27_000),
+                sleep_duration_sec: Some(27_000),
+                sleep_score: Some(82),
+                hrv_last_night: Some(55),
+                hrv_status: Some("BALANCED".to_string()),
+                hrv_baseline_low: Some(45),
+                hrv_baseline_high: Some(75),
+                ..Default::default()
+            }
+        })
+        .collect();
+    store.save_athlete_config(&auto_cfg).unwrap();
+
+    let mut prof = UserProfile::default();
+    splits_win_lib::coach::auto_calibrate_thresholds_from_history(&mut auto_cfg, &mut prof, &[], &days, now);
+    assert_eq!(auto_cfg.specs.resting_hr_baseline, None);
+
+    // Today's RHR = 62 -> delta = 62 - 59 = 3 (< 5): MUST NOT fire ELEVATED_RHR
+    let out_ok = ReadinessEngine::evaluate(ReadinessInput {
+        now,
+        athlete_config: &auto_cfg,
+        activities: &[],
+        days: &days,
+        plan: None,
+        gear_inventory: None,
+    });
+    assert!(out_ok.readiness_state.gatekeeper.run_permitted);
+    assert!(!out_ok
+        .readiness_state
+        .gatekeeper
+        .hard_blocks
+        .iter()
+        .any(|b| b.starts_with("ELEVATED_RHR")));
+    assert_eq!(out_ok.readiness_state.telemetry_provenance.rhr_baseline_bpm, Some(59));
+    assert_eq!(
+        out_ok.readiness_state.telemetry_provenance.rhr_baseline_source.as_deref(),
+        Some("rolling_30d_median")
+    );
+    let dm = out_ok.authoritative_target.deterministic_metrics.unwrap();
+    assert_eq!(dm.rhr_baseline_bpm, Some(59));
+    assert_eq!(dm.rhr_baseline_source.as_deref(), Some("rolling_30d_median"));
+
+    // Coach tools, packet builder & daily briefing expose rolling_30d_median
+    let wellness = build_wellness_history_tool_payload(&auto_cfg, &days, &[], &[], 14, now.timestamp());
+    assert_eq!(wellness["baseline_rhr_bpm"].as_i64(), Some(59));
+    assert_eq!(wellness["rhr_baseline_source"].as_str(), Some("rolling_30d_median"));
+
+    let rp = build_readiness_and_plan_tool_payload(&store, &[], &days, &[], now);
+    assert_eq!(rp["baseline_rhr_bpm"].as_i64(), Some(59));
+    assert_eq!(rp["rhr_baseline_source"].as_str(), Some("rolling_30d_median"));
+
+    let packet = CoachPacketBuilder::build_markdown_with_weights(&auto_cfg, &[], &days, &[], None, None, "", now);
+    assert!(packet.contains("rhr_baseline_source: rolling_30d_median"));
+
+    let facts = build_daily_briefing_facts_with_weights(
+        &auto_cfg,
+        &[],
+        &days,
+        &[],
+        None,
+        now.date_naive(),
+        now.timestamp(),
+    );
+    assert!(facts.contains("rhr_baseline_source: rolling_30d_median"));
+
+    // Today's RHR = 64 -> delta = 64 - 59 = 5 (>= 5): fires ELEVATED_RHR
+    days[0].resting_hr = Some(64);
+    let out_blocked = ReadinessEngine::evaluate(ReadinessInput {
+        now,
+        athlete_config: &auto_cfg,
+        activities: &[],
+        days: &days,
+        plan: None,
+        gear_inventory: None,
+    });
+    assert!(!out_blocked.readiness_state.gatekeeper.run_permitted);
+    assert!(out_blocked
+        .readiness_state
+        .gatekeeper
+        .hard_blocks
+        .iter()
+        .any(|b| b.starts_with("ELEVATED_RHR")));
+
+    // Explicit manual override emits "manual_override" everywhere
+    let mut manual_cfg = auto_cfg;
+    manual_cfg.specs.resting_hr_baseline = Some(54);
+    store.save_athlete_config(&manual_cfg).unwrap();
+
+    let out_manual = ReadinessEngine::evaluate(ReadinessInput {
+        now,
+        athlete_config: &manual_cfg,
+        activities: &[],
+        days: &days,
+        plan: None,
+        gear_inventory: None,
+    });
+    assert_eq!(out_manual.readiness_state.telemetry_provenance.rhr_baseline_bpm, Some(54));
+    assert_eq!(
+        out_manual.readiness_state.telemetry_provenance.rhr_baseline_source.as_deref(),
+        Some("manual_override")
+    );
+    let manual_wellness = build_wellness_history_tool_payload(&manual_cfg, &days, &[], &[], 14, now.timestamp());
+    assert_eq!(manual_wellness["baseline_rhr_bpm"].as_i64(), Some(54));
+    assert_eq!(manual_wellness["rhr_baseline_source"].as_str(), Some("manual_override"));
 
     let _ = std::fs::remove_dir_all(&dir);
 }
