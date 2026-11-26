@@ -97,6 +97,26 @@ impl SharedStore {
         Self::atomic_write_bytes(&target, &data)
     }
 
+    /// Loads `plan.json` and, if `covers.to < today`, deterministically rolls it forward
+    /// (`CONTRACT.md §2.4`), backing up the prior `plan.json` to `.backups/` and `history/`
+    /// before persisting atomically.
+    pub fn load_plan_with_auto_rollover(
+        &self,
+        today: &str,
+        now_iso: &str,
+    ) -> Result<Option<PlanFile>, StorageError> {
+        let Some(plan) = self.read_json::<PlanFile>("plan.json")? else {
+            return Ok(None);
+        };
+        if let Some(rolled) = rollover_plan_if_expired(&plan, today, now_iso) {
+            let target = self.root_dir.join("plan.json");
+            self.copy_to_backups_if_exists(&target)?;
+            self.write_json_atomic("plan.json", &rolled)?;
+            return Ok(Some(rolled));
+        }
+        Ok(Some(plan))
+    }
+
     pub fn load_athlete_config(&self) -> Result<Option<AthleteConfig>, StorageError> {
         self.read_json("athlete_config.json")
     }
@@ -246,6 +266,24 @@ impl SharedStore {
         };
         let bytes = fs::read(target)?;
         Self::atomic_write_bytes(&history_dir.join(backup_name), &bytes)
+    }
+
+    fn copy_to_backups_if_exists(&self, target: &Path) -> Result<(), StorageError> {
+        if !target.exists() {
+            return Ok(());
+        }
+        let backups_dir = self.root_dir.join(".backups");
+        fs::create_dir_all(&backups_dir)?;
+        let stem = target.file_stem().and_then(|s| s.to_str()).unwrap_or("file");
+        let ext = target.extension().and_then(|s| s.to_str()).unwrap_or("");
+        let stamp = Local::now().format("%Y-%m-%dT%H%M%S").to_string();
+        let backup_name = if ext.is_empty() {
+            format!("{stem}_{stamp}")
+        } else {
+            format!("{stem}_{stamp}.{ext}")
+        };
+        let bytes = fs::read(target)?;
+        Self::atomic_write_bytes(&backups_dir.join(backup_name), &bytes)
     }
 
     pub fn atomic_write_bytes(target: &Path, data: &[u8]) -> Result<(), StorageError> {

@@ -9,6 +9,7 @@ pub mod storage;
 
 use chrono::{Local, Utc};
 use models::*;
+pub use models::rollover_plan_if_expired;
 use readiness::{ReadinessEngine, ReadinessInput};
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -303,11 +304,15 @@ fn recompute_readiness(state: State<'_, AppState>) -> Result<ReadinessState, Str
     let config = store.load_athlete_config().map_err(|e| e.to_string())?.unwrap_or_default();
     let activities = db.list_activities(200).map_err(|e| e.to_string())?;
     let days = db.list_days(60).map_err(|e| e.to_string())?;
-    let plan: Option<PlanFile> = store.read_json("plan.json").map_err(|e| e.to_string())?;
+    let now = Utc::now();
+    let today_str = now.format("%Y-%m-%d").to_string();
+    let plan = store
+        .load_plan_with_auto_rollover(&today_str, &now.to_rfc3339())
+        .map_err(|e| e.to_string())?;
     let gear: Option<GearInventoryFile> = store.read_json("gear_inventory.json").map_err(|e| e.to_string())?;
 
     let output = ReadinessEngine::evaluate(ReadinessInput {
-        now: Utc::now(),
+        now,
         athlete_config: &config,
         activities: &activities,
         days: &days,
@@ -403,10 +408,15 @@ async fn perform_full_garmin_sync(
     let config = reconcile_scale_weights_and_config(&db, store, Utc::now().timestamp())?;
     let activities = db.list_activities(200).map_err(|e| e.to_string())?;
     let days = db.list_days(60).map_err(|e| e.to_string())?;
-    let plan: Option<PlanFile> = store.read_json("plan.json").ok().flatten();
+    let now = Utc::now();
+    let today_str = now.format("%Y-%m-%d").to_string();
+    let plan = store
+        .load_plan_with_auto_rollover(&today_str, &now.to_rfc3339())
+        .ok()
+        .flatten();
     let gear: Option<GearInventoryFile> = store.read_json("gear_inventory.json").ok().flatten();
     let output = ReadinessEngine::evaluate(ReadinessInput {
-        now: Utc::now(),
+        now,
         athlete_config: &config,
         activities: &activities,
         days: &days,
@@ -606,16 +616,21 @@ fn apply_coach_proposal(state: State<'_, AppState>, proposal: CoachUpdateProposa
         let config = store.load_athlete_config().map_err(|e| e.to_string())?.unwrap_or_default();
         let activities = db.list_activities(5000).map_err(|e| e.to_string())?;
         let days = db.list_days(60).map_err(|e| e.to_string())?;
-        let mut plan: Option<PlanFile> = store.read_json("plan.json").ok().flatten();
+        let now = Utc::now();
+        let today_str = now.format("%Y-%m-%d").to_string();
+        let mut plan: Option<PlanFile> = store
+            .load_plan_with_auto_rollover(&today_str, &now.to_rfc3339())
+            .ok()
+            .flatten();
         if plan.is_none() {
-            let summary = coach::analyze_training_history(&activities, &config, Utc::now());
+            let summary = coach::analyze_training_history(&activities, &config, now);
             let seeded = coach::starter_plan_file(&config, &summary);
             let _ = store.write_json_atomic("plan.json", &seeded);
             plan = Some(seeded);
         }
         let gear: Option<GearInventoryFile> = store.read_json("gear_inventory.json").ok().flatten();
         let output = ReadinessEngine::evaluate(ReadinessInput {
-            now: Utc::now(),
+            now,
             athlete_config: &config,
             activities: &activities,
             days: &days,
@@ -1130,13 +1145,18 @@ fn set_theme_mode(state: State<'_, AppState>, mode: String) -> Result<String, St
 #[tauri::command]
 fn get_plan_file(state: State<'_, AppState>) -> Result<PlanFile, String> {
     let store = state.load_store()?;
-    if let Some(plan) = store.read_json::<PlanFile>("plan.json").map_err(|e| e.to_string())? {
+    let now = Utc::now();
+    let today_str = now.format("%Y-%m-%d").to_string();
+    if let Some(plan) = store
+        .load_plan_with_auto_rollover(&today_str, &now.to_rfc3339())
+        .map_err(|e| e.to_string())?
+    {
         return Ok(plan);
     }
     let db = state.open_db()?;
     let config = store.load_athlete_config().map_err(|e| e.to_string())?.unwrap_or_default();
     let activities = db.list_activities(500).map_err(|e| e.to_string())?;
-    let summary = coach::analyze_training_history(&activities, &config, Utc::now());
+    let summary = coach::analyze_training_history(&activities, &config, now);
     Ok(coach::starter_plan_file(&config, &summary))
 }
 
@@ -1167,10 +1187,15 @@ fn save_plan_envelope(
     let days = db.list_days(60).map_err(|e| e.to_string())?;
     let gear: Option<GearInventoryFile> = store.read_json("gear_inventory.json").map_err(|e| e.to_string())?;
 
-    let mut plan = match store.read_json::<PlanFile>("plan.json").map_err(|e| e.to_string())? {
+    let now = Utc::now();
+    let today_utc = now.format("%Y-%m-%d").to_string();
+    let mut plan = match store
+        .load_plan_with_auto_rollover(&today_utc, &now.to_rfc3339())
+        .map_err(|e| e.to_string())?
+    {
         Some(p) => p,
         None => {
-            let summary = coach::analyze_training_history(&activities, &config, Utc::now());
+            let summary = coach::analyze_training_history(&activities, &config, now);
             coach::starter_plan_file(&config, &summary)
         }
     };

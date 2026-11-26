@@ -90,9 +90,14 @@ impl ReadinessEngine {
         let rolling_7d_km = round2(runs_7d.iter().map(|a| a.distance_km()).sum());
         let rolling_7d_runs = runs_7d.len() as i32;
 
-        let weekly_volume_cap_km = resolve_weekly_volume_cap_km(input.plan, input.athlete_config);
+        let effective_plan_owned = input
+            .plan
+            .and_then(|p| rollover_plan_if_expired(p, &today_str, &updated_at_str));
+        let effective_plan = effective_plan_owned.as_ref().or(input.plan);
+
+        let weekly_volume_cap_km = resolve_weekly_volume_cap_km(effective_plan, input.athlete_config);
         let remaining_7d_budget_km = round2((weekly_volume_cap_km - rolling_7d_km).max(0.0));
-        let max_runs_7d = input.plan.map_or(4, |p| (p.sessions.len() as i32).max(3));
+        let max_runs_7d = effective_plan.map_or(4, |p| (p.sessions.len() as i32).max(3));
 
         // 2. Today's recovery telemetry & 30d RHR baseline
         let today_day = input.days.iter().find(|d| d.date == today_str);
@@ -162,7 +167,7 @@ impl ReadinessEngine {
             }
         }
 
-        if let Some(plan) = input.plan {
+        if let Some(plan) = effective_plan {
             if plan.envelope.max_weekly_km > 0.0 {
                 let plan_remaining = round2((plan.envelope.max_weekly_km - rolling_7d_km).max(0.0));
                 if plan_remaining < 2.0 && !hard_blocks.iter().any(|b| b.starts_with("VOLUME_CAP_REACHED")) {
@@ -213,7 +218,17 @@ impl ReadinessEngine {
 
         // 5. Shoe Eligibility & Planned Session
         let (eligible_shoes, gated_shoes, blocked_shoes) = resolve_shoe_eligibility(input.gear_inventory, &prior_runs);
-        let today_session = input.plan.and_then(|p| p.sessions.iter().find(|s| s.date == today_str));
+        let today_session = effective_plan.and_then(|p| p.sessions.iter().find(|s| s.date == today_str));
+        let clean_plan_constraints: Vec<String> = today_session
+            .map(|s| {
+                s.shoe_constraints
+                    .iter()
+                    .map(|c| c.trim().to_string())
+                    .filter(|c| !c.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let resolved_shoe_platform = resolve_shoe_platform(&clean_plan_constraints, &eligible_shoes);
         let default_single_cap_km = if goal_type == GoalType::CouchTo5k {
             5.0
         } else if is_reentry_or_c25k {
@@ -221,7 +236,7 @@ impl ReadinessEngine {
         } else {
             10.0
         };
-        let single_run_cap_km = input.plan.map_or(default_single_cap_km, |p| p.envelope.max_single_run_km);
+        let single_run_cap_km = effective_plan.map_or(default_single_cap_km, |p| p.envelope.max_single_run_km);
         let effective_today_max_km = round2(single_run_cap_km.min(remaining_7d_budget_km));
 
         // 6. Deterministic Prescription & Guardrail Clamping (`CONTRACT.md §3.4`)
@@ -252,7 +267,7 @@ impl ReadinessEngine {
                     .and_then(|s| s.target.duration_min.first().copied())
                     .map(|v| v.round() as i32)
                     .unwrap_or_else(|| ((dist * 6.5).round() as i32).max(20));
-                let shoe = eligible_shoes.first().cloned().unwrap_or_else(|| "Daily Trainer".to_string());
+                let shoe = resolved_shoe_platform.clone();
                 (
                     "🟡 AMBER - ADAPTED / CAUTION",
                     "ADAPTED_RUN",
@@ -280,7 +295,7 @@ impl ReadinessEngine {
                     .and_then(|s| s.target.duration_min.first().copied())
                     .map(|v| v.round() as i32)
                     .unwrap_or_else(|| ((dist * pace_min_per_km).round() as i32).max(20));
-                let shoe = eligible_shoes.first().cloned().unwrap_or_else(|| "Daily Trainer".to_string());
+                let shoe = resolved_shoe_platform.clone();
                 let default_title = match goal_type {
                     GoalType::CouchTo5k => "C25K Run-Walk Progression",
                     GoalType::ReturnToRunning | GoalType::ReturnFromInjury => "Run-Walk Re-Entry",
@@ -330,7 +345,7 @@ impl ReadinessEngine {
             }
         } else {
             checklist.push("Adhere to gatekeeper running prohibition.".to_string());
-            let walk_cap = input.plan.and_then(|p| p.envelope.walk_hr_cap_bpm).unwrap_or(110);
+            let walk_cap = effective_plan.and_then(|p| p.envelope.walk_hr_cap_bpm).unwrap_or(110);
             checklist.push(format!("Optional walking must stay <= {walk_cap} bpm."));
         }
         if is_hybrid {
@@ -379,17 +394,17 @@ impl ReadinessEngine {
                 effective_today_max_km,
             },
             plan_context: ReadinessPlanContext {
-                source: if input.plan.is_some() {
+                source: if effective_plan.is_some() {
                     "shared_plan_json".to_string()
                 } else {
                     "self_contained_config".to_string()
                 },
-                revision: input.plan.map_or(0, |p| p.revision),
-                mesocycle_phase: input.plan.map_or_else(
+                revision: effective_plan.map_or(0, |p| p.revision),
+                mesocycle_phase: effective_plan.map_or_else(
                     || format!("{:?}", input.athlete_config.objective.goal_type).to_lowercase(),
                     |p| p.envelope.mesocycle_phase.clone(),
                 ),
-                walk_hr_cap_bpm: input.plan.and_then(|p| p.envelope.walk_hr_cap_bpm).unwrap_or(110),
+                walk_hr_cap_bpm: effective_plan.and_then(|p| p.envelope.walk_hr_cap_bpm).unwrap_or(110),
                 today_planned_session: planned_session_snapshot,
             },
             shoe_eligibility: ReadinessShoeEligibility {
@@ -403,15 +418,7 @@ impl ReadinessEngine {
                 gated_shoes,
                 blocked_shoes,
                 non_run_footwear: Vec::new(),
-                plan_shoe_constraints: today_session
-                    .map(|s| {
-                        s.shoe_constraints
-                            .iter()
-                            .map(|c| c.trim().to_string())
-                            .filter(|c| !c.is_empty())
-                            .collect()
-                    })
-                    .unwrap_or_default(),
+                plan_shoe_constraints: clean_plan_constraints,
             },
             telemetry_provenance: TelemetryProvenance {
                 source: "garmin".to_string(),
@@ -527,6 +534,30 @@ fn resolve_weekly_volume_cap_km(plan: Option<&PlanFile>, config: &AthleteConfig)
         }
     }
     20.0
+}
+
+/// Resolves `prescription.shoe_platform` deterministically by intersecting today's non-empty
+/// `shoe_constraints` with `eligible_run_shoes` (case-insensitive match, preserving
+/// `shoe_constraints` order), falling back to `eligible_run_shoes.first()` only when empty.
+pub fn resolve_shoe_platform(plan_constraints: &[String], eligible_run_shoes: &[String]) -> String {
+    if !plan_constraints.is_empty() {
+        for constraint in plan_constraints {
+            let trimmed = constraint.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if let Some(matched) = eligible_run_shoes
+                .iter()
+                .find(|shoe| shoe.trim().eq_ignore_ascii_case(trimmed))
+            {
+                return matched.clone();
+            }
+        }
+    }
+    eligible_run_shoes
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "Daily Trainer".to_string())
 }
 
 fn resolve_shoe_eligibility(

@@ -1099,7 +1099,11 @@ pub fn build_readiness_and_plan_tool_payload(
     now: DateTime<Utc>,
 ) -> Value {
     let config = store.load_athlete_config().ok().flatten().unwrap_or_default();
-    let plan = store.read_json::<PlanFile>("plan.json").ok().flatten();
+    let today_str = now.format("%Y-%m-%d").to_string();
+    let plan = store
+        .load_plan_with_auto_rollover(&today_str, &now.to_rfc3339())
+        .ok()
+        .flatten();
     let gear = store.read_json::<GearInventoryFile>("gear_inventory.json").ok().flatten();
     let rhr_samples: Vec<(DateTime<Utc>, Option<i32>)> = days
         .iter()

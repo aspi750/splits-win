@@ -18,6 +18,7 @@ use splits_win_lib::garmin::{
 };
 use splits_win_lib::models::*;
 use splits_win_lib::readiness::{ReadinessEngine, ReadinessInput};
+use splits_win_lib::rollover_plan_if_expired;
 use splits_win_lib::scheduler::{
     is_within_catch_up_window, should_catch_up_briefing, should_send_morning_notification,
 };
@@ -3964,6 +3965,266 @@ fn test_rolling_30d_median_rhr_default_no_false_positive_elevated_rhr_and_source
     let manual_wellness = build_wellness_history_tool_payload(&manual_cfg, &days, &[], &[], 14, now.timestamp());
     assert_eq!(manual_wellness["baseline_rhr_bpm"].as_i64(), Some(54));
     assert_eq!(manual_wellness["rhr_baseline_source"].as_str(), Some("manual_override"));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_deterministic_plan_auto_rollover_and_shoe_parity() {
+    let base_envelope = PlanEnvelope {
+        max_weekly_km: 12.0,
+        max_single_run_km: 4.0,
+        mesocycle_phase: "sesamoid_return_reentry".to_string(),
+        min_hours_between_runs: 48.0,
+        walk_hr_cap_bpm: Some(120),
+    };
+    let base_plan = PlanFile {
+        version: 1,
+        revision: 3,
+        updated_at: "2026-11-15T14:39:05+01:00".to_string(),
+        updated_by: "splits-coach".to_string(),
+        covers: PlanDateRange {
+            from: "2026-11-09".to_string(),
+            to: "2026-11-22".to_string(),
+        },
+        status: PlanStatus::Valid,
+        envelope: base_envelope.clone(),
+        sessions: vec![
+            PlanSession {
+                id: "2026-11-13-rw-1".to_string(),
+                date: "2026-11-13".to_string(),
+                session_type: RunTypology::RunWalkReentry,
+                target: PlanTargetRange {
+                    duration_min: vec![20.0, 25.0],
+                    distance_km: vec![2.5, 3.5],
+                },
+                hr_cap_bpm: 133,
+                shoe_constraints: vec!["Superblast 3".to_string(), "Vomero 18".to_string()],
+                alternatives: vec!["Walk 30 min on flat soft surface (HR <= 120 bpm)".to_string()],
+            },
+            PlanSession {
+                id: "2026-11-21-rw-4".to_string(),
+                date: "2026-11-21".to_string(),
+                session_type: RunTypology::RunWalkReentry,
+                target: PlanTargetRange {
+                    duration_min: vec![22.0, 28.0],
+                    distance_km: vec![2.8, 3.8],
+                },
+                hr_cap_bpm: 133,
+                shoe_constraints: vec!["Superblast 3".to_string()],
+                alternatives: vec!["Core 15 min".to_string()],
+            },
+        ],
+    };
+
+    // 1. Not expired when today <= covers.to
+    assert!(rollover_plan_if_expired(&base_plan, "2026-11-22", "2026-11-22T08:00:00Z").is_none());
+
+    // 2. Single-week rollover (+7 days when 4 days expired)
+    let single = rollover_plan_if_expired(&base_plan, "2026-11-26", "2026-11-26T08:00:00Z")
+        .expect("expired plan should roll over");
+    assert_eq!(single.covers.from, "2026-11-16");
+    assert_eq!(single.covers.to, "2026-11-29");
+    assert_eq!(single.sessions[0].date, "2026-11-20");
+    assert_eq!(single.sessions[0].id, "2026-11-20-rw-1");
+    assert_eq!(single.sessions[1].date, "2026-11-28");
+    assert_eq!(single.sessions[1].id, "2026-11-28-rw-4");
+    assert_eq!(single.status, PlanStatus::Provisional);
+    assert_eq!(single.updated_by, "auto-rollover");
+    assert_eq!(single.updated_at, "2026-11-26T08:00:00Z");
+    assert_eq!(single.revision, 4);
+    assert_eq!(single.envelope, base_envelope);
+    assert_eq!(single.sessions[0].session_type, RunTypology::RunWalkReentry);
+    assert_eq!(single.sessions[0].target, base_plan.sessions[0].target);
+    assert_eq!(single.sessions[0].hr_cap_bpm, 133);
+    assert_eq!(single.sessions[0].shoe_constraints, base_plan.sessions[0].shoe_constraints);
+    assert_eq!(single.sessions[0].alternatives, base_plan.sessions[0].alternatives);
+
+    // Exact 7-day boundary -> +7 days
+    let boundary = rollover_plan_if_expired(&base_plan, "2026-11-29", "2026-11-29T08:00:00Z")
+        .expect("7-day expired plan should shift +7");
+    assert_eq!(boundary.covers.from, "2026-11-16");
+    assert_eq!(boundary.covers.to, "2026-11-29");
+
+    // 3. Multi-week gap: 16 days expired -> ceil(16/7) = 3 weeks (+21 days)
+    let multi = rollover_plan_if_expired(&base_plan, "2026-12-08", "2026-12-08T08:00:00Z")
+        .expect("multi-week gap should shift +21 days");
+    assert_eq!(multi.covers.from, "2026-11-30");
+    assert_eq!(multi.covers.to, "2026-12-13");
+    assert_eq!(multi.sessions[0].date, "2026-12-04");
+    assert_eq!(multi.sessions[0].id, "2026-12-04-rw-1");
+    assert_eq!(multi.sessions[1].date, "2026-12-12");
+    assert_eq!(multi.sessions[1].id, "2026-12-12-rw-4");
+    assert_eq!(multi.revision, 4);
+
+    // 4. SharedStore::load_plan_with_auto_rollover creates .backups/ & history/, persists atomically, is idempotent
+    let dir = make_temp_dir("rollover-parity");
+    let store = SharedStore::new(Some(dir.clone())).unwrap();
+    let raw = serde_json::to_vec_pretty(&base_plan).unwrap();
+    SharedStore::atomic_write_bytes(&dir.join("plan.json"), &raw).unwrap();
+
+    let eval_now = Utc.with_ymd_and_hms(2026, 11, 26, 10, 0, 0).unwrap();
+    let loaded1 = store
+        .load_plan_with_auto_rollover("2026-11-26", &eval_now.to_rfc3339())
+        .unwrap()
+        .unwrap();
+    assert_eq!(loaded1.revision, 4);
+    assert_eq!(loaded1.covers.to, "2026-11-29");
+    assert_eq!(loaded1.updated_by, "auto-rollover");
+    assert!(std::fs::read_dir(dir.join(".backups")).unwrap().next().is_some());
+    assert!(std::fs::read_dir(dir.join("history")).unwrap().next().is_some());
+
+    // Idempotent reload on same day
+    let loaded2 = store
+        .load_plan_with_auto_rollover("2026-11-26", &eval_now.to_rfc3339())
+        .unwrap()
+        .unwrap();
+    assert_eq!(loaded2.revision, 4);
+
+    // 5. Strict deterministic session-to-shoe parity (GREEN, AMBER, fallback, RED)
+    let mut cfg = AthleteConfig::default();
+    cfg.specs.resting_hr_baseline = Some(52);
+    cfg.specs.vt1_ceiling_bpm = Some(138);
+
+    let healthy_day = DayRecord {
+        date: "2026-11-26".to_string(),
+        resting_hr: Some(52),
+        sleep_seconds: Some(27_000),
+        sleep_score: Some(84),
+        hrv_last_night: Some(62),
+        hrv_status: Some("BALANCED".to_string()),
+        ..Default::default()
+    };
+
+    let mut items = std::collections::HashMap::new();
+    items.insert(
+        "shoe-a".to_string(),
+        GearItem {
+            garmin: None,
+            alias: Some("Adios Pro 4".to_string()),
+            eligibility: Some(GearEligibility::Simple("eligible".to_string())),
+            pending_naming: None,
+        },
+    );
+    items.insert(
+        "shoe-s".to_string(),
+        GearItem {
+            garmin: None,
+            alias: Some("Superblast 3".to_string()),
+            eligibility: Some(GearEligibility::Simple("eligible".to_string())),
+            pending_naming: None,
+        },
+    );
+    items.insert(
+        "shoe-v".to_string(),
+        GearItem {
+            garmin: None,
+            alias: Some("Vomero 18".to_string()),
+            eligibility: Some(GearEligibility::Simple("blocked".to_string())),
+            pending_naming: None,
+        },
+    );
+    let gear = GearInventoryFile {
+        version: 1,
+        revision: 1,
+        updated_at: "2026-11-26T09:00:00Z".to_string(),
+        updated_by: "test".to_string(),
+        items,
+        pending: Vec::new(),
+    };
+
+    let make_today_plan = |constraints: Vec<&str>| PlanFile {
+        version: 1,
+        revision: 2,
+        updated_at: "2026-11-26T08:00:00Z".to_string(),
+        updated_by: "splits-coach".to_string(),
+        covers: PlanDateRange {
+            from: "2026-11-23".to_string(),
+            to: "2026-11-29".to_string(),
+        },
+        status: PlanStatus::Valid,
+        envelope: PlanEnvelope {
+            max_weekly_km: 15.0,
+            max_single_run_km: 5.0,
+            mesocycle_phase: "base".to_string(),
+            min_hours_between_runs: 36.0,
+            walk_hr_cap_bpm: None,
+        },
+        sessions: vec![PlanSession {
+            id: "2026-11-26-rw-1".to_string(),
+            date: "2026-11-26".to_string(),
+            session_type: RunTypology::EasyAerobic,
+            target: PlanTargetRange {
+                duration_min: vec![25.0],
+                distance_km: vec![4.0],
+            },
+            hr_cap_bpm: 135,
+            shoe_constraints: constraints.into_iter().map(String::from).collect(),
+            alternatives: Vec::new(),
+        }],
+    };
+
+    // GREEN: skips blocked Vomero 18, case-insensitive match picks Superblast 3 before alphabetical Adios Pro 4
+    let p_green = make_today_plan(vec!["Vomero 18", "superblast 3", "Adios Pro 4"]);
+    let out_green = ReadinessEngine::evaluate(ReadinessInput {
+        now: eval_now,
+        athlete_config: &cfg,
+        activities: &[],
+        days: &[healthy_day.clone()],
+        plan: Some(&p_green),
+        gear_inventory: Some(&gear),
+    });
+    assert_eq!(out_green.readiness_state.prescription_summary.decision, "RUN");
+    assert_eq!(out_green.readiness_state.prescription_summary.shoe_platform, "Superblast 3");
+    assert_eq!(
+        out_green.authoritative_target.prescription.as_ref().and_then(|p| p.shoe_platform.as_deref()),
+        Some("Superblast 3")
+    );
+
+    // AMBER: preserves same deterministic shoe intersection
+    let mut caution_day = healthy_day.clone();
+    caution_day.hrv_status = Some("LOW".to_string());
+    let p_amber = make_today_plan(vec!["superblast 3", "Adios Pro 4"]);
+    let out_amber = ReadinessEngine::evaluate(ReadinessInput {
+        now: eval_now,
+        athlete_config: &cfg,
+        activities: &[],
+        days: &[caution_day],
+        plan: Some(&p_amber),
+        gear_inventory: Some(&gear),
+    });
+    assert_eq!(out_amber.readiness_state.prescription_summary.decision, "ADAPTED_RUN");
+    assert_eq!(out_amber.readiness_state.prescription_summary.shoe_platform, "Superblast 3");
+    assert_eq!(
+        out_amber.authoritative_target.prescription.as_ref().and_then(|p| p.shoe_platform.as_deref()),
+        Some("Superblast 3")
+    );
+
+    // Empty intersection falls back to first eligible shoe ("Adios Pro 4")
+    let p_fallback = make_today_plan(vec!["Vomero 18", "Unknown Shoe"]);
+    let out_fallback = ReadinessEngine::evaluate(ReadinessInput {
+        now: eval_now,
+        athlete_config: &cfg,
+        activities: &[],
+        days: &[healthy_day.clone()],
+        plan: Some(&p_fallback),
+        gear_inventory: Some(&gear),
+    });
+    assert_eq!(out_fallback.readiness_state.prescription_summary.shoe_platform, "Adios Pro 4");
+
+    // RED stays "N/A - Rest"
+    let mut blocked_day = healthy_day;
+    blocked_day.sleep_score = Some(40);
+    let out_red = ReadinessEngine::evaluate(ReadinessInput {
+        now: eval_now,
+        athlete_config: &cfg,
+        activities: &[],
+        days: &[blocked_day],
+        plan: Some(&p_amber),
+        gear_inventory: Some(&gear),
+    });
+    assert_eq!(out_red.readiness_state.prescription_summary.decision, "REST_DECOMPRESSION");
+    assert_eq!(out_red.readiness_state.prescription_summary.shoe_platform, "N/A - Rest");
 
     let _ = std::fs::remove_dir_all(&dir);
 }

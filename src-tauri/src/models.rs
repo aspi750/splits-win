@@ -1,4 +1,4 @@
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Duration, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -785,6 +785,62 @@ pub struct PlanFile {
     pub status: PlanStatus,
     pub envelope: PlanEnvelope,
     pub sessions: Vec<PlanSession>,
+}
+
+impl PlanFile {
+    /// Deterministic auto-rollover (`CONTRACT.md §2.4`): when `covers.to < today` (`YYYY-MM-DD`),
+    /// shifts `covers.from`, `covers.to`, `session.date`, and date-prefixed `session.id` forward
+    /// by `+7 * ceil((today - covers.to).days / 7)` days (minimum 1 week), preserves `envelope`
+    /// and all session parameters, marks `status = PlanStatus::Provisional`, `updated_by = "auto-rollover"`,
+    /// sets `updated_at = now_iso`, and increments `revision += 1`. Returns `None` if not expired.
+    pub fn rollover_if_expired(&self, today: &str, now_iso: &str) -> Option<PlanFile> {
+        let today_date = NaiveDate::parse_from_str(today, "%Y-%m-%d").ok()?;
+        let from_date = NaiveDate::parse_from_str(&self.covers.from, "%Y-%m-%d").ok()?;
+        let to_date = NaiveDate::parse_from_str(&self.covers.to, "%Y-%m-%d").ok()?;
+
+        let days_expired = (today_date - to_date).num_days();
+        if days_expired <= 0 {
+            return None;
+        }
+
+        let weeks_to_shift = ((days_expired + 6) / 7).max(1);
+        let shift = Duration::days(7 * weeks_to_shift);
+
+        let mut rolled = self.clone();
+        rolled.covers = PlanDateRange {
+            from: (from_date + shift).format("%Y-%m-%d").to_string(),
+            to: (to_date + shift).format("%Y-%m-%d").to_string(),
+        };
+        rolled.sessions = self
+            .sessions
+            .iter()
+            .map(|session| {
+                let mut updated = session.clone();
+                if let Ok(old_session_date) = NaiveDate::parse_from_str(&session.date, "%Y-%m-%d") {
+                    let new_date = (old_session_date + shift).format("%Y-%m-%d").to_string();
+                    if let Some(suffix) = session.id.strip_prefix(&session.date) {
+                        updated.id = format!("{new_date}{suffix}");
+                    } else if session.id.len() >= 10
+                        && session.id.is_char_boundary(10)
+                        && NaiveDate::parse_from_str(&session.id[..10], "%Y-%m-%d").is_ok()
+                    {
+                        updated.id = format!("{new_date}{}", &session.id[10..]);
+                    }
+                    updated.date = new_date;
+                }
+                updated
+            })
+            .collect();
+        rolled.status = PlanStatus::Provisional;
+        rolled.updated_by = "auto-rollover".to_string();
+        rolled.updated_at = now_iso.to_string();
+        rolled.revision += 1;
+        Some(rolled)
+    }
+}
+
+pub fn rollover_plan_if_expired(plan: &PlanFile, today: &str, now_iso: &str) -> Option<PlanFile> {
+    plan.rollover_if_expired(today, now_iso)
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
