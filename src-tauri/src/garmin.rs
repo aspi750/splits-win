@@ -5,7 +5,7 @@ use crate::models::{
     WeightEntry, APP_SERVICE, GARMIN_ACCOUNT, GARMIN_KEYRING_SERVICE,
 };
 use crate::storage::CredentialStore;
-use chrono::{DateTime, Duration, Local, NaiveDate, NaiveDateTime, TimeZone, Utc};
+use chrono::{DateTime, Duration, Local, NaiveDate, NaiveDateTime, Utc};
 use reqwest::Client;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -663,10 +663,7 @@ fn parse_weight_timestamp_epoch(metric: &serde_json::Value) -> Option<i64> {
     }
     if let Some(cal) = metric.get("calendarDate").and_then(|v| v.as_str()) {
         if let Ok(nd) = NaiveDate::parse_from_str(cal.trim(), "%Y-%m-%d") {
-            if let Some(ndt) = nd.and_hms_opt(7, 0, 0) {
-                if let Some(local_dt) = Local.from_local_datetime(&ndt).single() {
-                    return Some(local_dt.with_timezone(&Utc).timestamp());
-                }
+            if let Some(ndt) = nd.and_hms_opt(0, 0, 0) {
                 return Some(DateTime::<Utc>::from_naive_utc_and_offset(ndt, Utc).timestamp());
             }
         }

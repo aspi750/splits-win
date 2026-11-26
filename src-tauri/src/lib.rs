@@ -65,6 +65,10 @@ pub fn build_bootstrap_state(
     let theme_mode = db.get_theme_mode().unwrap_or_else(|_| "system".to_string());
     let lifetime_backfill_completed = db.is_lifetime_backfill_completed().unwrap_or(false);
     let total_activities_count = db.count_activities().unwrap_or(activities.len());
+    let weights = db.list_weight_entries(60).unwrap_or_default();
+    let windows = scale_matcher::activity_windows(&activities);
+    let latest_garmin_weight = scale_matcher::latest_baseline_weigh_in(&weights, &windows)
+        .map(|w| coach::build_garmin_weight_json(w, Utc::now().timestamp()));
 
     let mut effective_settings = settings.clone();
     effective_settings.profile_onboarded = settings.profile_onboarded
@@ -83,6 +87,7 @@ pub fn build_bootstrap_state(
         "readiness_state": readiness,
         "activities": activities,
         "days": days,
+        "latest_garmin_weight": latest_garmin_weight,
         "needs_initial_coach_setup": needs_initial_coach_setup,
         "model_settings": model_settings,
         "first_use_state": first_use_state,
@@ -395,38 +400,8 @@ async fn perform_full_garmin_sync(
         }
     }
 
-    let mut config = store.load_athlete_config().map_err(|e| e.to_string())?.unwrap_or_default();
-    let all_weights = db.list_weight_entries(400).unwrap_or_default();
-    let mut activities = db.list_activities(200).map_err(|e| e.to_string())?;
-    for a in &mut activities {
-        if let Some(start_ep) = scale_matcher::parse_activity_epoch_sec(&a.start_iso) {
-            let dur = a.moving_duration_sec.max(a.duration_sec).max(0.0);
-            let end_ep = start_ep + a.duration_sec.max(a.moving_duration_sec).max(0.0).round() as i64;
-            let current = a.post_run_context.clone().unwrap_or_default();
-            let paired = scale_matcher::pair_scale_weigh_ins(
-                start_ep,
-                end_ep,
-                dur,
-                &all_weights,
-                current.clone(),
-            );
-            if paired != current {
-                let _ = db.save_post_run_context(a.garmin_id, &paired);
-                a.post_run_context = Some(paired);
-            }
-        }
-    }
-
-    let windows = scale_matcher::activity_windows(&activities);
-    if let Some(baseline_kg) = scale_matcher::latest_baseline_weight_kg(&all_weights, &windows) {
-        if (!config.specs.weight_baseline_confirmed || config.specs.weight_kg.unwrap_or(0.0) <= 0.0)
-            && (config.specs.weight_kg.unwrap_or(0.0) - baseline_kg).abs() >= 0.05
-        {
-            config.specs.weight_kg = Some(baseline_kg);
-            let _ = store.save_athlete_config(&config);
-        }
-    }
-
+    let config = reconcile_scale_weights_and_config(&db, store, Utc::now().timestamp())?;
+    let activities = db.list_activities(200).map_err(|e| e.to_string())?;
     let days = db.list_days(60).map_err(|e| e.to_string())?;
     let plan: Option<PlanFile> = store.read_json("plan.json").ok().flatten();
     let gear: Option<GearInventoryFile> = store.read_json("gear_inventory.json").ok().flatten();
@@ -527,6 +502,54 @@ fn attach_latest_forensic(
     }
 }
 
+pub fn reconcile_scale_weights_and_config(
+    db: &Database,
+    store: &SharedStore,
+    now_epoch: i64,
+) -> Result<AthleteConfig, String> {
+    let mut config = store.load_athlete_config().map_err(|e| e.to_string())?.unwrap_or_default();
+    let all_weights = db.list_weight_entries(400).unwrap_or_default();
+    let mut activities = db.list_activities(200).map_err(|e| e.to_string())?;
+    for a in &mut activities {
+        if let Some(start_ep) = scale_matcher::parse_activity_epoch_sec(&a.start_iso) {
+            let dur = a.moving_duration_sec.max(a.duration_sec).max(0.0);
+            let end_ep = start_ep + a.duration_sec.max(a.moving_duration_sec).max(0.0).round() as i64;
+            let current = a.post_run_context.clone().unwrap_or_default();
+            let paired = scale_matcher::pair_scale_weigh_ins(
+                start_ep,
+                end_ep,
+                dur,
+                &all_weights,
+                current.clone(),
+            );
+            if paired != current {
+                let _ = db.save_post_run_context(a.garmin_id, &paired);
+                a.post_run_context = Some(paired);
+            }
+        }
+    }
+
+    let windows = scale_matcher::activity_windows(&activities);
+    if let Some(baseline) = scale_matcher::latest_baseline_weigh_in(&all_weights, &windows) {
+        let is_fresh = scale_matcher::is_fresh_baseline(baseline, now_epoch);
+        let weight_diff = (config.specs.weight_kg.unwrap_or(0.0) - baseline.weight_kg).abs();
+        if is_fresh {
+            if weight_diff >= 0.05 || !config.specs.weight_baseline_confirmed {
+                config.specs.weight_kg = Some(baseline.weight_kg);
+                config.specs.weight_baseline_confirmed = true;
+                let _ = store.save_athlete_config(&config);
+            }
+        } else if (!config.specs.weight_baseline_confirmed
+            || config.specs.weight_kg.unwrap_or(0.0) <= 0.0)
+            && weight_diff >= 0.05
+        {
+            config.specs.weight_kg = Some(baseline.weight_kg);
+            let _ = store.save_athlete_config(&config);
+        }
+    }
+    Ok(config)
+}
+
 #[tauri::command]
 fn build_coach_packet(state: State<'_, AppState>, draft_prompt: String) -> Result<String, String> {
     let store = state.load_store()?;
@@ -534,13 +557,15 @@ fn build_coach_packet(state: State<'_, AppState>, draft_prompt: String) -> Resul
     let config = store.load_athlete_config().map_err(|e| e.to_string())?.unwrap_or_default();
     let activities = db.list_activities(50).map_err(|e| e.to_string())?;
     let days = db.list_days(60).map_err(|e| e.to_string())?;
+    let weights = db.list_weight_entries(200).unwrap_or_default();
     let gear: Option<GearInventoryFile> = store.read_json("gear_inventory.json").map_err(|e| e.to_string())?;
     let readiness: Option<ReadinessState> = store.read_json("readiness_state.json").map_err(|e| e.to_string())?;
 
-    let packet = coach::CoachPacketBuilder::build_markdown(
+    let packet = coach::CoachPacketBuilder::build_markdown_with_weights(
         &config,
         &activities,
         &days,
+        &weights,
         gear.as_ref(),
         readiness.as_ref(),
         &draft_prompt,
@@ -559,7 +584,17 @@ fn apply_coach_proposal(state: State<'_, AppState>, proposal: CoachUpdateProposa
     if proposal.target_file == "COACH_PROFILE.md" {
         let mut user_profile = db.get_user_profile().unwrap_or_default();
         let mut config = store.load_athlete_config().map_err(|e| e.to_string())?.unwrap_or_default();
-        if coach::hydrate_profile_from_proposal(&proposal, &mut user_profile, &mut config) {
+        let activities = db.list_activities(200).unwrap_or_default();
+        let weights = db.list_weight_entries(200).unwrap_or_default();
+        let windows = scale_matcher::activity_windows(&activities);
+        let has_authoritative_garmin_weight = scale_matcher::latest_baseline_weigh_in(&weights, &windows)
+            .map_or(false, |w| scale_matcher::is_fresh_baseline(w, Utc::now().timestamp()));
+        if coach::hydrate_profile_from_proposal_with_weight_guard(
+            &proposal,
+            &mut user_profile,
+            &mut config,
+            has_authoritative_garmin_weight,
+        ) {
             db.save_user_profile(&user_profile).map_err(|e| e.to_string())?;
             store.save_athlete_config(&config).map_err(|e| e.to_string())?;
         }
@@ -944,17 +979,20 @@ async fn send_coach_message(
     let config = store.load_athlete_config().map_err(|e| e.to_string())?.unwrap_or_default();
     let activities = db.list_activities(5000).map_err(|e| e.to_string())?;
     let days = db.list_days(365).map_err(|e| e.to_string())?;
+    let weights = db.list_weight_entries(200).unwrap_or_default();
     let model_settings = db.load_model_settings().unwrap_or_default();
     let first_use_state = store.load_first_use_state().unwrap_or_default();
 
     if let Some(api_key) = CredentialStore::read_gemini_key() {
         let user_profile = db.get_user_profile().ok();
-        let sys = coach::build_static_system_instruction(
+        let sys = coach::build_static_system_instruction_with_weights(
             &store,
             &config,
             &activities,
+            &weights,
             user_profile.as_ref(),
             Some(&first_use_state),
+            Utc::now().timestamp(),
         );
         let intake_slice = if matches!(
             first_use_state.stage,
@@ -985,10 +1023,11 @@ async fn send_coach_message(
     } else {
         let gear: Option<GearInventoryFile> = store.read_json("gear_inventory.json").map_err(|e| e.to_string())?;
         let readiness: Option<ReadinessState> = store.read_json("readiness_state.json").map_err(|e| e.to_string())?;
-        let packet = coach::CoachPacketBuilder::build_markdown(
+        let packet = coach::CoachPacketBuilder::build_markdown_with_weights(
             &config,
             &activities,
             &days,
+            &weights,
             gear.as_ref(),
             readiness.as_ref(),
             &prompt,
@@ -1236,18 +1275,21 @@ async fn get_or_generate_daily_briefing(
         .ok_or_else(|| "Gemini API key required to generate morning briefing.".to_string())?;
     let config = store.load_athlete_config().map_err(|e| e.to_string())?.unwrap_or_default();
     let activities = db.list_activities(100).map_err(|e| e.to_string())?;
+    let weights = db.list_weight_entries(200).unwrap_or_default();
     let readiness: Option<ReadinessState> = store.read_json("readiness_state.json").ok().flatten();
     let model_settings = db.load_model_settings().unwrap_or_default();
 
-    let briefing = coach::generate_daily_briefing(
+    let briefing = coach::generate_daily_briefing_with_weights(
         &api_key,
         &store,
         &config,
         &activities,
         &days,
+        &weights,
         readiness.as_ref(),
         &model_settings,
         today,
+        Utc::now().timestamp(),
     )
     .await?;
     db.upsert_daily_briefing(&briefing).map_err(|e| e.to_string())?;

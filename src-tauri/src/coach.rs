@@ -23,6 +23,28 @@ impl CoachPacketBuilder {
         draft_prompt: &str,
         now: DateTime<Utc>,
     ) -> String {
+        Self::build_markdown_with_weights(
+            config,
+            activities,
+            days,
+            &[],
+            gear_inventory,
+            readiness_state,
+            draft_prompt,
+            now,
+        )
+    }
+
+    pub fn build_markdown_with_weights(
+        config: &AthleteConfig,
+        activities: &[ActivityRecord],
+        days: &[DayRecord],
+        weights: &[WeightEntry],
+        gear_inventory: Option<&GearInventoryFile>,
+        readiness_state: Option<&ReadinessState>,
+        draft_prompt: &str,
+        now: DateTime<Utc>,
+    ) -> String {
         let mut sections = Vec::new();
 
         let rhr_samples: Vec<(DateTime<Utc>, Option<i32>)> = days
@@ -41,6 +63,19 @@ impl CoachPacketBuilder {
             "## Athlete Profile & Active Guardrails\n{}",
             config.prompt_summary(effective_rhr)
         );
+        let windows = scale_matcher::activity_windows(activities);
+        if let Some(latest_weight) = scale_matcher::latest_baseline_weigh_in(weights, &windows) {
+            let date_str = latest_weight.timestamp_iso.get(..10).unwrap_or("");
+            let stale_tag = if scale_matcher::is_fresh_baseline(latest_weight, now.timestamp()) {
+                ""
+            } else {
+                " (stale: >14d)"
+            };
+            profile_sec.push_str(&format!(
+                "\n- Garmin Connect Weight (Authoritative): {:.1} kg ({date_str}, {}{stale_tag})",
+                latest_weight.weight_kg, latest_weight.source
+            ));
+        }
         if let Some(r) = readiness_state {
             let status_label = if r.gatekeeper.run_permitted { "Run Permitted" } else { "Rest / Restricted" };
             profile_sec.push_str(&format!(
@@ -924,8 +959,11 @@ pub fn build_activity_detail_tool_payload(
         "is_hyrox": act.is_hyrox,
         "post_run_context": ctx_owned,
         "sweat_status": ctx.and_then(|c| c.sweat_status.as_deref()),
+        "net_fluid_deficit_kg": ctx.and_then(|c| c.net_fluid_deficit_kg),
         "provisional_sweat_rate_l_hr": ctx.and_then(|c| c.provisional_sweat_rate_l_hr),
         "final_sweat_rate_l_hr": ctx.and_then(|c| c.final_sweat_rate_l_hr),
+        "pre_weigh_in_offset_min": ctx.and_then(|c| c.pre_weigh_in_offset_min),
+        "post_weigh_in_offset_min": ctx.and_then(|c| c.post_weigh_in_offset_min),
         "effective_weight_kg": resolved_weight.as_ref().map(|w| w.weight_kg),
         "weight_source": resolved_weight.as_ref().map(|w| w.source.as_str()),
         "is_weight_provisional": resolved_weight.as_ref().map(|w| w.is_provisional),
@@ -939,6 +977,132 @@ pub fn build_activity_detail_tool_payload(
         "decoupling_pct": track.as_ref().and_then(|t| t.decoupling_pct),
         "guardrail_audit": track.as_ref().map(|t| &t.audit),
     })
+}
+
+pub fn build_garmin_weight_json(entry: &WeightEntry, now_epoch: i64) -> Value {
+    let date_str = entry
+        .timestamp_iso
+        .get(..10)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            chrono::DateTime::<Utc>::from_timestamp(entry.timestamp_epoch_sec, 0)
+                .map(|dt| dt.format("%Y-%m-%d").to_string())
+                .unwrap_or_default()
+        });
+    let mut obj = json!({
+        "weight_kg": entry.weight_kg,
+        "date": date_str,
+        "timestamp_iso": entry.timestamp_iso,
+        "source": entry.source,
+        "is_fresh": scale_matcher::is_fresh_baseline(entry, now_epoch),
+        "authoritative": true,
+    });
+    if let Some(bf) = entry.body_fat_pct {
+        obj["body_fat_pct"] = json!(bf);
+    }
+    if let Some(mm) = entry.muscle_mass_kg {
+        obj["muscle_mass_kg"] = json!(mm);
+    }
+    obj
+}
+
+pub fn build_wellness_history_tool_payload(
+    days: &[DayRecord],
+    weights: &[WeightEntry],
+    activities: &[ActivityRecord],
+    requested_days: usize,
+    now_epoch: i64,
+) -> Value {
+    let count = requested_days.clamp(1, 60);
+    let slice: Vec<DayRecord> = days
+        .iter()
+        .take(count)
+        .map(|d| {
+            let mut slim = d.clone();
+            slim.body_battery_series = None;
+            slim
+        })
+        .collect();
+    let windows = scale_matcher::activity_windows(activities);
+    let latest_garmin_weight = scale_matcher::latest_baseline_weigh_in(weights, &windows)
+        .map(|w| build_garmin_weight_json(w, now_epoch));
+    let recent_weight_entries: Vec<Value> = weights
+        .iter()
+        .take(14)
+        .map(|entry| {
+            let date_str = entry
+                .timestamp_iso
+                .get(..10)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| {
+                    chrono::DateTime::<Utc>::from_timestamp(entry.timestamp_epoch_sec, 0)
+                        .map(|dt| dt.format("%Y-%m-%d").to_string())
+                        .unwrap_or_default()
+                });
+            let mut row = json!({
+                "date": date_str,
+                "timestamp_iso": entry.timestamp_iso,
+                "weight_kg": entry.weight_kg,
+                "source": entry.source,
+                "is_post_run_dehydrated": scale_matcher::is_post_run_dehydrated(entry.timestamp_epoch_sec, &windows),
+            });
+            if let Some(bf) = entry.body_fat_pct {
+                row["body_fat_pct"] = json!(bf);
+            }
+            if let Some(mm) = entry.muscle_mass_kg {
+                row["muscle_mass_kg"] = json!(mm);
+            }
+            row
+        })
+        .collect();
+
+    let mut payload = json!({
+        "count": slice.len(),
+        "days": slice,
+    });
+    if let Some(latest) = latest_garmin_weight {
+        payload["latest_garmin_weight"] = latest;
+    }
+    if !recent_weight_entries.is_empty() {
+        payload["recent_weight_entries"] = json!(recent_weight_entries);
+    }
+    payload
+}
+
+pub fn build_readiness_and_plan_tool_payload(
+    store: &SharedStore,
+    activities: &[ActivityRecord],
+    days: &[DayRecord],
+    weights: &[WeightEntry],
+    now: DateTime<Utc>,
+) -> Value {
+    let config = store.load_athlete_config().ok().flatten().unwrap_or_default();
+    let plan = store.read_json::<PlanFile>("plan.json").ok().flatten();
+    let gear = store.read_json::<GearInventoryFile>("gear_inventory.json").ok().flatten();
+    let output = ReadinessEngine::evaluate(ReadinessInput {
+        now,
+        athlete_config: &config,
+        activities,
+        days,
+        plan: plan.as_ref(),
+        gear_inventory: gear.as_ref(),
+    });
+    let _ = output.persist(store.root());
+    let windows = scale_matcher::activity_windows(activities);
+    let latest_garmin_weight = scale_matcher::latest_baseline_weigh_in(weights, &windows)
+        .map(|w| build_garmin_weight_json(w, now.timestamp()));
+    let mut payload = json!({
+        "execution_mode": "self_contained",
+        "readiness_state": output.readiness_state,
+        "today_adapted_target": output.authoritative_target,
+        "plan": plan
+    });
+    if let Some(latest) = latest_garmin_weight {
+        payload["latest_garmin_weight"] = latest;
+    }
+    payload
 }
 
 fn execute_tool(
@@ -1019,36 +1183,12 @@ fn execute_tool(
         }
         "get_wellness_history" => {
             let count = args["days"].as_u64().unwrap_or(14).min(60) as usize;
-            let slice: Vec<DayRecord> = days
-                .iter()
-                .take(count)
-                .map(|d| {
-                    let mut slim = d.clone();
-                    slim.body_battery_series = None;
-                    slim
-                })
-                .collect();
-            json!({ "count": slice.len(), "days": slice })
+            let weights = db.and_then(|d| d.list_weight_entries(60).ok()).unwrap_or_default();
+            build_wellness_history_tool_payload(days, &weights, activities, count, Utc::now().timestamp())
         }
         "get_readiness_and_plan" => {
-            let config = store.load_athlete_config().ok().flatten().unwrap_or_default();
-            let plan = store.read_json::<PlanFile>("plan.json").ok().flatten();
-            let gear = store.read_json::<GearInventoryFile>("gear_inventory.json").ok().flatten();
-            let output = ReadinessEngine::evaluate(ReadinessInput {
-                now: Utc::now(),
-                athlete_config: &config,
-                activities,
-                days,
-                plan: plan.as_ref(),
-                gear_inventory: gear.as_ref(),
-            });
-            let _ = output.persist(store.root());
-            json!({
-                "execution_mode": "self_contained",
-                "readiness_state": output.readiness_state,
-                "today_adapted_target": output.authoritative_target,
-                "plan": plan
-            })
+            let weights = db.and_then(|d| d.list_weight_entries(60).ok()).unwrap_or_default();
+            build_readiness_and_plan_tool_payload(store, activities, days, &weights, Utc::now())
         }
         "get_lifetime_and_yearly_history" => {
             let config = store.load_athlete_config().ok().flatten().unwrap_or_default();
@@ -1951,6 +2091,15 @@ pub fn hydrate_profile_from_proposal(
     profile: &mut UserProfile,
     config: &mut AthleteConfig,
 ) -> bool {
+    hydrate_profile_from_proposal_with_weight_guard(proposal, profile, config, false)
+}
+
+pub fn hydrate_profile_from_proposal_with_weight_guard(
+    proposal: &CoachUpdateProposal,
+    profile: &mut UserProfile,
+    config: &mut AthleteConfig,
+    has_authoritative_garmin_weight: bool,
+) -> bool {
     let md_fallback = parse_profile_thresholds_from_markdown(&proposal.updated_section_markdown);
     let merged = match proposal.profile_thresholds.as_ref() {
         Some(t) => t.merged(&md_fallback),
@@ -2007,9 +2156,11 @@ pub fn hydrate_profile_from_proposal(
         config.medical.enforce_pace_floor = true;
         config.medical.min_pace_sec_per_km = Some(pf);
     }
-    if let Some(w) = merged.weight_kg.filter(|&w| w > 0.0) {
-        config.specs.weight_kg = Some(w);
-        config.specs.weight_baseline_confirmed = true;
+    if !has_authoritative_garmin_weight {
+        if let Some(w) = merged.weight_kg.filter(|&w| w > 0.0) {
+            config.specs.weight_kg = Some(w);
+            config.specs.weight_baseline_confirmed = true;
+        }
     }
 
     if let Some(ref div) = merged.hyrox_division {
@@ -2042,12 +2193,32 @@ pub fn build_static_system_instruction(
     user_profile: Option<&UserProfile>,
     first_use_state: Option<&FirstUseFlowState>,
 ) -> String {
+    build_static_system_instruction_with_weights(
+        store,
+        config,
+        activities,
+        &[],
+        user_profile,
+        first_use_state,
+        Utc::now().timestamp(),
+    )
+}
+
+pub fn build_static_system_instruction_with_weights(
+    store: &SharedStore,
+    config: &AthleteConfig,
+    activities: &[ActivityRecord],
+    weights: &[WeightEntry],
+    user_profile: Option<&UserProfile>,
+    first_use_state: Option<&FirstUseFlowState>,
+    now_epoch: i64,
+) -> String {
     let profile_md = store.read_text("COACH_PROFILE.md").ok().flatten().unwrap_or_default();
     let plan_md = store.read_text("TRAINING_PLAN.md").ok().flatten().unwrap_or_default();
     let needs_setup = profile_md.trim().is_empty() || plan_md.trim().is_empty();
 
     let mut sections = vec![
-        "You are a Living Markdown training-planning coach inside Splits Coach. Use metric units (km, min/km, bpm, kg). Always use `propose_coach_update` for Markdown changes, and CONSOLIDATE all sections for a given target file (`COACH_PROFILE.md` or `TRAINING_PLAN.md`) into ONE single `propose_coach_update` call per file rather than emitting separate proposals for individual sections. Use `get_recent_activities`, `get_activity_detail`, `get_wellness_history`, `get_training_load_and_records`, `get_readiness_and_plan`, `get_lifetime_and_yearly_history`, `fetch_1hz_window`, `append_training_ledger`, `update_post_run_context`, and `query_run_slice` for drill-downs. Inspect `garmin_notes` on activities when present. Sweat Matrix Rule: when analyzing a run with `sweat_status == \"provisional_no_intake\"`, report the provisional sweat rate and ask if the user had any intra-run fluid intake, then call `update_post_run_context` once confirmed (`0` ml if none). Weight Fallback Rule: inspect `weight_source` — when set to `\"profile_baseline\"` or `\"latest_14d_weigh_in\"`, label derived sweat/weight metrics provisional. Hybrid Tempe Rule: when `temp_source == \"watch_internal\"` and temperature data exists, check the user's post-run message for any mention of a Garmin Tempe sensor and call `update_post_run_context(tempe_sensor_used: true)` -> `\"user_confirmed_tempe\"` if mentioned, or ask the user to confirm whether a Tempe sensor was worn before treating temperature spikes as external ambient heat rather than wrist skin warmth.".to_string(),
+        "You are a Living Markdown training-planning coach inside Splits Coach. Use metric units (km, min/km, bpm, kg). Always use `propose_coach_update` for Markdown changes, and CONSOLIDATE all sections for a given target file (`COACH_PROFILE.md` or `TRAINING_PLAN.md`) into ONE single `propose_coach_update` call per file rather than emitting separate proposals for individual sections. Use `get_recent_activities`, `get_activity_detail`, `get_wellness_history`, `get_training_load_and_records`, `get_readiness_and_plan`, `get_lifetime_and_yearly_history`, `fetch_1hz_window`, `append_training_ledger`, `update_post_run_context`, and `query_run_slice` for drill-downs. Inspect `garmin_notes` on activities when present. Weight Authority Rule: Garmin Connect weigh-in data is the authoritative weight source and always supersedes any older or placeholder weight in COACH_PROFILE.md or TRAINING_PLAN.md. Sweat Matrix Rule: when analyzing a run with `sweat_status == \"provisional_no_intake\"`, report the provisional sweat rate and ask if the user had any intra-run fluid intake, then call `update_post_run_context` once confirmed (`0` ml if none). Weight Fallback Rule: inspect `weight_source` — when set to `\"profile_baseline\"` or `\"latest_14d_weigh_in\"`, label derived sweat/weight metrics provisional. Hybrid Tempe Rule: when `temp_source == \"watch_internal\"` and temperature data exists, check the user's post-run message for any mention of a Garmin Tempe sensor and call `update_post_run_context(tempe_sensor_used: true)` -> `\"user_confirmed_tempe\"` if mentioned, or ask the user to confirm whether a Tempe sensor was worn before treating temperature spikes as external ambient heat rather than wrist skin warmth.".to_string(),
         format!("=== ATHLETE CONFIG ===\n{}", config.prompt_summary(None)),
     ];
     if let Some(profile) = user_profile {
@@ -2058,6 +2229,31 @@ pub fn build_static_system_instruction(
     }
     if !plan_md.trim().is_empty() {
         sections.push(format!("=== TRAINING_PLAN.md ===\n{plan_md}"));
+    }
+    let windows = scale_matcher::activity_windows(activities);
+    if let Some(latest_weight) = scale_matcher::latest_baseline_weigh_in(weights, &windows) {
+        let mut extras = Vec::new();
+        if let Some(bf) = latest_weight.body_fat_pct {
+            extras.push(format!("body fat {bf:.1}%"));
+        }
+        if let Some(mm) = latest_weight.muscle_mass_kg {
+            extras.push(format!("muscle mass {mm:.1} kg"));
+        }
+        let extra = if extras.is_empty() {
+            String::new()
+        } else {
+            format!(" · {}", extras.join(" · "))
+        };
+        let date_str = latest_weight.timestamp_iso.get(..10).unwrap_or("");
+        let stale_tag = if scale_matcher::is_fresh_baseline(latest_weight, now_epoch) {
+            ""
+        } else {
+            " (stale: >14d)"
+        };
+        sections.push(format!(
+            "=== GARMIN CONNECT WEIGHT (AUTHORITATIVE) ===\nLatest non-dehydrated weigh-in: {:.1} kg on {date_str}{stale_tag} (source: {}{extra}). Supersedes any older weight in COACH_PROFILE.md or TRAINING_PLAN.md.",
+            latest_weight.weight_kg, latest_weight.source
+        ));
     }
 
     if let Some(fu) = first_use_state.filter(|s| s.stage.is_guided()) {
@@ -2149,6 +2345,11 @@ pub fn append_forensic_section(
                 ctx.fluid_consumed_ml.map(|f| format!("{f:.0}")).unwrap_or_else(|| "0".to_string()),
                 ctx.fluid_intake_confirmed
             ));
+        }
+        if let (Some(pre_off), Some(post_off)) = (ctx.pre_weigh_in_offset_min, ctx.post_weigh_in_offset_min) {
+            let pre_s = if pre_off >= 0 { format!("+{pre_off} min") } else { format!("{pre_off} min") };
+            let post_s = if post_off >= 0 { format!("+{post_off} min") } else { format!("{post_off} min") };
+            lines.push(format!("- **Pairing Offsets**: Pre: {pre_s} · Post: {post_s}"));
         }
         if let Some(ref status) = ctx.sweat_status {
             lines.push(format!("- **Sweat Status**: {status}"));
@@ -2299,6 +2500,26 @@ pub fn build_daily_briefing_facts(
     days: &[DayRecord],
     readiness: Option<&ReadinessState>,
     today_date: NaiveDate,
+) -> String {
+    build_daily_briefing_facts_with_weights(
+        config,
+        activities,
+        days,
+        &[],
+        readiness,
+        today_date,
+        Utc::now().timestamp(),
+    )
+}
+
+pub fn build_daily_briefing_facts_with_weights(
+    config: &AthleteConfig,
+    activities: &[ActivityRecord],
+    days: &[DayRecord],
+    weights: &[WeightEntry],
+    readiness: Option<&ReadinessState>,
+    today_date: NaiveDate,
+    now_epoch: i64,
 ) -> String {
     let today_str = today_date.format("%Y-%m-%d").to_string();
     let yesterday_str = (today_date - Duration::days(1)).format("%Y-%m-%d").to_string();
@@ -2581,6 +2802,20 @@ pub fn build_daily_briefing_facts(
         }
     }
 
+    let windows = scale_matcher::activity_windows(activities);
+    if let Some(latest_weight) = scale_matcher::latest_baseline_weigh_in(weights, &windows) {
+        let date_str = latest_weight.timestamp_iso.get(..10).unwrap_or("");
+        let stale_tag = if scale_matcher::is_fresh_baseline(latest_weight, now_epoch) {
+            ""
+        } else {
+            " (stale: >14d)"
+        };
+        lines.push(format!(
+            "Garmin Connect weight: {:.1} kg on {date_str}{stale_tag} (authoritative; supersedes any older placeholder weight in COACH_PROFILE.md).",
+            latest_weight.weight_kg
+        ));
+    }
+
     lines.join("\n")
 }
 
@@ -2594,6 +2829,34 @@ pub async fn generate_daily_briefing(
     model_settings: &ModelSettings,
     today_date: NaiveDate,
 ) -> Result<DailyBriefingRecord, String> {
+    generate_daily_briefing_with_weights(
+        api_key,
+        store,
+        config,
+        activities,
+        days,
+        &[],
+        readiness,
+        model_settings,
+        today_date,
+        Utc::now().timestamp(),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn generate_daily_briefing_with_weights(
+    api_key: &str,
+    store: &SharedStore,
+    config: &AthleteConfig,
+    activities: &[ActivityRecord],
+    days: &[DayRecord],
+    weights: &[WeightEntry],
+    readiness: Option<&ReadinessState>,
+    model_settings: &ModelSettings,
+    today_date: NaiveDate,
+    now_epoch: i64,
+) -> Result<DailyBriefingRecord, String> {
     let resolved = resolve_model(ModelScope::Background, model_settings);
     let today_str = today_date.format("%Y-%m-%d").to_string();
     let today_day = days.iter().find(|d| d.date == today_str);
@@ -2601,7 +2864,9 @@ pub async fn generate_daily_briefing(
         .and_then(|d| d.sleep_seconds.or(d.sleep_duration_sec))
         .map_or(false, |s| s > 0);
 
-    let facts = build_daily_briefing_facts(config, activities, days, readiness, today_date);
+    let facts = build_daily_briefing_facts_with_weights(
+        config, activities, days, weights, readiness, today_date, now_epoch,
+    );
     let name = config.specs.display_name.trim();
     let greeting = if name.is_empty() {
         "You are a witty, upbeat running buddy and coach writing someone's morning briefing inside Splits Coach.".to_string()
@@ -2615,6 +2880,19 @@ pub async fn generate_daily_briefing(
         ),
         format!("=== ATHLETE CONFIG ===\n{}", config.prompt_summary(None)),
     ];
+    let windows = scale_matcher::activity_windows(activities);
+    if let Some(latest_weight) = scale_matcher::latest_baseline_weigh_in(weights, &windows) {
+        let date_str = latest_weight.timestamp_iso.get(..10).unwrap_or("");
+        let stale_tag = if scale_matcher::is_fresh_baseline(latest_weight, now_epoch) {
+            ""
+        } else {
+            " (stale: >14d)"
+        };
+        sys_parts.push(format!(
+            "=== GARMIN CONNECT WEIGHT (AUTHORITATIVE) ===\nLatest non-dehydrated weigh-in: {:.1} kg on {date_str}{stale_tag} (source: {}). Supersedes any older placeholder weight.",
+            latest_weight.weight_kg, latest_weight.source
+        ));
+    }
     if let Ok(Some(profile_md)) = store.read_text("COACH_PROFILE.md") {
         let trimmed = profile_md.trim();
         if !trimmed.is_empty() {

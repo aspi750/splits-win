@@ -790,17 +790,23 @@ pub struct GearItem {
 }
 
 impl GearItem {
+    pub fn non_blank_display_name(&self) -> Option<String> {
+        [
+            self.alias.as_deref(),
+            self.garmin.as_ref().and_then(|g| g.name.as_deref()),
+            self.garmin.as_ref().and_then(|g| g.model.as_deref()),
+            self.garmin.as_ref().and_then(|g| g.brand.as_deref()),
+        ]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .find(|s| !s.is_empty())
+        .map(str::to_string)
+    }
+
     pub fn display_name(&self) -> String {
-        if let Some(alias) = self.alias.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-            return alias.to_string();
-        }
-        if let Some(name) = self.garmin.as_ref().and_then(|g| g.name.as_deref()).map(str::trim).filter(|s| !s.is_empty()) {
-            return name.to_string();
-        }
-        if let Some(model) = self.garmin.as_ref().and_then(|g| g.model.as_deref()).map(str::trim).filter(|s| !s.is_empty()) {
-            return model.to_string();
-        }
-        "Unnamed Shoe".to_string()
+        self.non_blank_display_name()
+            .unwrap_or_else(|| "Unnamed Shoe".to_string())
     }
 
     pub fn footwear_status(&self) -> &'static str {
@@ -876,6 +882,10 @@ pub struct PostRunContext {
     #[serde(default)]
     pub tempe_sensor_used: Option<bool>,
     #[serde(default)]
+    pub pre_weigh_in_offset_min: Option<i32>,
+    #[serde(default)]
+    pub post_weigh_in_offset_min: Option<i32>,
+    #[serde(default)]
     pub garmin_notes: Option<String>,
 }
 
@@ -893,34 +903,54 @@ impl PostRunContext {
     pub fn with_computed_sweat(mut self, duration_sec: f64) -> Self {
         if let (Some(pre), Some(post)) = (self.pre_run_weight_kg, self.post_run_weight_kg) {
             if pre > 0.0 && post > 0.0 {
-                let prov_deficit = ((pre - post) * 100.0).round() / 100.0;
-                let prov_rate = if duration_sec > 60.0 {
-                    let hrs = duration_sec / 3600.0;
-                    Some(((prov_deficit / hrs) * 100.0).round() / 100.0)
+                let raw_prov_deficit = pre - post;
+                let prov_deficit_opt = if raw_prov_deficit >= 0.0 {
+                    Some((raw_prov_deficit * 100.0).round() / 100.0)
                 } else {
                     None
                 };
+                let prov_rate = prov_deficit_opt.and_then(|prov_deficit| {
+                    if duration_sec > 60.0 {
+                        let hrs = duration_sec / 3600.0;
+                        Some(((prov_deficit / hrs) * 100.0).round() / 100.0)
+                    } else {
+                        None
+                    }
+                });
                 self.provisional_sweat_rate_l_hr = prov_rate;
 
                 if self.fluid_intake_confirmed {
-                    let fluid_l = self.fluid_consumed_ml.unwrap_or(0.0) / 1000.0;
-                    let fin_deficit = ((pre - post + fluid_l) * 100.0).round() / 100.0;
-                    self.net_fluid_deficit_kg = Some(fin_deficit);
-                    if duration_sec > 60.0 {
-                        let hrs = duration_sec / 3600.0;
-                        let rate = ((fin_deficit / hrs) * 100.0).round() / 100.0;
-                        self.final_sweat_rate_l_hr = Some(rate);
-                        self.net_sweat_rate_l_hr = Some(rate);
+                    let fluid_l = self.fluid_consumed_ml.unwrap_or(0.0).max(0.0) / 1000.0;
+                    let raw_fin_deficit = pre - post + fluid_l;
+                    if raw_fin_deficit >= 0.0 {
+                        let fin_deficit = (raw_fin_deficit * 100.0).round() / 100.0;
+                        self.net_fluid_deficit_kg = Some(fin_deficit);
+                        if duration_sec > 60.0 {
+                            let hrs = duration_sec / 3600.0;
+                            let rate = ((fin_deficit / hrs) * 100.0).round() / 100.0;
+                            self.final_sweat_rate_l_hr = Some(rate);
+                            self.net_sweat_rate_l_hr = Some(rate);
+                        } else {
+                            self.final_sweat_rate_l_hr = None;
+                            self.net_sweat_rate_l_hr = None;
+                        }
+                        self.sweat_status = Some("final_verified".to_string());
                     } else {
+                        self.net_fluid_deficit_kg = None;
                         self.final_sweat_rate_l_hr = None;
                         self.net_sweat_rate_l_hr = None;
+                        self.sweat_status = None;
                     }
-                    self.sweat_status = Some("final_verified".to_string());
-                } else {
+                } else if let Some(prov_deficit) = prov_deficit_opt {
                     self.net_fluid_deficit_kg = Some(prov_deficit);
                     self.final_sweat_rate_l_hr = None;
                     self.net_sweat_rate_l_hr = prov_rate;
                     self.sweat_status = Some("provisional_no_intake".to_string());
+                } else {
+                    self.net_fluid_deficit_kg = None;
+                    self.final_sweat_rate_l_hr = None;
+                    self.net_sweat_rate_l_hr = None;
+                    self.sweat_status = None;
                 }
                 return self;
             }
@@ -954,7 +984,25 @@ pub struct ResolvedWeight {
 
 pub mod scale_matcher {
     use super::{ActivityRecord, PostRunContext, ResolvedWeight, WeightEntry};
-    use chrono::{DateTime, Local, NaiveDateTime, TimeZone, Utc};
+    use chrono::{DateTime, Local, NaiveDateTime, TimeZone, Timelike, Utc};
+
+    pub const BASELINE_RECENCY_SECS: i64 = 14 * 86_400;
+
+    pub fn is_fresh_baseline(entry: &WeightEntry, now_epoch: i64) -> bool {
+        now_epoch - entry.timestamp_epoch_sec <= BASELINE_RECENCY_SECS
+    }
+
+    pub fn is_midnight_placeholder(epoch_sec: i64) -> bool {
+        let utc_mod = ((epoch_sec % 86_400) + 86_400) % 86_400;
+        if utc_mod == 0 {
+            return true;
+        }
+        if let Some(dt) = DateTime::<Utc>::from_timestamp(epoch_sec, 0) {
+            let local_dt = dt.with_timezone(&Local);
+            return local_dt.hour() == 0 && local_dt.minute() == 0 && local_dt.second() == 0;
+        }
+        false
+    }
 
     pub fn parse_activity_epoch_sec(raw: &str) -> Option<i64> {
         let trimmed = raw.trim();
@@ -990,16 +1038,23 @@ pub mod scale_matcher {
             .any(|&(_start, end)| weigh_in_epoch >= end - 5 * 60 && weigh_in_epoch <= end + 90 * 60)
     }
 
+    /// Returns the newest morning / pre-run Garmin Scale entry, never updating from dehydrated post-run weigh-ins.
+    pub fn latest_baseline_weigh_in<'a>(
+        weigh_ins: &'a [WeightEntry],
+        windows: &[(i64, i64)],
+    ) -> Option<&'a WeightEntry> {
+        weigh_ins
+            .iter()
+            .filter(|w| w.weight_kg > 0.0 && !is_post_run_dehydrated(w.timestamp_epoch_sec, windows))
+            .max_by_key(|w| w.timestamp_epoch_sec)
+    }
+
     /// Returns the newest morning / pre-run Garmin Scale weight, never updating from dehydrated post-run weigh-ins.
     pub fn latest_baseline_weight_kg(
         weigh_ins: &[WeightEntry],
         windows: &[(i64, i64)],
     ) -> Option<f64> {
-        weigh_ins
-            .iter()
-            .filter(|w| w.weight_kg > 0.0 && !is_post_run_dehydrated(w.timestamp_epoch_sec, windows))
-            .max_by_key(|w| w.timestamp_epoch_sec)
-            .map(|w| w.weight_kg)
+        latest_baseline_weigh_in(weigh_ins, windows).map(|w| w.weight_kg)
     }
 
     pub fn pair_scale_weigh_ins(
@@ -1010,41 +1065,92 @@ pub mod scale_matcher {
         existing: PostRunContext,
     ) -> PostRunContext {
         let mut ctx = existing;
-        let pre_lo = activity_start_epoch - 120 * 60;
-        let pre_hi = activity_start_epoch + 10 * 60;
-        if !ctx.pre_weight_manually_edited {
-            if let Some(pre) = weigh_ins
-                .iter()
-                .filter(|w| {
-                    w.source == "garmin_scale"
-                        && w.weight_kg > 0.0
-                        && w.timestamp_epoch_sec >= pre_lo
-                        && w.timestamp_epoch_sec <= pre_hi
-                })
-                .min_by_key(|w| (w.timestamp_epoch_sec - activity_start_epoch).abs())
-            {
-                ctx.pre_run_weight_kg = Some(pre.weight_kg);
-                ctx.weight_source = Some("garmin_scale".to_string());
-            }
-        }
-
+        let pre_lo = activity_start_epoch - 45 * 60;
+        let pre_hi = activity_start_epoch + 5 * 60;
         let post_lo = activity_end_epoch - 5 * 60;
-        let post_hi = activity_end_epoch + 90 * 60;
-        if !ctx.post_weight_manually_edited {
-            if let Some(post) = weigh_ins
-                .iter()
-                .filter(|w| {
-                    w.source == "garmin_scale"
-                        && w.weight_kg > 0.0
-                        && w.timestamp_epoch_sec >= post_lo
-                        && w.timestamp_epoch_sec <= post_hi
-                })
-                .min_by_key(|w| (w.timestamp_epoch_sec - activity_end_epoch).abs())
-            {
-                ctx.post_run_weight_kg = Some(post.weight_kg);
-                if ctx.weight_source.is_none() {
+        let post_hi = activity_end_epoch + 30 * 60;
+
+        let scale_entries: Vec<&WeightEntry> = weigh_ins
+            .iter()
+            .filter(|w| {
+                w.source == "garmin_scale"
+                    && w.weight_kg > 0.0
+                    && !is_midnight_placeholder(w.timestamp_epoch_sec)
+            })
+            .collect();
+
+        let pre_match = scale_entries
+            .iter()
+            .copied()
+            .filter(|w| w.timestamp_epoch_sec >= pre_lo && w.timestamp_epoch_sec <= pre_hi)
+            .min_by_key(|w| (w.timestamp_epoch_sec - activity_start_epoch).abs());
+
+        let post_match = scale_entries
+            .iter()
+            .copied()
+            .filter(|w| {
+                w.timestamp_epoch_sec >= post_lo
+                    && w.timestamp_epoch_sec <= post_hi
+                    && pre_match.map_or(true, |pre| w.timestamp_epoch_sec > pre.timestamp_epoch_sec)
+            })
+            .min_by_key(|w| (w.timestamp_epoch_sec - activity_end_epoch).abs());
+
+        if !ctx.pre_weight_manually_edited && !ctx.post_weight_manually_edited {
+            if let (Some(pre), Some(post)) = (pre_match, post_match) {
+                if post.timestamp_epoch_sec > pre.timestamp_epoch_sec {
+                    ctx.pre_run_weight_kg = Some(pre.weight_kg);
+                    ctx.post_run_weight_kg = Some(post.weight_kg);
+                    ctx.pre_weigh_in_offset_min = Some(
+                        ((pre.timestamp_epoch_sec - activity_start_epoch) as f64 / 60.0).round() as i32,
+                    );
+                    ctx.post_weigh_in_offset_min = Some(
+                        ((post.timestamp_epoch_sec - activity_end_epoch) as f64 / 60.0).round() as i32,
+                    );
                     ctx.weight_source = Some("garmin_scale".to_string());
+                    return ctx.with_computed_sweat(duration_sec);
                 }
+            }
+            ctx.pre_run_weight_kg = None;
+            ctx.post_run_weight_kg = None;
+            ctx.pre_weigh_in_offset_min = None;
+            ctx.post_weigh_in_offset_min = None;
+            if ctx.weight_source.as_deref() == Some("garmin_scale") {
+                ctx.weight_source = None;
+            }
+        } else {
+            if !ctx.pre_weight_manually_edited {
+                if let Some(pre) = pre_match {
+                    ctx.pre_run_weight_kg = Some(pre.weight_kg);
+                    ctx.pre_weigh_in_offset_min = Some(
+                        ((pre.timestamp_epoch_sec - activity_start_epoch) as f64 / 60.0).round() as i32,
+                    );
+                    ctx.weight_source = Some("garmin_scale".to_string());
+                } else {
+                    ctx.pre_run_weight_kg = None;
+                    ctx.pre_weigh_in_offset_min = None;
+                    if ctx.weight_source.as_deref() == Some("garmin_scale") {
+                        ctx.weight_source = None;
+                    }
+                }
+            } else {
+                ctx.pre_weigh_in_offset_min = None;
+            }
+
+            if !ctx.post_weight_manually_edited {
+                if let Some(post) = post_match {
+                    ctx.post_run_weight_kg = Some(post.weight_kg);
+                    ctx.post_weigh_in_offset_min = Some(
+                        ((post.timestamp_epoch_sec - activity_end_epoch) as f64 / 60.0).round() as i32,
+                    );
+                    if ctx.weight_source.is_none() {
+                        ctx.weight_source = Some("garmin_scale".to_string());
+                    }
+                } else {
+                    ctx.post_run_weight_kg = None;
+                    ctx.post_weigh_in_offset_min = None;
+                }
+            } else {
+                ctx.post_weigh_in_offset_min = None;
             }
         }
 

@@ -241,7 +241,20 @@ export interface PostRunContext {
   provisional_sweat_rate_l_hr?: number | null;
   final_sweat_rate_l_hr?: number | null;
   tempe_sensor_used?: boolean | null;
+  pre_weigh_in_offset_min?: number | null;
+  post_weigh_in_offset_min?: number | null;
   garmin_notes?: string | null;
+}
+
+export interface LatestGarminWeight {
+  weight_kg: number;
+  date: string;
+  timestamp_iso: string;
+  source: string;
+  is_fresh: boolean;
+  authoritative: boolean;
+  body_fat_pct?: number | null;
+  muscle_mass_kg?: number | null;
 }
 
 export interface ActivityRecord {
@@ -365,6 +378,7 @@ export interface BootstrapState {
   readiness_state: ReadinessState | null;
   activities: ActivityRecord[];
   days: DayRecord[];
+  latest_garmin_weight?: LatestGarminWeight | null;
   needs_initial_coach_setup?: boolean;
   model_settings?: ModelSettings;
   first_use_state?: FirstUseFlowState;

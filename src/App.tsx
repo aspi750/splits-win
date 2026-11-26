@@ -3555,6 +3555,9 @@ export default function App() {
                 activeProfile.hyrox_config.division ??
                 draftConfig.objective.hybridProfile?.division ??
                 "Men Open";
+              const latestGarminWeight = state.latest_garmin_weight ?? null;
+              const isGarminWeightLocked = Boolean(latestGarminWeight?.is_fresh);
+              const isGarminWeightStale = Boolean(latestGarminWeight && !latestGarminWeight.is_fresh);
               const standardDivisions = [
                 "Men Open",
                 "Men Pro",
@@ -3660,11 +3663,18 @@ export default function App() {
                       />
                     </div>
                     <div>
-                      <label className="muted">Weight (kg)</label>
+                      <label className="muted">
+                        Weight (kg){isGarminWeightLocked ? " (Garmin Connect Synced)" : ""}
+                      </label>
                       <input
                         type="number"
                         step="0.1"
-                        value={draftConfig.specs.weightKg ?? ""}
+                        disabled={isGarminWeightLocked}
+                        value={
+                          isGarminWeightLocked && latestGarminWeight
+                            ? latestGarminWeight.weight_kg
+                            : (draftConfig.specs.weightKg ?? "")
+                        }
                         onChange={(e) => {
                           const v = e.target.value ? Number(e.target.value) : null;
                           setDraftConfig({
@@ -3677,6 +3687,16 @@ export default function App() {
                           });
                         }}
                       />
+                      {isGarminWeightLocked && latestGarminWeight && (
+                        <div className="muted" style={{ fontSize: 11, marginTop: 4 }}>
+                          Synced from Garmin Connect ({latestGarminWeight.date}) — authoritative
+                        </div>
+                      )}
+                      {isGarminWeightStale && latestGarminWeight && (
+                        <div className="muted" style={{ fontSize: 11, marginTop: 4 }}>
+                          Last Garmin weigh-in was &gt;14 days ago ({latestGarminWeight.date}) — manual override enabled
+                        </div>
+                      )}
                     </div>
                     <div>
                       <label className="muted">Goal Type</label>
@@ -4289,8 +4309,14 @@ export default function App() {
                         },
                         specs: {
                           ...draftConfig.specs,
+                          weightKg:
+                            isGarminWeightLocked && latestGarminWeight
+                              ? latestGarminWeight.weight_kg
+                              : draftConfig.specs.weightKg,
                           weightBaselineConfirmed: Boolean(
-                            draftConfig.specs.weightKg && draftConfig.specs.weightKg > 0
+                            (isGarminWeightLocked && latestGarminWeight
+                              ? latestGarminWeight.weight_kg
+                              : draftConfig.specs.weightKg) ?? 0 > 0
                           ),
                           vt1CeilingBPM: vt1Ceiling,
                           maxHR: syncedMaxHr,
@@ -4720,20 +4746,32 @@ function ActivityDetailView({
 
   const preNum = parseOptionalNum(preWeight);
   const postNum = parseOptionalNum(postWeight);
-  const fluidNum = parseOptionalNum(fluidMl) ?? 0;
-  const liveProvisionalLossKg =
+  const fluidNum = Math.max(0, parseOptionalNum(fluidMl) ?? 0);
+  const rawProvisionalLoss =
     preNum != null && postNum != null && preNum > 0 && postNum > 0
       ? preNum - postNum
       : null;
-  const liveFinalLossKg =
-    fluidIntakeConfirmed && liveProvisionalLossKg != null
-      ? liveProvisionalLossKg + fluidNum / 1000
+  const liveProvisionalLossKg =
+    rawProvisionalLoss != null && rawProvisionalLoss >= 0 ? rawProvisionalLoss : null;
+  const rawFinalLoss =
+    fluidIntakeConfirmed && rawProvisionalLoss != null
+      ? rawProvisionalLoss + fluidNum / 1000
       : null;
+  const liveFinalLossKg =
+    rawFinalLoss != null && rawFinalLoss >= 0 ? rawFinalLoss : null;
   const durHours = durSec / 3600;
   const liveProvisionalSweatRateLHr =
     liveProvisionalLossKg != null && durSec > 60 ? liveProvisionalLossKg / durHours : null;
   const liveFinalSweatRateLHr =
     liveFinalLossKg != null && durSec > 60 ? liveFinalLossKg / durHours : null;
+
+  const formatOffsetMin = (mins: number) => (mins >= 0 ? `+${mins} min` : `${mins} min`);
+  const preOffsetMin = a.post_run_context?.pre_weigh_in_offset_min ?? null;
+  const postOffsetMin = a.post_run_context?.post_weigh_in_offset_min ?? null;
+  const pairingOffsetLabel =
+    preOffsetMin != null && postOffsetMin != null
+      ? `Pre: ${formatOffsetMin(preOffsetMin)} · Post: ${formatOffsetMin(postOffsetMin)}`
+      : null;
 
   const baseTempSource = track?.temp_source ?? forensic?.temp_source ?? a.fit_temp_source ?? "watch_internal";
   const effectiveTempSource =
@@ -4774,7 +4812,7 @@ function ActivityDetailView({
       const preEdited = Boolean(a.post_run_context?.pre_weight_manually_edited) || preWeight !== initialPreWeight;
       const postEdited = Boolean(a.post_run_context?.post_weight_manually_edited) || postWeight !== initialPostWeight;
       const existingWs = a.post_run_context?.weight_source ?? null;
-      const nextWs = preEdited ? "manual" : existingWs ?? (preNum != null ? "manual" : null);
+      const nextWs = (preEdited || postEdited) ? "manual" : existingWs ?? (preNum != null ? "manual" : null);
       const tempeUsed = tempeChoice === "yes" ? true : tempeChoice === "no" ? false : null;
       const payload: PostRunContext = {
         shoe_model: shoeModel.trim(),
@@ -4789,6 +4827,8 @@ function ActivityDetailView({
         fluid_intake_confirmed: fluidIntakeConfirmed,
         weight_source: nextWs,
         tempe_sensor_used: tempeUsed,
+        pre_weigh_in_offset_min: preEdited ? null : (a.post_run_context?.pre_weigh_in_offset_min ?? null),
+        post_weigh_in_offset_min: postEdited ? null : (a.post_run_context?.post_weigh_in_offset_min ?? null),
         orthopedic: {
           left_achilles: parseRatingOrZero(leftAchilles),
           lumbar_sciatica: parseRatingOrZero(lumbarSciatica),
@@ -5192,6 +5232,9 @@ function ActivityDetailView({
             {a.post_run_context?.weight_source && (
               <span className="pill">weight: {a.post_run_context.weight_source}</span>
             )}
+            {pairingOffsetLabel && (
+              <span className="pill">{pairingOffsetLabel}</span>
+            )}
             <span className={`pill ${effectiveTempSource === "watch_internal" ? "amber" : "green"}`}>
               temp: {effectiveTempSource}
             </span>
@@ -5273,10 +5316,16 @@ function ActivityDetailView({
         </label>
 
         <div className="muted" style={{ fontSize: 13, marginTop: 10, marginBottom: 10 }}>
-          Provisional Rate (pre - post):{" "}
-          <strong>{liveProvisionalSweatRateLHr != null ? `${liveProvisionalSweatRateLHr.toFixed(2)} L/hr` : "–"}</strong>
-          {" · "}Final Verified:{" "}
-          <strong>{liveFinalSweatRateLHr != null ? `${liveFinalSweatRateLHr.toFixed(2)} L/hr` : "Pending Intake Confirmation"}</strong>
+          {liveProvisionalSweatRateLHr == null && liveFinalSweatRateLHr == null ? (
+            <span>No pre/post weigh-in within activity window</span>
+          ) : (
+            <>
+              Provisional Rate (pre - post):{" "}
+              <strong>{liveProvisionalSweatRateLHr != null ? `${liveProvisionalSweatRateLHr.toFixed(2)} L/hr` : "–"}</strong>
+              {" · "}Final Verified:{" "}
+              <strong>{liveFinalSweatRateLHr != null ? `${liveFinalSweatRateLHr.toFixed(2)} L/hr` : "Pending Intake Confirmation"}</strong>
+            </>
+          )}
         </div>
 
         <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: 10 }}>

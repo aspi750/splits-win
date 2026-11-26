@@ -1,11 +1,15 @@
 use chrono::{Duration, NaiveDate, TimeZone, Utc};
 use splits_win_lib::coach::{
     analyze_training_history, append_forensic_section, append_training_ledger_entry,
-    apply_coach_proposal, apply_post_run_context_tool_update, build_daily_briefing_facts,
-    compact_history_markdown, fetch_1hz_window_from_track, format_user_profile_context,
-    replacing_section, slice_fit_track_by_km, starter_coach_profile_markdown,
-    starter_plan_file, starter_training_plan_markdown, without_dashes, CoachPacketBuilder,
+    apply_coach_proposal, apply_post_run_context_tool_update, build_activity_detail_tool_payload,
+    build_daily_briefing_facts, build_daily_briefing_facts_with_weights,
+    build_readiness_and_plan_tool_payload, build_static_system_instruction_with_weights,
+    build_wellness_history_tool_payload, compact_history_markdown, fetch_1hz_window_from_track,
+    format_user_profile_context, hydrate_profile_from_proposal_with_weight_guard,
+    replacing_section, slice_fit_track_by_km, starter_coach_profile_markdown, starter_plan_file,
+    starter_training_plan_markdown, without_dashes, CoachPacketBuilder,
 };
+use splits_win_lib::reconcile_scale_weights_and_config;
 use splits_win_lib::forensic_extractor::extract_forensic_telemetry;
 use splits_win_lib::garmin::{
     analyze_fit_points, chunk_date_range, dissect_hyrox_laps, parse_body_battery_days_json,
@@ -3469,4 +3473,365 @@ fn v0_2_6_security_hardening_contracts() {
         .expect("tauri.conf.json app.security.csp must be a non-null string");
     assert!(csp.contains("default-src 'self'"));
     assert!(csp.contains("object-src 'none'"));
+}
+
+#[test]
+fn test_tight_sweat_pairing_midnight_and_negative_loss_guards() {
+    let act_start: i64 = 1_795_000_000;
+    let act_end: i64 = act_start + 3600;
+
+    // 1. Tight window (-15m pre, +10m post) pairs cleanly and computes offsets
+    let tight_pre = WeightEntry {
+        timestamp_epoch_sec: act_start - 15 * 60,
+        timestamp_iso: "2026-11-14T15:11:40Z".to_string(),
+        weight_kg: 105.0,
+        body_fat_pct: None,
+        body_water_pct: None,
+        muscle_mass_kg: None,
+        source: "garmin_scale".to_string(),
+    };
+    let tight_post = WeightEntry {
+        timestamp_epoch_sec: act_end + 10 * 60,
+        timestamp_iso: "2026-11-14T16:36:40Z".to_string(),
+        weight_kg: 104.2,
+        body_fat_pct: None,
+        body_water_pct: None,
+        muscle_mass_kg: None,
+        source: "garmin_scale".to_string(),
+    };
+    let paired = scale_matcher::pair_scale_weigh_ins(
+        act_start,
+        act_end,
+        3600.0,
+        &[tight_pre.clone(), tight_post.clone()],
+        PostRunContext::default(),
+    );
+    assert_eq!(paired.pre_run_weight_kg, Some(105.0));
+    assert_eq!(paired.post_run_weight_kg, Some(104.2));
+    assert_eq!(paired.pre_weigh_in_offset_min, Some(-15));
+    assert_eq!(paired.post_weigh_in_offset_min, Some(10));
+    assert_eq!(paired.sweat_status.as_deref(), Some("provisional_no_intake"));
+    assert_eq!(paired.provisional_sweat_rate_l_hr, Some(0.8));
+
+    // 2. Outside tight windows (-90m pre or +55m post) must NOT compute sweat rate,
+    // while +55m post is STILL excluded from baseline weight ([end - 5m, end + 90m]).
+    let early_pre = WeightEntry {
+        timestamp_epoch_sec: act_start - 90 * 60,
+        timestamp_iso: "2026-11-14T13:56:40Z".to_string(),
+        weight_kg: 105.3,
+        body_fat_pct: None,
+        body_water_pct: None,
+        muscle_mass_kg: None,
+        source: "garmin_scale".to_string(),
+    };
+    let delayed_post = WeightEntry {
+        timestamp_epoch_sec: act_end + 55 * 60,
+        timestamp_iso: "2026-11-14T17:21:40Z".to_string(),
+        weight_kg: 104.0,
+        body_fat_pct: None,
+        body_water_pct: None,
+        muscle_mass_kg: None,
+        source: "garmin_scale".to_string(),
+    };
+    let missed = scale_matcher::pair_scale_weigh_ins(
+        act_start,
+        act_end,
+        3600.0,
+        &[early_pre, delayed_post.clone()],
+        PostRunContext::default(),
+    );
+    assert_eq!(missed.pre_run_weight_kg, None);
+    assert_eq!(missed.post_run_weight_kg, None);
+    assert_eq!(missed.sweat_status, None);
+    assert_eq!(missed.provisional_sweat_rate_l_hr, None);
+    assert_eq!(
+        scale_matcher::latest_baseline_weigh_in(&[delayed_post], &[(act_start, act_end)]),
+        None
+    );
+
+    // 3. calendarDate-only entry parses to UTC midnight and is rejected by auto-pairing
+    let cal_only_json = br#"{
+      "dailyWeightSummaries": [{
+        "allWeightMetrics": [{
+          "samplePk": 77,
+          "calendarDate": "2026-11-14",
+          "weight": 104500.0,
+          "sourceType": "INDEX_SCALE"
+        }]
+      }]
+    }"#;
+    let parsed_cal = parse_weight_range_json(cal_only_json);
+    assert_eq!(parsed_cal.len(), 1);
+    assert!(scale_matcher::is_midnight_placeholder(
+        parsed_cal[0].timestamp_epoch_sec
+    ));
+    let midnight_ep = parsed_cal[0].timestamp_epoch_sec;
+    let midnight_paired = scale_matcher::pair_scale_weigh_ins(
+        midnight_ep + 10 * 60,
+        midnight_ep + 70 * 60,
+        3600.0,
+        &[parsed_cal[0].clone(), tight_post],
+        PostRunContext::default(),
+    );
+    assert_eq!(midnight_paired.pre_run_weight_kg, None);
+    assert_eq!(midnight_paired.sweat_status, None);
+
+    // 4. Post > Pre without sufficient fluid intake never emits negative sweat rate
+    let neg_ctx = PostRunContext {
+        pre_run_weight_kg: Some(104.0),
+        post_run_weight_kg: Some(104.3),
+        fluid_consumed_ml: Some(100.0),
+        fluid_intake_confirmed: true,
+        weight_source: Some("garmin_scale".to_string()),
+        ..Default::default()
+    }
+    .with_computed_sweat(3600.0);
+    assert_eq!(neg_ctx.provisional_sweat_rate_l_hr, None);
+    assert_eq!(neg_ctx.final_sweat_rate_l_hr, None);
+    assert_eq!(neg_ctx.net_fluid_deficit_kg, None);
+    assert_eq!(neg_ctx.sweat_status, None);
+}
+
+#[test]
+fn test_garmin_weight_authority_recency_guard_and_blank_shoe_filter() {
+    let dir = make_temp_dir("win-weight-authority");
+    let store = SharedStore::new(Some(dir.clone())).unwrap();
+    let db = Database::open_in_memory().unwrap();
+
+    let mut cfg = AthleteConfig::default();
+    cfg.specs.weight_kg = Some(100.0);
+    cfg.specs.weight_baseline_confirmed = true;
+    store.save_athlete_config(&cfg).unwrap();
+
+    let act_start: i64 = 1_795_000_000;
+    let act_end: i64 = act_start + 3600;
+    let act = ActivityRecord {
+        garmin_id: 991,
+        name: "Easy Run".to_string(),
+        type_key: "running".to_string(),
+        start_iso: Utc.timestamp_opt(act_start, 0).unwrap().to_rfc3339(),
+        distance_m: 8_000.0,
+        duration_sec: 3600.0,
+        moving_duration_sec: 3600.0,
+        elevation_gain_m: 20.0,
+        average_hr: Some(128.0),
+        max_hr: Some(135.0),
+        cadence_spm: Some(174.0),
+        training_load: Some(45.0),
+        shoe_name: Some("Superblast 3".to_string()),
+        is_hyrox: None,
+        post_run_context: None,
+        fit_temp_source: None,
+        garmin_notes: None,
+        is_pr: None,
+        start_latitude: None,
+        start_longitude: None,
+    };
+    db.upsert_activity(&act).unwrap();
+
+    let morning_ep = act_start - 3 * 3600;
+    let dehydrated_ep = act_end + 20 * 60;
+    let morning = WeightEntry {
+        timestamp_epoch_sec: morning_ep,
+        timestamp_iso: Utc.timestamp_opt(morning_ep, 0).unwrap().to_rfc3339(),
+        weight_kg: 109.4,
+        body_fat_pct: Some(24.0),
+        body_water_pct: None,
+        muscle_mass_kg: Some(44.2),
+        source: "garmin_scale".to_string(),
+    };
+    let dehydrated = WeightEntry {
+        timestamp_epoch_sec: dehydrated_ep,
+        timestamp_iso: Utc.timestamp_opt(dehydrated_ep, 0).unwrap().to_rfc3339(),
+        weight_kg: 107.8,
+        body_fat_pct: None,
+        body_water_pct: None,
+        muscle_mass_kg: None,
+        source: "garmin_scale".to_string(),
+    };
+    db.upsert_weight_entry(&morning).unwrap();
+    db.upsert_weight_entry(&dehydrated).unwrap();
+
+    // 1. Fresh (<=14d) Garmin weight supersedes even already-confirmed config weight
+    let eval_now = act_start + 7200;
+    let updated_cfg = reconcile_scale_weights_and_config(&db, &store, eval_now).unwrap();
+    assert_eq!(updated_cfg.specs.weight_kg, Some(109.4));
+    assert!(updated_cfg.specs.weight_baseline_confirmed);
+
+    // 2. Stale (>14d) Garmin weight must NOT overwrite confirmed manual weight
+    let mut manual_cfg = updated_cfg.clone();
+    manual_cfg.specs.weight_kg = Some(102.0);
+    manual_cfg.specs.weight_baseline_confirmed = true;
+    store.save_athlete_config(&manual_cfg).unwrap();
+    let stale_now = morning_ep + 20 * 86_400;
+    let preserved_cfg = reconcile_scale_weights_and_config(&db, &store, stale_now).unwrap();
+    assert_eq!(preserved_cfg.specs.weight_kg, Some(102.0));
+
+    // 3. Wellness history tags is_post_run_dehydrated & is_fresh; readiness tool includes latest_garmin_weight
+    let activities = db.list_activities(10).unwrap();
+    let days = db.list_days(14).unwrap();
+    let weights = db.list_weight_entries(20).unwrap();
+    let wellness = build_wellness_history_tool_payload(&days, &weights, &activities, 14, eval_now);
+    assert_eq!(wellness["latest_garmin_weight"]["weight_kg"].as_f64(), Some(109.4));
+    assert_eq!(wellness["latest_garmin_weight"]["is_fresh"].as_bool(), Some(true));
+    let recent = wellness["recent_weight_entries"].as_array().unwrap();
+    let dehydrated_row = recent.iter().find(|r| r["weight_kg"].as_f64() == Some(107.8)).unwrap();
+    let morning_row = recent.iter().find(|r| r["weight_kg"].as_f64() == Some(109.4)).unwrap();
+    assert_eq!(dehydrated_row["is_post_run_dehydrated"].as_bool(), Some(true));
+    assert_eq!(morning_row["is_post_run_dehydrated"].as_bool(), Some(false));
+
+    let readiness_payload = build_readiness_and_plan_tool_payload(
+        &store,
+        &activities,
+        &days,
+        &weights,
+        Utc.timestamp_opt(eval_now, 0).unwrap(),
+    );
+    assert_eq!(readiness_payload["latest_garmin_weight"]["weight_kg"].as_f64(), Some(109.4));
+
+    // 4. System instruction, packet builder & briefing facts surface authoritative weight + (stale: >14d)
+    let sys_fresh = build_static_system_instruction_with_weights(
+        &store,
+        &updated_cfg,
+        &activities,
+        &weights,
+        None,
+        None,
+        eval_now,
+    );
+    assert!(sys_fresh.contains("=== GARMIN CONNECT WEIGHT (AUTHORITATIVE) ==="));
+    assert!(sys_fresh.contains("109.4 kg"));
+    assert!(!sys_fresh.contains("(stale: >14d)"));
+
+    let sys_stale = build_static_system_instruction_with_weights(
+        &store,
+        &updated_cfg,
+        &activities,
+        &weights,
+        None,
+        None,
+        stale_now,
+    );
+    assert!(sys_stale.contains("(stale: >14d)"));
+
+    let packet_stale = CoachPacketBuilder::build_markdown_with_weights(
+        &updated_cfg,
+        &activities,
+        &days,
+        &weights,
+        None,
+        None,
+        "",
+        Utc.timestamp_opt(stale_now, 0).unwrap(),
+    );
+    assert!(packet_stale.contains("Garmin Connect Weight (Authoritative): 109.4 kg"));
+    assert!(packet_stale.contains("(stale: >14d)"));
+
+    let facts_stale = build_daily_briefing_facts_with_weights(
+        &updated_cfg,
+        &activities,
+        &days,
+        &weights,
+        None,
+        NaiveDate::from_ymd_opt(2026, 12, 4).unwrap(),
+        stale_now,
+    );
+    assert!(facts_stale.contains("Garmin Connect weight: 109.4 kg"));
+    assert!(facts_stale.contains("(stale: >14d)"));
+
+    // 5. COACH_PROFILE.md proposal must not overwrite fresh Garmin weight
+    let mut profile = UserProfile::default();
+    let mut proposal_cfg = updated_cfg.clone();
+    let proposal = CoachUpdateProposal {
+        id: "p1".to_string(),
+        target_file: "COACH_PROFILE.md".to_string(),
+        reason: "test".to_string(),
+        updated_section_markdown: "- Weight: 98.0 kg (PLACEHOLDER)".to_string(),
+        expires_on: None,
+        diff_preview: String::new(),
+        status: "pending_user_approval".to_string(),
+        plan_json: None,
+        profile_thresholds: Some(CoachProfileThresholds {
+            vt1_bpm: Some(133),
+            weight_kg: Some(98.0),
+            ..Default::default()
+        }),
+    };
+    assert!(hydrate_profile_from_proposal_with_weight_guard(
+        &proposal,
+        &mut profile,
+        &mut proposal_cfg,
+        true
+    ));
+    assert_eq!(proposal_cfg.specs.weight_kg, Some(109.4));
+
+    // 6. Activity detail payload exposes pairing offsets and net_fluid_deficit_kg
+    let mut act_with_offsets = act;
+    act_with_offsets.post_run_context = Some(PostRunContext {
+        pre_run_weight_kg: Some(105.0),
+        post_run_weight_kg: Some(104.2),
+        net_fluid_deficit_kg: Some(0.8),
+        pre_weigh_in_offset_min: Some(-15),
+        post_weigh_in_offset_min: Some(10),
+        weight_source: Some("garmin_scale".to_string()),
+        ..Default::default()
+    });
+    let detail = build_activity_detail_tool_payload(&act_with_offsets, &store, Some(&db), &activities);
+    assert_eq!(detail["pre_weigh_in_offset_min"].as_i64(), Some(-15));
+    assert_eq!(detail["post_weigh_in_offset_min"].as_i64(), Some(10));
+    assert_eq!(detail["net_fluid_deficit_kg"].as_f64(), Some(0.8));
+
+    // 7. Blank "" shoe names never leak into ReadinessState
+    let mut items = std::collections::HashMap::new();
+    items.insert(
+        "blank-shoe".to_string(),
+        GearItem {
+            garmin: Some(GearGarminMeta {
+                name: Some("   ".to_string()),
+                brand: None,
+                model: None,
+                gear_type: None,
+                status: Some("ACTIVE".to_string()),
+                distance_used_m: None,
+                activities_linked: None,
+                max_usage_distance_m: None,
+                first_use: None,
+                retrieved_at: None,
+            }),
+            alias: Some("".to_string()),
+            eligibility: Some(GearEligibility::Simple("eligible".to_string())),
+            pending_naming: None,
+        },
+    );
+    items.insert(
+        "real-shoe".to_string(),
+        GearItem {
+            garmin: None,
+            alias: Some("Superblast 3".to_string()),
+            eligibility: Some(GearEligibility::Simple("eligible".to_string())),
+            pending_naming: None,
+        },
+    );
+    let gear = GearInventoryFile {
+        version: 1,
+        revision: 1,
+        updated_at: "2026-11-14T16:00:00Z".to_string(),
+        updated_by: "test".to_string(),
+        items,
+        pending: Vec::new(),
+    };
+    let out = ReadinessEngine::evaluate(ReadinessInput {
+        now: Utc.timestamp_opt(eval_now, 0).unwrap(),
+        athlete_config: &updated_cfg,
+        activities: &[],
+        days: &[],
+        plan: None,
+        gear_inventory: Some(&gear),
+    });
+    assert_eq!(
+        out.readiness_state.shoe_eligibility.eligible_run_shoes,
+        vec!["Superblast 3".to_string()]
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
 }

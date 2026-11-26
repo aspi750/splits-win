@@ -402,7 +402,15 @@ impl ReadinessEngine {
                 gated_shoes,
                 blocked_shoes,
                 non_run_footwear: Vec::new(),
-                plan_shoe_constraints: today_session.map(|s| s.shoe_constraints.clone()).unwrap_or_default(),
+                plan_shoe_constraints: today_session
+                    .map(|s| {
+                        s.shoe_constraints
+                            .iter()
+                            .map(|c| c.trim().to_string())
+                            .filter(|c| !c.is_empty())
+                            .collect()
+                    })
+                    .unwrap_or_default(),
             },
             telemetry_provenance: TelemetryProvenance {
                 source: "garmin".to_string(),
@@ -526,7 +534,9 @@ fn resolve_shoe_eligibility(
             let mut gated = Vec::new();
             let mut blocked = Vec::new();
             for item in inv.items.values() {
-                let name = item.display_name();
+                let Some(name) = item.non_blank_display_name() else {
+                    continue;
+                };
                 match item.footwear_status() {
                     "eligible" => eligible.push(name),
                     "gated" => gated.push(name),
