@@ -4022,7 +4022,7 @@ dependencies = [
 
 [[package]]
 name = "splits-win"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "chrono",
  "dirs 5.0.1",
